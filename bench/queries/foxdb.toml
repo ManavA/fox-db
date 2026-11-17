@@ -1,0 +1,83 @@
+# Fixed query set for foxdb itself (Rust, ~50 source files).
+name = "foxdb"
+
+[[q]]
+cat = "symbol"
+q = "open_ro"
+expect = "src/db.rs:"
+[[q]]
+cat = "symbol"
+q = "split_ident"
+expect = "src/inventory.rs:"
+[[q]]
+cat = "symbol"
+q = "brief_line"
+expect = "src/savings.rs:"
+[[q]]
+cat = "symbol"
+q = "spawn_background_index"
+expect = "src/bg.rs:"
+[[q]]
+cat = "symbol"
+q = "cited_paths"
+expect = "src/savings.rs:"
+[[q]]
+cat = "symbol"
+q = "page_n"
+expect = "src/query.rs:"
+
+[[q]]
+cat = "callers"
+q = "open_ro"
+expect = "open_ro"
+[[q]]
+cat = "callers"
+q = "split_ident"
+expect = "split_ident"
+[[q]]
+cat = "callers"
+q = "clip"
+expect = "clip"
+
+[[q]]
+cat = "doc"
+q = "Latency fox code"
+expect = "Latency"
+[[q]]
+cat = "doc"
+q = "Coverage finding"
+expect = "Coverage finding"
+[[q]]
+cat = "doc"
+q = "Ignore behaviour"
+expect = "Ignore behaviour"
+[[q]]
+cat = "doc"
+q = "Claude Code setup"
+expect = "Claude Code setup"
+
+[[q]]
+cat = "memory"
+q = "checkout latency"
+expect = "checkout-latency"
+
+[[q]]
+cat = "nl"
+q = "token savings ledger"
+expect = "savings"
+[[q]]
+cat = "nl"
+q = "background index lock"
+expect = "bg.rs"
+[[q]]
+cat = "nl"
+q = "milestone log parsing"
+expect = "markdown.rs"
+[[q]]
+cat = "nl"
+q = "secret files are never read"
+expect = "tiers.rs"
+[[q]]
+cat = "memory"
+q = "dependency upgrades"
+expect = "dependency-upgrades"

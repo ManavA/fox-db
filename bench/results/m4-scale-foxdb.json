@@ -1,0 +1,73 @@
+{
+ "bench": "m4 scale: kubernetes (shallow clone, ~32k files) alone, then linux (~97k files) added to the same store",
+ "host": "32 cores, 125 GB RAM, store on tmpfs, shared host (not quiet); treat latencies as +-2x",
+ "queries": "20 find queries scoped to kubernetes, first uncached run, process spawn included; saves are fox index re-runs after appending a function",
+ "before_commit": "419dcf2",
+ "before": {
+  "k8s_cold_index_s": 501.07,
+  "k8s_save_noop_s": 0.77,
+  "k8s_save_one_leaf_file_s": 6.89,
+  "k8s_save_file_defining_String_s": 151.91,
+  "k8s_save_100_files_s": 87.71,
+  "linux_cold_index_into_shared_store_s": 295.22,
+  "linux_save_one_leaf_file_s": 27.47,
+  "linux_save_100_files_s": 376.46,
+  "k8s_find_alone_cli_p50_p95_ms": [
+   56.6,
+   120.9
+  ],
+  "k8s_find_shared_store_cli_p50_p95_max_ms": [
+   128.7,
+   6540.4,
+   6893.8
+  ],
+  "k8s_find_shared_store_foxd_first_p50_p95_max_ms": [
+   114.8,
+   12057.7,
+   12139.4
+  ],
+  "alone_top20_found_in_shared_top60": 0.948,
+  "foxd_first_find_after_k8s_save_ms": 4881.2,
+  "foxd_first_find_after_linux_save_ms": 4537.1,
+  "foxd_peak_rss_mb": 1011,
+  "shared_store_mb": 2564,
+  "host_load_1m_start_end": [
+   9.4,
+   9.2
+  ]
+ },
+ "after": {
+  "k8s_cold_index_s": 77.39,
+  "k8s_save_noop_s": 0.82,
+  "k8s_save_one_leaf_file_s": 0.83,
+  "k8s_save_file_defining_String_s": 3.05,
+  "k8s_save_100_files_s": 3.68,
+  "linux_cold_index_into_shared_store_s": 301.2,
+  "linux_save_one_leaf_file_s": 1.83,
+  "linux_save_100_files_s": 9.47,
+  "k8s_find_alone_cli_p50_p95_ms": [
+   65.0,
+   264.8
+  ],
+  "k8s_find_shared_store_cli_p50_p95_max_ms": [
+   73.3,
+   152.9,
+   162.8
+  ],
+  "k8s_find_shared_store_foxd_first_p50_p95_max_ms": [
+   64.2,
+   165.5,
+   191.2
+  ],
+  "alone_top20_found_in_shared_top60": 0.743,
+  "foxd_first_find_after_k8s_save_ms": 234.0,
+  "foxd_first_find_after_linux_save_ms": 127.2,
+  "foxd_peak_rss_mb": 258,
+  "shared_store_mb": 2701,
+  "host_load_1m_start_end": [
+   24.5,
+   11.1
+  ]
+ },
+ "notes": "alone_top20_found_in_shared_top60 and the 'after' latencies were measured before the follow-up fixes (scope checked per match before ranking, prefix matches kept in project slices, fragmented ranges bridged into at most 8 slices, background graph rebuilds). The host was busy (load 9-24), so the 150 ms shared-store target is not shown as met on a quiet machine. Reviewer re-measurements on the same build: a 1-file save is 0.72-0.75 s no-op and about 1.0 s median on kubernetes (2-3 s for files defining very common names), and 1.64 s no-op on linux, most of it the file walk, so the single-save target holds only on kubernetes. Before the bridging fix, about 64 interleaved saves disabled project slices and search fell back to about 5.5 s; that fallback no longer exists."
+}

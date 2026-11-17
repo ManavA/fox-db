@@ -1,0 +1,15 @@
+{
+  "dispatch_ms_median": 47.577277,
+  "n": 10,
+  "packet_create_ms": 39.592988000000005,
+  "packet_tokens": 135,
+  "packet_tokens_claude": 135,
+  "packet_tokens_codex": 135,
+  "realistic_packet_tokens": 609,
+  "realistic_packet_tokens_claude": 609,
+  "realistic_packet_tokens_codex": 609,
+  "realistic_packet_tokens_uncapped": 609,
+  "repo": "~/foxdb",
+  "wait_done_ms": 6.924466,
+  "wait_ms_median": 57.441767
+}

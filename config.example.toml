@@ -1,0 +1,14 @@
+# Copy to ~/.foxdb/config.toml (or $FOXDB_HOME/config.toml). All keys are optional.
+
+# Use an external codanna binary (~/.foxdb/bin/codanna) instead of the built-in tree-sitter index.
+codanna = false
+
+# Swift/Xcode module (target) name -> platform tag appended to symbol hits as " [tag]".
+[module_tags]
+MyAppTV = "tvOS"
+MyAppMobile = "iOS"
+
+# Agents that get no SubagentStart brief (globs on agent name or type). Setting this replaces
+# the default, which keeps zero-context ("goldfish") reviewers zero-context.
+[hooks]
+skip_agents = ["egm-*", "*goldfish*", "*reviewer*"]

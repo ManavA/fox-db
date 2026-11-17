@@ -1,0 +1,167 @@
+{
+ "name": "linux-lexical",
+ "repo": "linux",
+ "url": "https://github.com/torvalds/linux",
+ "commit": "666539eecdf4db623f5e3c3e55cf9f2dfad24aa4",
+ "about": "Lexical lookups with known targets: symbol, keyword, phrase, prefix, substring and regex. Names and paths match by containment where the target says so.",
+ "queries": [
+  {
+   "id": "l01",
+   "type": "symbol",
+   "q": "tcp_v4_connect",
+   "targets": [
+    {
+     "name": "tcp_v4_connect",
+     "path_contains": "net/ipv4/tcp_ipv4.c"
+    }
+   ]
+  },
+  {
+   "id": "l02",
+   "type": "symbol",
+   "q": "schedule_timeout",
+   "targets": [
+    {
+     "name": "schedule_timeout",
+     "path_contains": "kernel/time/sleep_timeout.c"
+    }
+   ]
+  },
+  {
+   "id": "l03",
+   "type": "symbol",
+   "q": "ext4_fill_super",
+   "targets": [
+    {
+     "name": "ext4_fill_super",
+     "path_contains": "fs/ext4/super.c"
+    }
+   ]
+  },
+  {
+   "id": "l04",
+   "type": "symbol",
+   "q": "io_uring_setup",
+   "targets": [
+    {
+     "name": "io_uring_setup",
+     "path_contains": "io_uring/io_uring.c"
+    }
+   ]
+  },
+  {
+   "id": "l05",
+   "type": "keyword",
+   "q": "dock station present",
+   "targets": [
+    {
+     "name": "dock_present"
+    }
+   ]
+  },
+  {
+   "id": "l06",
+   "type": "keyword",
+   "q": "ksm scan thread",
+   "targets": [
+    {
+     "name": "ksm_scan_thread",
+     "path_contains": "mm/ksm.c"
+    }
+   ]
+  },
+  {
+   "id": "l07",
+   "type": "keyword",
+   "q": "omap dma context notifier",
+   "targets": [
+    {
+     "name": "omap_dma_context_notifier"
+    }
+   ]
+  },
+  {
+   "id": "l08",
+   "type": "phrase",
+   "q": "kernel samepage merging",
+   "targets": [
+    {
+     "name": "ksm.rst",
+     "path_contains": "Documentation/"
+    }
+   ]
+  },
+  {
+   "id": "l09",
+   "type": "phrase",
+   "q": "memory barriers",
+   "targets": [
+    {
+     "name": "memory-barriers.txt",
+     "path_contains": "Documentation/memory-barriers.txt"
+    }
+   ]
+  },
+  {
+   "id": "l10",
+   "type": "prefix",
+   "q": "omap_dma_cont",
+   "targets": [
+    {
+     "name": "omap_dma_context_notifier"
+    }
+   ]
+  },
+  {
+   "id": "l11",
+   "type": "prefix",
+   "q": "ibridge_get_w",
+   "targets": [
+    {
+     "name": "ibridge_get_width"
+    }
+   ]
+  },
+  {
+   "id": "l12",
+   "type": "substring",
+   "q": "ipv6/ip6_fib",
+   "targets": [
+    {
+     "name": "ip6_fib.c",
+     "path_contains": "net/ipv6/ip6_fib.c"
+    }
+   ]
+  },
+  {
+   "id": "l13",
+   "type": "substring",
+   "q": "mcam_dis_ent",
+   "targets": [
+    {
+     "name": "rvu_mbox_handler_npc_mcam_dis_entry"
+    }
+   ]
+  },
+  {
+   "id": "l14",
+   "type": "regex",
+   "q": "^tcp_v4_conn.*",
+   "targets": [
+    {
+     "name": "tcp_v4_connect"
+    }
+   ]
+  },
+  {
+   "id": "l15",
+   "type": "regex",
+   "q": "^ibridge_get_.*width$",
+   "targets": [
+    {
+     "name": "ibridge_get_width"
+    }
+   ]
+  }
+ ]
+}

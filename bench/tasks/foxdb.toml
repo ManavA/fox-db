@@ -1,0 +1,17 @@
+# A/B tasks over foxdb's own repo. Read-only questions, so runs never need write access.
+repo = "~/foxdb"
+
+[[task]]
+id = "callers-open-ro"
+prompt = "List every function in this repo that calls db::open_ro and say in one line what each uses it for. Do not edit files."
+check = "cmd_find"
+
+[[task]]
+id = "where-secrets"
+prompt = "Where does this repo decide that a file is a secret and must never be read? Give path:line and the rule. Do not edit files."
+check = "tiers.rs"
+
+[[task]]
+id = "savings-ledger"
+prompt = "Explain how the token-savings ledger estimates savings, citing the functions involved with path:line. Do not edit files."
+check = "savings.rs"

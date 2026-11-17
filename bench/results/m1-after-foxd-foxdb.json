@@ -1,0 +1,78 @@
+{
+  "client": "daemon",
+  "headroom": "headroom-off",
+  "instructions_tokens": 82,
+  "iters": 5,
+  "label": "after-foxd",
+  "rows": [
+    {
+      "cat": "callers",
+      "hit5": 3,
+      "mrr": 1.0,
+      "n": 3,
+      "naive_tokens": 1203,
+      "p50_ms": 7.020376,
+      "p95_ms": 7.721287,
+      "saved_tokens": 1176,
+      "tokens_per_answer": 27
+    },
+    {
+      "cat": "doc",
+      "hit5": 4,
+      "mrr": 1.0,
+      "n": 4,
+      "naive_tokens": 4510,
+      "p50_ms": 8.075223,
+      "p95_ms": 8.703859,
+      "saved_tokens": 4341,
+      "tokens_per_answer": 169
+    },
+    {
+      "cat": "memory",
+      "hit5": 2,
+      "mrr": 1.0,
+      "n": 2,
+      "naive_tokens": 152,
+      "p50_ms": 8.499245,
+      "p95_ms": 9.385561000000001,
+      "saved_tokens": 133,
+      "tokens_per_answer": 18
+    },
+    {
+      "cat": "nl",
+      "hit5": 4,
+      "mrr": 1.0,
+      "n": 4,
+      "naive_tokens": 2969,
+      "p50_ms": 7.914401999999999,
+      "p95_ms": 9.219861,
+      "saved_tokens": 2686,
+      "tokens_per_answer": 283
+    },
+    {
+      "cat": "symbol",
+      "hit5": 6,
+      "mrr": 1.0,
+      "n": 6,
+      "naive_tokens": 2779,
+      "p50_ms": 7.335909,
+      "p95_ms": 9.095605999999998,
+      "saved_tokens": 2724,
+      "tokens_per_answer": 55
+    },
+    {
+      "cat": "all",
+      "hit5": 19,
+      "mrr": 1.0,
+      "n": 19,
+      "naive_tokens": 2658,
+      "p50_ms": 7.614382,
+      "p95_ms": 9.095605999999998,
+      "saved_tokens": 2539,
+      "tokens_per_answer": 118
+    }
+  ],
+  "set": "foxdb",
+  "store_bytes": 72728576,
+  "tool_def_tokens": 759
+}

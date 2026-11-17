@@ -1,0 +1,11 @@
+{
+  "dispatch_ms_median": 11.703600999999999,
+  "n": 10,
+  "packet_create_ms": 54.42700000000001,
+  "packet_tokens": 238,
+  "packet_tokens_claude": 238,
+  "packet_tokens_codex": 238,
+  "repo": "~/foxdb",
+  "wait_done_ms": 14.913217,
+  "wait_ms_median": 23.387115
+}

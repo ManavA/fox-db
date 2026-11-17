@@ -1,0 +1,165 @@
+{
+ "name": "kubernetes-lexical",
+ "repo": "kubernetes",
+ "url": "https://github.com/kubernetes/kubernetes",
+ "commit": "aaaf121ca6d8e73dde021892a8280523c0c005aa",
+ "about": "Lexical lookups with known targets: symbol, keyword, phrase, prefix, substring and regex. Names and paths match by containment where the target says so.",
+ "queries": [
+  {
+   "id": "k01",
+   "type": "symbol",
+   "q": "isHintSocketAligned",
+   "targets": [
+    {
+     "name": "isHintSocketAligned",
+     "path_contains": "policy_static.go"
+    }
+   ]
+  },
+  {
+   "id": "k02",
+   "type": "symbol",
+   "q": "NewPromptingAuthLoader",
+   "targets": [
+    {
+     "name": "NewPromptingAuthLoader"
+    }
+   ]
+  },
+  {
+   "id": "k03",
+   "type": "symbol",
+   "q": "ValidateServiceAccount",
+   "targets": [
+    {
+     "name": "ValidateServiceAccount",
+     "path_contains": "pkg/apis/core/validation/validation.go"
+    }
+   ]
+  },
+  {
+   "id": "k04",
+   "type": "symbol",
+   "q": "SyncPod",
+   "targets": [
+    {
+     "name": "SyncPod",
+     "path_contains": "pkg/kubelet/kubelet.go"
+    }
+   ]
+  },
+  {
+   "id": "k05",
+   "type": "keyword",
+   "q": "prompting auth loader",
+   "targets": [
+    {
+     "name": "NewPromptingAuthLoader"
+    }
+   ]
+  },
+  {
+   "id": "k06",
+   "type": "keyword",
+   "q": "weighted histogram observe locked",
+   "targets": [
+    {
+     "name": "observeWithWeightLocked"
+    }
+   ]
+  },
+  {
+   "id": "k07",
+   "type": "keyword",
+   "q": "atomic writer validate payload",
+   "targets": [
+    {
+     "name": "validatePayload",
+     "path_contains": "atomic_writer.go"
+    }
+   ]
+  },
+  {
+   "id": "k08",
+   "type": "phrase",
+   "q": "version skew policy",
+   "targets": [
+    {
+     "name_contains": "Version skew policy",
+     "path_contains": "cri-api/README.md"
+    }
+   ]
+  },
+  {
+   "id": "k09",
+   "type": "phrase",
+   "q": "cluster setup preparation",
+   "targets": [
+    {
+     "name_contains": "Cluster setup preparation",
+     "path_contains": "test/e2e/dra/README.md"
+    }
+   ]
+  },
+  {
+   "id": "k10",
+   "type": "prefix",
+   "q": "NewPrefixTransf",
+   "targets": [
+    {
+     "name": "NewPrefixTransformers"
+    }
+   ]
+  },
+  {
+   "id": "k11",
+   "type": "prefix",
+   "q": "APIObjectVers",
+   "targets": [
+    {
+     "name": "APIObjectVersioner"
+    }
+   ]
+  },
+  {
+   "id": "k12",
+   "type": "substring",
+   "q": "cpumanager/policy_st",
+   "targets": [
+    {
+     "path_contains": "pkg/kubelet/cm/cpumanager/policy_static"
+    }
+   ]
+  },
+  {
+   "id": "k13",
+   "type": "substring",
+   "q": "HintSocketAlig",
+   "targets": [
+    {
+     "name": "isHintSocketAligned"
+    }
+   ]
+  },
+  {
+   "id": "k14",
+   "type": "regex",
+   "q": "^Fmt.*Configuration$",
+   "targets": [
+    {
+     "name": "FmtPriorityLevelConfiguration"
+    }
+   ]
+  },
+  {
+   "id": "k15",
+   "type": "regex",
+   "q": "loadmetrics/.*handler",
+   "targets": [
+    {
+     "path_contains": "loadmetrics/handler.go"
+    }
+   ]
+  }
+ ]
+}

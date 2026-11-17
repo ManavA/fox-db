@@ -1,0 +1,542 @@
+{
+ "name": "kubernetes-retrieval",
+ "repo": "kubernetes",
+ "url": "https://github.com/kubernetes/kubernetes",
+ "commit": "aaaf121ca6d8e73dde021892a8280523c0c005aa",
+ "about": "Retrieval quality set: vague questions paraphrased from docstrings, code-vocabulary keyword queries, and bare identifiers. A query hits when any of its targets is in the top k; a target is a path, or a path and a symbol name.",
+ "queries": [
+  {
+   "id": "v01",
+   "type": "vague",
+   "q": "where is the code that decides how many replicas each replica set gets when a deployment is scaled in the middle of a rollout",
+   "targets": [
+    {
+     "path": "pkg/controller/deployment/util/deployment_util.go",
+     "name": "getReplicaSetFraction"
+    }
+   ]
+  },
+  {
+   "id": "v02",
+   "type": "vague",
+   "q": "kubelet waits until it is a container's turn to shut down based on declared stop ordering",
+   "targets": [
+    {
+     "path": "pkg/kubelet/kuberuntime/kuberuntime_termination_order.go",
+     "name": "waitForTurn"
+    }
+   ]
+  },
+  {
+   "id": "v03",
+   "type": "vague",
+   "q": "stop a single object from flooding the cluster with too many events",
+   "targets": [
+    {
+     "path": "staging/src/k8s.io/client-go/tools/record/events_cache.go",
+     "name": "Filter"
+    }
+   ]
+  },
+  {
+   "id": "v04",
+   "type": "vague",
+   "q": "make sure a file written into a projected volume is not an absolute path and does not escape with dot dot",
+   "targets": [
+    {
+     "path": "pkg/volume/util/atomic_writer.go",
+     "name": "validatePath"
+    }
+   ]
+  },
+  {
+   "id": "v05",
+   "type": "vague",
+   "q": "reload the TLS serving certificate and key when the files on disk are rewritten",
+   "targets": [
+    {
+     "path": "staging/src/k8s.io/apiserver/pkg/server/dynamiccertificates/dynamic_serving_content.go"
+    }
+   ]
+  },
+  {
+   "id": "v06",
+   "type": "vague",
+   "q": "collapse duplicate consecutive notifications for the same object in the informer queue",
+   "targets": [
+    {
+     "path": "staging/src/k8s.io/client-go/tools/cache/delta_fifo.go",
+     "name": "dedupDeltas"
+    }
+   ]
+  },
+  {
+   "id": "v07",
+   "type": "vague",
+   "q": "how does the batch controller decide to create or remove pods while respecting back-off",
+   "targets": [
+    {
+     "path": "pkg/controller/job/job_controller.go",
+     "name": "manageJob"
+    }
+   ]
+  },
+  {
+   "id": "v08",
+   "type": "vague",
+   "q": "after a kubelet restart, rediscover which volumes a pod had by scanning its directory on disk",
+   "targets": [
+    {
+     "path": "pkg/kubelet/volumemanager/reconciler/reconstruct_common.go",
+     "name": "getVolumesFromPodDir"
+    }
+   ]
+  },
+  {
+   "id": "v09",
+   "type": "vague",
+   "q": "make an HTTP request body readable again so the request can be retried on a new connection",
+   "targets": [
+    {
+     "path": "staging/src/k8s.io/client-go/transport/connection_pool.go",
+     "name": "rewindRequest"
+    }
+   ]
+  },
+  {
+   "id": "v10",
+   "type": "vague",
+   "q": "decide whether the Windows host network stack supports the kernel-mode service proxy",
+   "targets": [
+    {
+     "path": "pkg/proxy/winkernel/supported.go",
+     "name": "CanUseWinKernelProxier"
+    }
+   ]
+  },
+  {
+   "id": "v11",
+   "type": "vague",
+   "q": "where does the scheduler filter out machines that cannot run a pod",
+   "targets": [
+    {
+     "path": "pkg/scheduler/algorithm.go",
+     "name": "findNodesThatFitPod"
+    }
+   ]
+  },
+  {
+   "id": "v12",
+   "type": "vague",
+   "q": "where is the guaranteed / burstable / best effort class of a pod worked out",
+   "targets": [
+    {
+     "path": "pkg/apis/core/v1/helper/qos/qos.go"
+    },
+    {
+     "path": "pkg/apis/core/helper/qos/qos.go"
+    }
+   ]
+  },
+  {
+   "id": "v13",
+   "type": "vague",
+   "q": "code that kicks pods off a node when it runs short on memory or disk",
+   "targets": [
+    {
+     "path": "pkg/kubelet/eviction/eviction_manager.go",
+     "name": "synchronize"
+    }
+   ]
+  },
+  {
+   "id": "v14",
+   "type": "vague",
+   "q": "remove pods from nodes that carry taints they do not tolerate with the execute effect",
+   "targets": [
+    {
+     "path": "pkg/controller/tainteviction/taint_eviction.go"
+    }
+   ]
+  },
+  {
+   "id": "v15",
+   "type": "vague",
+   "q": "how a candidate keeps or grabs the lock that makes it the single active controller",
+   "targets": [
+    {
+     "path": "staging/src/k8s.io/client-go/tools/leaderelection/leaderelection.go",
+     "name": "tryAcquireOrRenew"
+    },
+    {
+     "path": "staging/src/k8s.io/client-go/tools/leaderelection/leaderelection.go",
+     "name": "renew"
+    }
+   ]
+  },
+  {
+   "id": "v16",
+   "type": "vague",
+   "q": "safely move every workload off a machine before maintenance, using the eviction API",
+   "targets": [
+    {
+     "path": "staging/src/k8s.io/kubectl/pkg/drain/drain.go"
+    }
+   ]
+  },
+  {
+   "id": "v17",
+   "type": "vague",
+   "q": "turn strings like 100Mi or 1.5 into a numeric amount of a resource",
+   "targets": [
+    {
+     "path": "staging/src/k8s.io/apimachinery/pkg/api/resource/quantity.go",
+     "name": "ParseQuantity"
+    }
+   ]
+  },
+  {
+   "id": "v18",
+   "type": "vague",
+   "q": "encode strings with their size in front so concatenated cache keys cannot collide",
+   "targets": [
+    {
+     "path": "staging/src/k8s.io/apiserver/pkg/authentication/token/cache/cached_token_authenticator.go",
+     "name": "writeLengthPrefixedString"
+    }
+   ]
+  },
+  {
+   "id": "v19",
+   "type": "vague",
+   "q": "keep the admission plugin's annotation untouched when the pod is resized in place",
+   "targets": [
+    {
+     "path": "plugin/pkg/admission/limitranger/admission.go",
+     "name": "preserveLimitAnnotation"
+    }
+   ]
+  },
+  {
+   "id": "v20",
+   "type": "vague",
+   "q": "react when a slice of service backends changes in a way the controller did not expect",
+   "targets": [
+    {
+     "path": "pkg/controller/endpointslice/endpointslice_controller.go",
+     "name": "onEndpointSliceUpdate"
+    }
+   ]
+  },
+  {
+   "id": "v21",
+   "type": "vague",
+   "q": "tell whether a resource name lives in the built-in domain or is a vendor extension",
+   "targets": [
+    {
+     "path": "pkg/apis/core/v1/helper/helpers.go",
+     "name": "IsNativeResource"
+    }
+   ]
+  },
+  {
+   "id": "v22",
+   "type": "vague",
+   "q": "join URL path pieces without losing the slash at the end",
+   "targets": [
+    {
+     "path": "staging/src/k8s.io/apimachinery/pkg/util/net/http.go",
+     "name": "JoinPreservingTrailingSlash"
+    }
+   ]
+  },
+  {
+   "id": "v23",
+   "type": "vague",
+   "q": "convert the newer combined discovery document back into the old per-group format",
+   "targets": [
+    {
+     "path": "staging/src/k8s.io/client-go/discovery/aggregated_discovery.go",
+     "name": "convertAPIGroup"
+    }
+   ]
+  },
+  {
+   "id": "v24",
+   "type": "vague",
+   "q": "compute how many pods the autoscaler wants from CPU utilisation",
+   "targets": [
+    {
+     "path": "pkg/controller/podautoscaler/replica_calculator.go",
+     "name": "GetResourceReplicas"
+    }
+   ]
+  },
+  {
+   "id": "v25",
+   "type": "vague",
+   "q": "delete unused container images when the disk gets too full",
+   "targets": [
+    {
+     "path": "pkg/kubelet/images/image_gc_manager.go",
+     "name": "GarbageCollect"
+    }
+   ]
+  },
+  {
+   "id": "v26",
+   "type": "vague",
+   "q": "keep a bounded number of failed and finished workloads around and delete the oldest",
+   "targets": [
+    {
+     "path": "pkg/controller/cronjob/cronjob_controllerv2.go"
+    },
+    {
+     "path": "pkg/controller/cronjob/utils.go"
+    }
+   ]
+  },
+  {
+   "id": "v27",
+   "type": "vague",
+   "q": "figure out where a block device's symlink lives for a storage plugin volume",
+   "targets": [
+    {
+     "path": "pkg/volume/csi/csi_util.go",
+     "name": "getVolumeDevicePluginDir"
+    }
+   ]
+  },
+  {
+   "id": "v28",
+   "type": "vague",
+   "q": "multiply a resource amount and report whether precision was lost",
+   "targets": [
+    {
+     "path": "staging/src/k8s.io/apimachinery/pkg/api/resource/quantity.go",
+     "name": "Mul"
+    }
+   ]
+  },
+  {
+   "id": "k01",
+   "type": "keyword",
+   "q": "translate in-tree storage class parameters to CSI",
+   "targets": [
+    {
+     "path": "staging/src/k8s.io/csi-translation-lib/translate.go",
+     "name": "TranslateInTreeStorageClassToCSI"
+    }
+   ]
+  },
+  {
+   "id": "k02",
+   "type": "keyword",
+   "q": "garbage collector graph builder monitors synced",
+   "targets": [
+    {
+     "path": "pkg/controller/garbagecollector/graph_builder.go",
+     "name": "IsSynced"
+    }
+   ]
+  },
+  {
+   "id": "k03",
+   "type": "keyword",
+   "q": "update pod condition last transition time",
+   "targets": [
+    {
+     "path": "pkg/api/v1/pod/util.go",
+     "name": "UpdatePodCondition"
+    }
+   ]
+  },
+  {
+   "id": "k04",
+   "type": "keyword",
+   "q": "add or update toleration in pod spec",
+   "targets": [
+    {
+     "path": "pkg/apis/core/v1/helper/helpers.go",
+     "name": "AddOrUpdateTolerationInPodSpec"
+    }
+   ]
+  },
+  {
+   "id": "k05",
+   "type": "keyword",
+   "q": "ipvs proxier write iptables rules ipset",
+   "targets": [
+    {
+     "path": "pkg/proxy/ipvs/proxier.go",
+     "name": "writeIptablesRules"
+    }
+   ]
+  },
+  {
+   "id": "k06",
+   "type": "keyword",
+   "q": "event aggregator by reason",
+   "targets": [
+    {
+     "path": "staging/src/k8s.io/client-go/tools/record/events_cache.go",
+     "name": "EventAggregatorByReasonFunc"
+    }
+   ]
+  },
+  {
+   "id": "k07",
+   "type": "keyword",
+   "q": "kubeconfig loader from config flags overrides",
+   "targets": [
+    {
+     "path": "staging/src/k8s.io/cli-runtime/pkg/genericclioptions/config_flags.go",
+     "name": "ToRawKubeConfigLoader"
+    }
+   ]
+  },
+  {
+   "id": "k08",
+   "type": "keyword",
+   "q": "validate pod host network dependent fields",
+   "targets": [
+    {
+     "path": "pkg/apis/core/validation/validation.go",
+     "name": "validatePodHostNetworkDeps"
+    }
+   ]
+  },
+  {
+   "id": "k09",
+   "type": "keyword",
+   "q": "CEL type to DeclType conversion for cost estimator",
+   "targets": [
+    {
+     "path": "staging/src/k8s.io/apiserver/pkg/admission/plugin/cel/composition.go",
+     "name": "convertCelTypeToDeclType"
+    }
+   ]
+  },
+  {
+   "id": "k10",
+   "type": "keyword",
+   "q": "statefulset delete pod NotFound treated as success",
+   "targets": [
+    {
+     "path": "pkg/controller/statefulset/stateful_pod_control.go",
+     "name": "DeleteStatefulPod"
+    }
+   ]
+  },
+  {
+   "id": "e01",
+   "type": "exact",
+   "q": "getReplicaSetFraction",
+   "targets": [
+    {
+     "path": "pkg/controller/deployment/util/deployment_util.go",
+     "name": "getReplicaSetFraction"
+    }
+   ]
+  },
+  {
+   "id": "e02",
+   "type": "exact",
+   "q": "dedupDeltas",
+   "targets": [
+    {
+     "path": "staging/src/k8s.io/client-go/tools/cache/delta_fifo.go",
+     "name": "dedupDeltas"
+    }
+   ]
+  },
+  {
+   "id": "e03",
+   "type": "exact",
+   "q": "ParseQuantity",
+   "targets": [
+    {
+     "path": "staging/src/k8s.io/apimachinery/pkg/api/resource/quantity.go",
+     "name": "ParseQuantity"
+    }
+   ]
+  },
+  {
+   "id": "e04",
+   "type": "exact",
+   "q": "tryAcquireOrRenew",
+   "targets": [
+    {
+     "path": "staging/src/k8s.io/client-go/tools/leaderelection/leaderelection.go",
+     "name": "tryAcquireOrRenew"
+    }
+   ]
+  },
+  {
+   "id": "e05",
+   "type": "exact",
+   "q": "JoinPreservingTrailingSlash",
+   "targets": [
+    {
+     "path": "staging/src/k8s.io/apimachinery/pkg/util/net/http.go",
+     "name": "JoinPreservingTrailingSlash"
+    }
+   ]
+  },
+  {
+   "id": "e06",
+   "type": "exact",
+   "q": "findNodesThatFitPod",
+   "targets": [
+    {
+     "path": "pkg/scheduler/algorithm.go",
+     "name": "findNodesThatFitPod"
+    }
+   ]
+  },
+  {
+   "id": "e07",
+   "type": "exact",
+   "q": "IsMigratedFromV1",
+   "targets": [
+    {
+     "path": "pkg/kubelet/allocation/state/checkpoint_v1.go",
+     "name": "IsMigratedFromV1"
+    }
+   ]
+  },
+  {
+   "id": "e08",
+   "type": "exact",
+   "q": "manageJob",
+   "targets": [
+    {
+     "path": "pkg/controller/job/job_controller.go",
+     "name": "manageJob"
+    }
+   ]
+  },
+  {
+   "id": "e09",
+   "type": "exact",
+   "q": "GetResourceReplicas",
+   "targets": [
+    {
+     "path": "pkg/controller/podautoscaler/replica_calculator.go",
+     "name": "GetResourceReplicas"
+    }
+   ]
+  },
+  {
+   "id": "e10",
+   "type": "exact",
+   "q": "writeLengthPrefixedString",
+   "targets": [
+    {
+     "path": "staging/src/k8s.io/apiserver/pkg/authentication/token/cache/cached_token_authenticator.go",
+     "name": "writeLengthPrefixedString"
+    }
+   ]
+  }
+ ]
+}

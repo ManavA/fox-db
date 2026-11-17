@@ -1,0 +1,216 @@
+{
+ "name": "fixture-retrieval",
+ "repo": "bench/eval/fixture",
+ "about": "A small checked-in corpus (bench/eval/fixture) run by `cargo test` on every change: questions in words, code vocabulary and bare identifiers, each with one target symbol.",
+ "queries": [
+  {
+   "id": "v01",
+   "type": "vague",
+   "q": "make a request body readable again so it can be sent a second time",
+   "targets": [
+    {
+     "path": "net/retry.go",
+     "name": "rewindBody"
+    }
+   ]
+  },
+  {
+   "id": "v02",
+   "type": "vague",
+   "q": "wait longer between attempts each time, up to a limit",
+   "targets": [
+    {
+     "path": "net/retry.go",
+     "name": "backoffDelay"
+    }
+   ]
+  },
+  {
+   "id": "v03",
+   "type": "vague",
+   "q": "join url path pieces without losing the slash at the end",
+   "targets": [
+    {
+     "path": "net/join.go",
+     "name": "joinPathKeepSlash"
+    }
+   ]
+  },
+  {
+   "id": "v04",
+   "type": "vague",
+   "q": "drop machines that cannot run a pod",
+   "targets": [
+    {
+     "path": "sched/filter.py",
+     "name": "nodes_that_fit"
+    }
+   ]
+  },
+  {
+   "id": "v05",
+   "type": "vague",
+   "q": "kick pods off a node when it runs short on memory",
+   "targets": [
+    {
+     "path": "sched/evict.rs",
+     "name": "evict_under_pressure"
+    }
+   ]
+  },
+  {
+   "id": "v06",
+   "type": "vague",
+   "q": "turn strings like 100Mi into a number",
+   "targets": [
+    {
+     "path": "store/quantity.go",
+     "name": "parseAmount"
+    }
+   ]
+  },
+  {
+   "id": "v07",
+   "type": "vague",
+   "q": "serve the cached value now and refresh it in the background",
+   "targets": [
+    {
+     "path": "store/cache.ts",
+     "name": "cachedFetch"
+    }
+   ]
+  },
+  {
+   "id": "v08",
+   "type": "vague",
+   "q": "keep the focused row in the middle of the screen",
+   "targets": [
+    {
+     "path": "ui/focus.kt",
+     "name": "centerFocusedRow"
+    }
+   ]
+  },
+  {
+   "id": "v09",
+   "type": "vague",
+   "q": "strip accents and punctuation so titles compare",
+   "targets": [
+    {
+     "path": "util/strings.rs",
+     "name": "fold_title"
+    }
+   ]
+  },
+  {
+   "id": "v10",
+   "type": "vague",
+   "q": "put the length in front so joined keys cannot collide",
+   "targets": [
+    {
+     "path": "util/strings.rs",
+     "name": "write_length_prefixed"
+    }
+   ]
+  },
+  {
+   "id": "k01",
+   "type": "keyword",
+   "q": "multiply amount precision lost",
+   "targets": [
+    {
+     "path": "store/quantity.go",
+     "name": "mulAmount"
+    }
+   ]
+  },
+  {
+   "id": "k02",
+   "type": "keyword",
+   "q": "prune cache max age",
+   "targets": [
+    {
+     "path": "store/cache.ts",
+     "name": "pruneCache"
+    }
+   ]
+  },
+  {
+   "id": "k03",
+   "type": "keyword",
+   "q": "tolerates taints",
+   "targets": [
+    {
+     "path": "sched/filter.py",
+     "name": "tolerates_taints"
+    }
+   ]
+  },
+  {
+   "id": "k04",
+   "type": "keyword",
+   "q": "top edge scrim navigation",
+   "targets": [
+    {
+     "path": "ui/focus.kt",
+     "name": "topEdgeScrim"
+    }
+   ]
+  },
+  {
+   "id": "e01",
+   "type": "exact",
+   "q": "rewindBody",
+   "targets": [
+    {
+     "path": "net/retry.go",
+     "name": "rewindBody"
+    }
+   ]
+  },
+  {
+   "id": "e02",
+   "type": "exact",
+   "q": "nodes_that_fit",
+   "targets": [
+    {
+     "path": "sched/filter.py",
+     "name": "nodes_that_fit"
+    }
+   ]
+  },
+  {
+   "id": "e03",
+   "type": "exact",
+   "q": "parseAmount",
+   "targets": [
+    {
+     "path": "store/quantity.go",
+     "name": "parseAmount"
+    }
+   ]
+  },
+  {
+   "id": "e04",
+   "type": "exact",
+   "q": "evict_under_pressure",
+   "targets": [
+    {
+     "path": "sched/evict.rs",
+     "name": "evict_under_pressure"
+    }
+   ]
+  },
+  {
+   "id": "e05",
+   "type": "exact",
+   "q": "fold_title",
+   "targets": [
+    {
+     "path": "util/strings.rs",
+     "name": "fold_title"
+    }
+   ]
+  }
+ ]
+}

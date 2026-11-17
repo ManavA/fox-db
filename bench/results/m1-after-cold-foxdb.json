@@ -1,0 +1,78 @@
+{
+  "client": "cold-cli",
+  "headroom": "headroom-off",
+  "instructions_tokens": 82,
+  "iters": 5,
+  "label": "after-cold",
+  "rows": [
+    {
+      "cat": "callers",
+      "hit5": 3,
+      "mrr": 1.0,
+      "n": 3,
+      "naive_tokens": 1203,
+      "p50_ms": 13.213631,
+      "p95_ms": 15.645666999999998,
+      "saved_tokens": 1176,
+      "tokens_per_answer": 27
+    },
+    {
+      "cat": "doc",
+      "hit5": 4,
+      "mrr": 1.0,
+      "n": 4,
+      "naive_tokens": 4510,
+      "p50_ms": 25.891008,
+      "p95_ms": 28.810398,
+      "saved_tokens": 4341,
+      "tokens_per_answer": 169
+    },
+    {
+      "cat": "memory",
+      "hit5": 2,
+      "mrr": 1.0,
+      "n": 2,
+      "naive_tokens": 152,
+      "p50_ms": 30.003777999999997,
+      "p95_ms": 40.678767,
+      "saved_tokens": 133,
+      "tokens_per_answer": 18
+    },
+    {
+      "cat": "nl",
+      "hit5": 4,
+      "mrr": 1.0,
+      "n": 4,
+      "naive_tokens": 2969,
+      "p50_ms": 34.698253,
+      "p95_ms": 38.514876,
+      "saved_tokens": 2686,
+      "tokens_per_answer": 283
+    },
+    {
+      "cat": "symbol",
+      "hit5": 6,
+      "mrr": 1.0,
+      "n": 6,
+      "naive_tokens": 2779,
+      "p50_ms": 28.329200999999998,
+      "p95_ms": 36.040411,
+      "saved_tokens": 2724,
+      "tokens_per_answer": 55
+    },
+    {
+      "cat": "all",
+      "hit5": 19,
+      "mrr": 1.0,
+      "n": 19,
+      "naive_tokens": 2658,
+      "p50_ms": 26.876424,
+      "p95_ms": 37.508852000000005,
+      "saved_tokens": 2539,
+      "tokens_per_answer": 118
+    }
+  ],
+  "set": "foxdb",
+  "store_bytes": 72728576,
+  "tool_def_tokens": 759
+}
