@@ -9,25 +9,36 @@ Caller and impact answers no longer look complete when they are not, and more ca
   instead of competing with it, `static` functions outside headers stay in their own file, and
   among several same-name definitions the one nearest in the tree that is not under a test,
   sample or tools directory is taken (labelled `guess 1 of N`). A function named in a designated
-  initializer (`.open = foo_open`) is a reference.
+  initializer (`.open = foo_open`) is a reference; a parameter or local of the same name
+  (`.size = size` in `f(int size)`) is not.
 - Calls through a receiver chain or a property (`theme.current.palette.fill()`,
-  `inputs.render(plan)`) resolve by their last name. The receiver's last name counts when it
-  matches a type (`inputs` reaches `Inputs` or `SessionInputs`; Go embedded fields such as
-  `pl.Evaluator.Preempt()` reach `Evaluator.Preempt`). With no such signal, a receiver call whose
-  name has several words is a guess among at most three same-name members (`guess by name`,
-  `guess 1 of N`); one-word names (`push`, `get`) still stay unresolved.
-- Function references are references: Kotlin `::fn` and `Type::fn`, Go function values in keyed
-  composite literals.
+  `inputs.render(plan)`) resolve by their last name. The receiver's last name breaks a tie
+  between candidates already in scope (Go embedded fields such as `pl.Evaluator.Preempt()` reach
+  `Evaluator.Preempt`). When it is the only signal (`palette` and an unimported `Palette`), the
+  call is a guess for a name of several words and stays unresolved for a one-word name, since
+  the receiver's real type is unknown (`state.update()` on a library `MutableStateFlow`). With no
+  signal at all, a receiver call whose name has several words is a guess among at most three
+  same-name members (`guess by name`, `guess 1 of N`); one-word names (`push`, `get`) and
+  standard-library method names (`toString`, `hashCode`, `is_empty`, `to_vec`) stay unresolved.
+- Function references are references: Kotlin `::fn` and `Type::fn`, and in Go a function named
+  by a plain identifier in a keyed composite literal (`RunE: runCmd`), unless a parameter or local
+  of the enclosing function has that name. A package-qualified value (`RunE: cmd.Run`) is not
+  captured; the completeness line counts its file.
 - A symbol query prefers the name as typed over a same-name symbol in another case
   (`render` the method before `Render` the class), and a definition over its C prototype.
 - Completeness signal: `callers` and `refs` (CLI and MCP `fox_graph`) add one line when the
   name occurs in more files than the answer lists, counted from the index only (unresolved or
-  guessed references of that name, and, for names of several words, symbol text holding the
-  name as a whole word): `may be incomplete: `name` also appears in N other files; confirm
-  with: rg -nw name`. `impact` adds the same line as `partial at d1: ...`. Nothing is added when
-  the counts agree.
-- The store moves to schema 14: on the next index run, C, C++, Objective-C, Kotlin and Go files
-  parse again once (handles of their symbols change) and every project re-scores its references.
+  guessed references of that name, and every code file holding the name as a whole word, case
+  as typed, anywhere in the file: file-scope initializers, macro bodies, comments): `may be
+  incomplete: `name` also appears in N other files; confirm with: rg -nw name`. `impact` adds
+  the same line as `partial at d1: ...`. Nothing is added when the counts agree. Files that
+  define a same-name symbol of their own are not counted.
+- Source directories named `target` (Linux `drivers/target`, `drivers/nvme/target`) are indexed.
+  A `target` directory is skipped as build output only beside a build manifest (`Cargo.toml`,
+  `pom.xml`, `build.sbt`, `build.gradle`, `project.clj`) or when it holds a `CACHEDIR.TAG`.
+- The store moves to schema 15: on the next index run, C, C++, Objective-C, Kotlin and Go files
+  parse again once (handles of their symbols change), every project re-scores its references,
+  and every code file is read once more for its words (a new `fts_word` table).
 
 ## 0.2.0 (2026-11-17)
 

@@ -344,8 +344,21 @@ pub(crate) fn migrate(c: &Connection) -> Result<()> {
              PRAGMA user_version = 14;",
         )?;
     }
+    if v < 15 {
+        // 0.2.1: every identifier of every code file, for the completeness line of `callers`,
+        // `refs` and `impact`. Code files are read again once (their handles stay).
+        in_tx(c, || {
+            c.execute_batch(FTS_WORD)?;
+            c.execute_batch(
+                "INSERT OR REPLACE INTO meta(k, v)
+                   SELECT 'reindex:' || p.id, 1 FROM project p WHERE EXISTS (SELECT 1 FROM ts_file f WHERE f.project_id = p.id);
+                 PRAGMA user_version = 15;",
+            )?;
+            Ok(())
+        })?;
+    }
     // Cheap when already set: the setting lives in each table's own config.
-    for t in FTS_TABLES {
+    for t in MERGE_TABLES {
         defer_merges(c, t)?;
     }
     Ok(())
@@ -353,6 +366,14 @@ pub(crate) fn migrate(c: &Connection) -> Result<()> {
 
 /// The full-text tables. Their merges run when the store is idle, never inside a write.
 pub const FTS_TABLES: [&str; 3] = ["fts_node", "fts_trigram", "fts_body"];
+/// [`FTS_TABLES`] and `fts_word`, whose rowids are not node ids (see `tsindex::word_rowid`).
+pub const MERGE_TABLES: [&str; 4] = ["fts_node", "fts_trigram", "fts_body", "fts_word"];
+
+/// Each code file's identifiers, once each, as whole words (`_` is part of a word, capitals are
+/// kept as `~` and the lower case, see `tsindex::case_word`): which files
+/// hold a name at all, for the completeness line. Project and path come back with the match.
+const FTS_WORD: &str = "CREATE VIRTUAL TABLE IF NOT EXISTS fts_word USING fts5(project_id UNINDEXED, path UNINDEXED, words, \
+    tokenize=\"unicode61 tokenchars '_~'\", content='', contentless_delete=1, contentless_unindexed=1);";
 
 /// Symbol text for the body arm: the name columns of `fts_node` plus the doc comment and the
 /// identifier-split body (see `tscode::body_text`). Rowid is the node id.
@@ -387,7 +408,7 @@ fn defer_merges(c: &Connection, t: &str) -> Result<()> {
 /// Returns whether anything was merged, so an idle loop can stop once the tables are settled.
 pub fn fts_merge(c: &Connection, pages: i64) -> Result<bool> {
     let mut did = false;
-    for t in FTS_TABLES {
+    for t in MERGE_TABLES {
         let before = c.total_changes();
         c.execute(&format!("INSERT INTO {t}({t}, rank) VALUES ('merge', ?1)"), [pages])?;
         did |= c.total_changes() > before + 1;
@@ -397,7 +418,7 @@ pub fn fts_merge(c: &Connection, pages: i64) -> Result<bool> {
 
 /// Merge every full-text table into one segment (`fox index optimize`).
 pub fn fts_optimize(c: &Connection) -> Result<()> {
-    for t in FTS_TABLES {
+    for t in MERGE_TABLES {
         c.execute(&format!("INSERT INTO {t}({t}) VALUES ('optimize')"), [])?;
     }
     Ok(())
@@ -637,7 +658,7 @@ pub fn minority(c: &Connection, ranges: &[(i64, i64)]) -> bool {
 }
 
 /// The schema version this build writes.
-pub const LATEST: i64 = 14;
+pub const LATEST: i64 = 15;
 
 /// Read-only connection for the hot paths. None if the store does not exist yet.
 pub fn open_ro() -> Option<Connection> {

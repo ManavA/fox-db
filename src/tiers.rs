@@ -29,7 +29,6 @@ const SKIP_DIR_NAMES: &[&str] = &[
     "DerivedData",
     "node_modules",
     ".gradle",
-    "target",
     "Pods",
     ".swiftpm",
     ".venv",
@@ -185,6 +184,44 @@ fn build(globs: &[String]) -> Option<GlobSet> {
     b.build().ok()
 }
 
+/// Build manifests whose `target/` sibling is build output (Cargo, Maven, sbt, Gradle, Leiningen).
+const TARGET_MANIFESTS: &[&str] = &["Cargo.toml", "pom.xml", "build.sbt", "build.gradle", "build.gradle.kts", "project.clj"];
+
+/// Is `rel` (under `root`) a build-output directory named `target`: one beside a build manifest,
+/// or holding a cache tag? A source directory of that name (Linux `drivers/target`) is not.
+pub fn is_build_output(root: &Path, rel: &str) -> bool {
+    if name_of(rel) != "target" {
+        return false;
+    }
+    let dir = root.join(rel);
+    if dir.join("CACHEDIR.TAG").exists() || dir.join(".rustc_info.json").exists() {
+        return true;
+    }
+    let parent = dir.parent().unwrap_or(root);
+    TARGET_MANIFESTS.iter().any(|m| parent.join(m).exists())
+}
+
+/// [`classify_dir`], plus build-output `target/` directories, which need the file system.
+pub fn classify_dir_at(root: &Path, rel: &str, ov: &Overrides) -> Tier {
+    if is_build_output(root, rel) { Tier::Skip } else { classify_dir(rel, ov) }
+}
+
+/// True if a directory of `rel` is build output (see [`is_build_output`]).
+pub fn in_build_output(root: &Path, rel: &str) -> bool {
+    let mut acc = String::new();
+    let parts: Vec<&str> = rel.split('/').filter(|p| !p.is_empty() && *p != ".").collect();
+    for p in parts.iter().take(parts.len().saturating_sub(1)) {
+        if !acc.is_empty() {
+            acc.push('/');
+        }
+        acc.push_str(p);
+        if *p == "target" && is_build_output(root, &acc) {
+            return true;
+        }
+    }
+    false
+}
+
 /// Built-in decision for a directory (relative path, `/`-separated, no leading `./`).
 pub fn classify_dir(rel: &str, ov: &Overrides) -> Tier {
     let name = name_of(rel);
@@ -278,6 +315,23 @@ mod tests {
         assert!(is_denied_path(".agent-review/PXL-31/x.swift"));
         assert!(is_denied_path("Config/Local.xcconfig"));
         assert!(!is_denied_path("Sources/App/Main.swift"));
+        assert_eq!(classify_dir("drivers/target", &o), Tier::Code);
+    }
+    #[test]
+    fn build_output_target() {
+        let d = tempfile::tempdir().unwrap();
+        let r = d.path();
+        for f in ["Cargo.toml", "target/x", "crates/a/pom.xml", "crates/a/target/x", "drivers/target/x", "tagged/target/CACHEDIR.TAG"] {
+            std::fs::create_dir_all(r.join(f).parent().unwrap()).unwrap();
+            std::fs::write(r.join(f), "").unwrap();
+        }
+        let o = Overrides::default();
+        assert_eq!(classify_dir_at(r, "target", &o), Tier::Skip);
+        assert_eq!(classify_dir_at(r, "crates/a/target", &o), Tier::Skip);
+        assert_eq!(classify_dir_at(r, "tagged/target", &o), Tier::Skip);
+        assert_eq!(classify_dir_at(r, "drivers/target", &o), Tier::Code);
+        assert!(in_build_output(r, "target/debug/a.rs"));
+        assert!(!in_build_output(r, "drivers/target/core.c"));
     }
     #[test]
     fn files() {

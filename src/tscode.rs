@@ -170,8 +170,7 @@ fn sites(c: &Connection, targets: &[i64], calls_only: bool, lines: &mut Vec<Stri
 /// One line when `top`'s name occurs in more files than `listed` (its resolved sites) and its
 /// own file: `{lead}: `name` also appears in N other files; confirm with: rg -nw name`. None when
 /// the counts agree. Read from the index only (no file is opened): files with a reference of
-/// that name not resolved with certainty to another symbol, and, for a name of several words
-/// (`wake_up_process`, `loadItems`), files whose indexed symbol text holds it as a whole word.
+/// that name not resolved with certainty to another symbol, and files holding it as a whole word.
 fn completeness(c: &Connection, pid: i64, top: &TSym, listed: &HashSet<String>, lead: &str) -> Result<Option<String>> {
     let n = unlisted_files(c, pid, top, listed)?;
     let name = &top.name;
@@ -197,25 +196,49 @@ fn unlisted_files(c: &Connection, pid: i64, top: &TSym, listed: &HashSet<String>
             open.insert(path);
         }
     }
-    // A single word (`load`) is also a part of longer names in the word index; only a name of
-    // several parts is one distinctive indexed word (`wakeupprocess`, `loaditems`).
-    let word: String = name.chars().filter(|ch| *ch != '_').collect::<String>().to_lowercase();
-    if crate::search::ident_parts(name).len() > 1 && word.chars().all(char::is_alphanumeric) {
+    // Files holding the name as a whole word anywhere (file-scope initializers, macro bodies,
+    // comments), except those that define a same-name symbol of their own or whose references
+    // of it all go elsewhere. A store still owing its first word pass falls back to symbol text.
+    if name.chars().all(|ch| ch.is_alphanumeric() || ch == '_') {
         let mut d = c.prepare_cached(
-            "SELECT path FROM node INDEXED BY node_sym_name WHERE project_id = ?1 AND kind = 'symbol' AND name = ?2 COLLATE NOCASE AND source = 'treesitter'",
+            "SELECT path, name FROM node INDEXED BY node_sym_name WHERE project_id = ?1 AND kind = 'symbol' AND name = ?2 COLLATE NOCASE AND source = 'treesitter'",
         )?;
-        let defs: HashSet<String> = d.query_map(params![pid, name], |r| r.get::<_, String>(0))?.flatten().collect();
-        let mut f = c.prepare_cached(
-            "SELECT DISTINCT n.path FROM fts_body f JOIN node n ON n.id = f.rowid
-             WHERE fts_body MATCH ?1 AND n.project_id = ?2 AND n.kind = 'symbol' AND n.source = 'treesitter' LIMIT 20000",
-        )?;
-        for path in f.query_map(params![format!("body:\"{word}\""), pid], |r| r.get::<_, String>(0))?.flatten() {
+        // The words are matched case as typed, so only a definition of that exact name counts.
+        let defs: HashSet<String> = d
+            .query_map(params![pid, name], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))?
+            .flatten()
+            .filter(|(_, n)| n == name)
+            .map(|(p, _)| p)
+            .collect();
+        let paths: Vec<String> = if crate::db::reindex_pending(c, pid) {
+            body_paths(c, pid, name)?
+        } else {
+            let mut f = c.prepare_cached("SELECT path FROM fts_word WHERE fts_word MATCH ?1 AND project_id = ?2 LIMIT 50000")?;
+            f.query_map(params![format!("words:\"{}\"", crate::tsindex::case_word(name)), pid], |r| r.get::<_, String>(0))?
+                .flatten()
+                .collect()
+        };
+        for path in paths {
             if !closed.contains(&path) && !defs.contains(&path) {
                 open.insert(path);
             }
         }
     }
     Ok(open.iter().filter(|p| !skip.contains(*p)).count())
+}
+
+/// Files whose indexed symbol text holds `name` as a whole word, for a name of several parts
+/// (a single word is also a part of longer names in that index).
+fn body_paths(c: &Connection, pid: i64, name: &str) -> Result<Vec<String>> {
+    let word: String = name.chars().filter(|ch| *ch != '_').collect::<String>().to_lowercase();
+    if crate::search::ident_parts(name).len() < 2 {
+        return Ok(vec![]);
+    }
+    let mut f = c.prepare_cached(
+        "SELECT DISTINCT n.path FROM fts_body f JOIN node n ON n.id = f.rowid
+         WHERE fts_body MATCH ?1 AND n.project_id = ?2 AND n.kind = 'symbol' AND n.source = 'treesitter' LIMIT 20000",
+    )?;
+    Ok(f.query_map(params![format!("body:\"{word}\""), pid], |r| r.get::<_, String>(0))?.flatten().collect())
 }
 
 /// ` guess 1 of N` after a site resolved by name among N same-name definitions; ` guess by

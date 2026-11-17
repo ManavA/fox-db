@@ -130,6 +130,64 @@ fn receiver_name(n: tree_sitter::Node, src: &[u8]) -> Option<String> {
         .then(|| t.to_string())
 }
 
+/// Function-like nodes whose parameters and locals can shadow a function name.
+const FN_KINDS: &[&str] = &["function_declaration", "method_declaration", "func_literal", "function_definition", "lambda_expression"];
+
+/// Is the identifier `n` declared as a parameter or local of the outermost function enclosing it
+/// (Go `name := ...`, `var name`, `func f(name string)`; C `int size`, `void f(int size)`)?
+fn is_local(n: tree_sitter::Node, src: &[u8]) -> bool {
+    let Ok(name) = n.utf8_text(src) else { return false };
+    let mut f = None;
+    let mut cur = n.parent();
+    while let Some(x) = cur {
+        if FN_KINDS.contains(&x.kind()) {
+            f = Some(x);
+        }
+        cur = x.parent();
+    }
+    let Some(f) = f else { return false };
+    let mut stack = vec![f];
+    while let Some(x) = stack.pop() {
+        if x.kind() == "identifier" && x.id() != n.id() && x.utf8_text(src).is_ok_and(|t| t == name) && declares(x) {
+            return true;
+        }
+        let mut w = x.walk();
+        stack.extend(x.named_children(&mut w));
+    }
+    false
+}
+
+/// Is identifier `x` in a declaring position: a parameter or variable name, not a use?
+fn declares(x: tree_sitter::Node) -> bool {
+    let is_field = |p: tree_sitter::Node, field: &str, c: tree_sitter::Node| p.child_by_field_name(field).is_some_and(|y| y.id() == c.id());
+    let mut c = x;
+    while let Some(p) = c.parent() {
+        match p.kind() {
+            // Go: `name := ...` and `for name := range ...` (the left-hand list).
+            "expression_list" => {
+                return p.parent().is_some_and(|g| matches!(g.kind(), "short_var_declaration" | "range_clause") && is_field(g, "left", p));
+            }
+            "parameter_declaration"
+            | "variadic_parameter_declaration"
+            | "var_spec"
+            | "const_spec"
+            | "declaration"
+            | "optional_parameter_declaration" => {
+                return !is_field(p, "type", c) && !is_field(p, "value", c);
+            }
+            // C/C++: a declarator wraps the name (`*p`, `a[4]`, `x = 1`).
+            "pointer_declarator" | "array_declarator" | "parenthesized_declarator" | "reference_declarator" | "init_declarator" => {
+                if !is_field(p, "declarator", c) && p.kind() != "parenthesized_declarator" {
+                    return false;
+                }
+                c = p;
+            }
+            _ => return false,
+        }
+    }
+    false
+}
+
 /// Parse one file and extract definitions and references.
 pub fn extract(l: &Lang, src: &[u8]) -> Parsed {
     let mut out = Parsed::default();
@@ -203,6 +261,14 @@ pub fn extract(l: &Lang, src: &[u8]) -> Parsed {
                 stat,
             });
         } else if let Some(k) = cn.strip_prefix("reference.") {
+            // A value in a keyed literal or designated initializer (`Name: name`, `.size = size`)
+            // that names a parameter or local of the enclosing function is no function reference.
+            if ref_kind(k) == "ref"
+                && nn.parent().is_some_and(|p| matches!(p.kind(), "literal_element" | "initializer_pair"))
+                && is_local(nn, src)
+            {
+                continue;
+            }
             out.refs.push(Ref {
                 kind: ref_kind(k),
                 name,
@@ -323,6 +389,7 @@ enum Work {
         mtime: i64,
         parsed: Parsed,
         texts: Vec<String>,
+        words: String,
     },
     /// An unchanged file whose symbols' body text is written again (a backfill or a rebuild).
     Body {
@@ -330,6 +397,7 @@ enum Work {
         size: i64,
         mtime: i64,
         texts: Vec<String>,
+        words: String,
     },
 }
 
@@ -475,10 +543,11 @@ pub fn index_project_with(c: &mut Connection, p: &Project, delta: Option<&crate:
             }
             let parsed = extract(l, &bytes);
             let texts = parsed.defs.iter().map(|d| body_text(&bytes, d)).collect();
+            let words = file_words(&bytes);
             if same {
-                return Some(Work::Body { path: path.clone(), size: *size, mtime: *mtime, texts });
+                return Some(Work::Body { path: path.clone(), size: *size, mtime: *mtime, texts, words });
             }
-            Some(Work::Parse { path: path.clone(), lang: l.name, hash, size: *size, mtime: *mtime, parsed, texts })
+            Some(Work::Parse { path: path.clone(), lang: l.name, hash, size: *size, mtime: *mtime, parsed, texts, words })
         })
         .collect();
     trace("ts parse", t0);
@@ -516,15 +585,16 @@ pub fn index_project_with(c: &mut Connection, p: &Project, delta: Option<&crate:
                 )?;
                 st.unchanged += 1;
             }
-            Work::Body { path, size, mtime, texts } => {
+            Work::Body { path, size, mtime, texts, words } => {
                 tx.execute(
                     "UPDATE ts_file SET size = ?3, mtime = ?4 WHERE project_id = ?1 AND path = ?2",
                     params![p.id, path, size, mtime],
                 )?;
                 store_bodies(&tx, &sink, p.id, &path, &texts, fill.then_some(&mut emitted))?;
+                store_words(&tx, p.id, &path, &words)?;
                 st.unchanged += 1;
             }
-            Work::Parse { path, lang, hash, size, mtime, parsed, texts } => {
+            Work::Parse { path, lang, hash, size, mtime, parsed, texts, words } => {
                 if old.contains_key(&path) {
                     old_names(&path, &mut sc_names)?;
                     drop_file(&tx, &sink, p.id, &path)?;
@@ -532,6 +602,7 @@ pub fn index_project_with(c: &mut Connection, p: &Project, delta: Option<&crate:
                 sc_names.extend(parsed.defs.iter().map(|d| d.name.clone()));
                 sc_paths.insert(path.clone());
                 store_file(&tx, &sink, p.id, &path, lang, &parsed, &texts, fill.then_some(&mut emitted))?;
+                store_words(&tx, p.id, &path, &words)?;
                 tx.execute(
                     "INSERT OR REPLACE INTO ts_file(project_id, path, lang, hash, size, mtime) VALUES (?1,?2,?3,?4,?5,?6)",
                     params![p.id, path, lang, hash, size, mtime],
@@ -602,6 +673,58 @@ fn drop_file(tx: &Connection, sink: &Sink, pid: i64, path: &str) -> Result<()> {
     tx.execute(&format!("UPDATE ts_ref SET dst = 0 WHERE dst != 0 AND dst IN ({sel})"), params![pid, path])?;
     tx.execute("DELETE FROM node WHERE project_id = ?1 AND path = ?2 AND kind = 'symbol' AND source = 'treesitter'", params![pid, path])?;
     tx.execute("DELETE FROM ts_ref WHERE project_id = ?1 AND path = ?2", params![pid, path])?;
+    tx.execute("DELETE FROM fts_word WHERE rowid = ?1", [word_rowid(pid, path)])?;
+    Ok(())
+}
+
+/// The `fts_word` rowid of a file: a fixed 63-bit FNV-1a hash of project and path, so a row is
+/// found again without a lookup table (and never depends on the Rust version).
+pub fn word_rowid(pid: i64, path: &str) -> i64 {
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    for b in pid.to_le_bytes().iter().chain(path.as_bytes()) {
+        h ^= u64::from(*b);
+        h = h.wrapping_mul(0x0100_0000_01b3);
+    }
+    ((h >> 1) as i64).max(1)
+}
+
+/// A word as `fts_word` holds it: each capital becomes `~` and its lower case, so the
+/// case-folding tokenizer still tells `State` from `state` (as `rg -w` does).
+pub fn case_word(w: &str) -> String {
+    let mut out = String::with_capacity(w.len() + 2);
+    for ch in w.chars() {
+        if ch.is_uppercase() {
+            out.push('~');
+            out.extend(ch.to_lowercase());
+        } else {
+            out.push(ch);
+        }
+    }
+    out
+}
+
+/// Every identifier of a file, once each, in first-seen order (comments and strings included,
+/// as `rg -w` sees them), each through [`case_word`].
+pub fn file_words(src: &[u8]) -> String {
+    let text = String::from_utf8_lossy(src);
+    let mut seen: HashSet<&str> = HashSet::new();
+    let mut out = String::new();
+    for w in text.split(|c: char| !(c.is_alphanumeric() || c == '_')) {
+        if w.is_empty() || w.len() > 100 || w.starts_with(|c: char| c.is_ascii_digit()) || !seen.insert(w) {
+            continue;
+        }
+        if !out.is_empty() {
+            out.push(' ');
+        }
+        out.push_str(&case_word(w));
+    }
+    out
+}
+
+fn store_words(tx: &Connection, pid: i64, path: &str, words: &str) -> Result<()> {
+    let id = word_rowid(pid, path);
+    tx.execute("DELETE FROM fts_word WHERE rowid = ?1", [id])?;
+    tx.execute("INSERT INTO fts_word(rowid, project_id, path, words) VALUES (?1,?2,?3,?4)", params![id, pid, path, words])?;
     Ok(())
 }
 
@@ -863,6 +986,20 @@ fn via_match(via: &str, ty: &str) -> i32 {
     if via.len() >= 4 && t.ends_with(&v) && word { 12 } else { 0 }
 }
 
+/// Method names the standard libraries define on their own common types (JVM, Kotlin, C#, Dart,
+/// JS, Rust, Python, Go, C++: `Object.toString`, `Vec::is_empty`): a call through a receiver with no scope signal is far more likely the
+/// library's than a project's same-name method, so it takes no guess.
+fn is_library_name(name: &str) -> bool {
+    const NAMES: &str = "toString hashCode equals compareTo getClass getName getValue setValue getKey getId getType \
+        isEmpty isNotEmpty forEach toList toSet toMap toArray valueOf getOrNull getOrDefault getOrElse putAll addAll \
+        removeAll containsKey toLowerCase toUpperCase ToString GetHashCode Equals GetType CompareTo Dispose toJson fromJson \
+        hasOwnProperty readLine writeLine is_empty to_vec to_string to_owned as_str as_ref as_mut into_iter iter_mut \
+        as_slice is_some is_none is_ok is_err unwrap_or unwrap_or_default and_then or_else map_err ok_or to_lowercase \
+        to_uppercase starts_with ends_with push_str extend_from_slice get_mut contains_key split_whitespace set_value \
+        get_value get_name push_back emplace_back pop_back c_str";
+    NAMES.split_whitespace().any(|n| n == name)
+}
+
 /// Under a test, sample or tooling directory: loses a tie against a candidate that is not.
 fn is_aux(p: &str) -> bool {
     p.split('/').rev().skip(1).any(|d| matches!(d, "test" | "tests" | "testing" | "samples" | "examples" | "tools"))
@@ -891,7 +1028,8 @@ fn score(r: &RefRow, cands: &[Cand], imp: Option<&FileImports>) -> (i64, i64) {
     // same-file member of another type (a local interface with the same method).
     let via = if r.recv { r.via.as_deref() } else { None };
     let via_hit = via.is_some_and(|v| cands.iter().any(|s| s.family == fam && via_match(v, &s.parent) == 20));
-    let mut best = (0i32, 0i64, 0usize, false, false);
+    // (score, id, candidates at that score, same file, member, score without the receiver match)
+    let mut best = (0i32, 0i64, 0usize, false, false, 0i32);
     let mut eligible = 0i64;
     for s in cands {
         if s.family != fam || s.id == r.src && call && is_type_kind(&s.kind) {
@@ -921,9 +1059,8 @@ fn score(r: &RefRow, cands: &[Cand], imp: Option<&FileImports>) -> (i64, i64) {
         // The receiver is named like the candidate's type (`inputs.render()` -> `Inputs`,
         // `pl.Evaluator.Preempt()` -> `Evaluator`, an embedded field), or like its last word
         // (`inputs` -> `SessionInputs`).
-        if !same_file && !s.parent.is_empty() {
-            score += via.map_or(0, |v| via_match(v, &s.parent));
-        }
+        let via_bonus = if !same_file && !s.parent.is_empty() { via.map_or(0, |v| via_match(v, &s.parent)) } else { 0 };
+        score += via_bonus;
         if call && !(is_callable_kind(&s.kind) || is_type_kind(&s.kind)) {
             score -= 5;
         }
@@ -942,21 +1079,27 @@ fn score(r: &RefRow, cands: &[Cand], imp: Option<&FileImports>) -> (i64, i64) {
             score += common_dirs(&s.path, &r.path).min(5) - is_aux(&s.path) as i32;
         }
         if score > best.0 {
-            best = (score, s.id, 1, same_file, member);
+            best = (score, s.id, 1, same_file, member, score - via_bonus);
         } else if score == best.0 {
             best.2 += 1;
         }
     }
-    let name_only = best.0 > 0 && best.0 < 20;
+    // A receiver named like the type (`state.update()` -> `State`) is the only signal: the
+    // receiver's real type is unknown (a library `MutableStateFlow` named `state`), so a one-word
+    // name stays unresolved and a longer one is a guess.
+    let via_only = best.0 >= 20 && best.5 < 20;
+    let name_only = best.0 > 0 && (best.0 < 20 || via_only);
     // No scope signal: only languages without captured imports may fall back to a unique name.
     // A C free function call, or a call through a receiver chain (`a.b.c.loadItems()`) whose
     // name has several words (so `x.push()` on a library type is no candidate), takes a guess
     // among a few same-name candidates instead.
     let unique = name_only && best.2 == 1 && UNIQUE_FALLBACK.contains(&fam);
-    let distinctive = crate::search::ident_parts(&r.name).len() > 1;
+    let distinctive = crate::search::ident_parts(&r.name).len() > 1 && !is_library_name(&r.name);
     let few = name_only && call && best.2 <= GUESS_MAX && (r.recv && best.4 && distinctive || c_fam && !r.recv);
-    let dst = if best.0 >= 20 || unique || few { best.1 } else { 0 };
-    let guess = dst != 0 && !best.3 && (eligible > 1 && (best.2 > 1 || call && r.recv || name_only) || name_only && call && r.recv);
+    let via_guess = via_only && distinctive && best.2 == 1;
+    let dst = if best.0 >= 20 && !via_only || via_guess || unique || few { best.1 } else { 0 };
+    let guess =
+        dst != 0 && !best.3 && (eligible > 1 && (best.2 > 1 || call && r.recv || name_only) || name_only && call && r.recv || via_only);
     (dst, if guess { eligible } else { 0 })
 }
 

@@ -42,10 +42,10 @@ fn cmd_index(a: &Args) -> anyhow::Result<String> {
     if a.pos.get(1).map(String::as_str) == Some("optimize") && !std::path::Path::new("optimize").is_dir() {
         let c = db::open_rw()?;
         let t0 = std::time::Instant::now();
-        let before: Vec<i64> = db::FTS_TABLES.iter().map(|t| db::fts_segments(&c, t)).collect();
+        let before: Vec<i64> = db::MERGE_TABLES.iter().map(|t| db::fts_segments(&c, t)).collect();
         db::fts_optimize(&c)?;
-        let after: Vec<i64> = db::FTS_TABLES.iter().map(|t| db::fts_segments(&c, t)).collect();
-        let tables = db::FTS_TABLES.iter().zip(before.iter().zip(&after)).map(|(t, (b, a))| format!("{t} {b}->{a}")).collect::<Vec<_>>();
+        let after: Vec<i64> = db::MERGE_TABLES.iter().map(|t| db::fts_segments(&c, t)).collect();
+        let tables = db::MERGE_TABLES.iter().zip(before.iter().zip(&after)).map(|(t, (b, a))| format!("{t} {b}->{a}")).collect::<Vec<_>>();
         return Ok(format!("optimized ({}) in {} ms", tables.join(", "), t0.elapsed().as_millis()));
     }
     // `fox index rebuild [PATH] [--backend tantivy|fts5]`: (re)build or drop a tantivy index.

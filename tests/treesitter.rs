@@ -353,18 +353,18 @@ fn kotlin_receiver_chains_function_references_and_exact_case() {
         ("app/math/Steps.kt", "package app.math\n\nfun stepOnce(acc: Int, x: Int): Int = acc + x\n"),
         (
             "app/feature/Screen.kt",
-            "package app.feature\n\nimport app.math.stepOnce\n\nclass Screen(val theme: Theme, val inputs: Inputs) {\n    fun draw() = theme.current.palette.tintFor(1)\n    fun show(plan: String) = inputs.render(plan)\n    fun total(xs: List<Int>) = xs.fold(0, ::stepOnce)\n    fun glow() = theme.current.colors.glowFor(2)\n}\n",
+            "package app.feature\n\nimport app.math.stepOnce\nimport app.plan.Inputs\n\nclass Screen(val theme: Theme, val inputs: Inputs) {\n    fun draw() = theme.current.palette.tintFor(1)\n    fun show(plan: String) = inputs.render(plan)\n    fun total(xs: List<Int>) = xs.fold(0, ::stepOnce)\n    fun glow() = theme.current.colors.glowFor(2)\n}\n",
         ),
     ]);
     let out = fox_code(&p, "tintFor", "callers", 800);
-    // The receiver `palette` names the type `Palette`: no guess.
-    assert!(out.contains("1 call sites in 1 files\n") && out.contains(":6 Screen.draw c:"), "{out}");
-    // `render` is the method, not the class `Render`; its call through a property is found.
+    // The receiver `palette` names the type `Palette`, which is not imported: a guess.
+    assert!(out.contains("1 guessed by name") && out.contains(":7 Screen.draw c:") && out.contains(" guess by name"), "{out}");
+    // `render` is the method, not the class `Render`; its call through an imported type's property is found.
     let out = fox_code(&p, "render", "impact", 800);
     assert!(out.contains("method Inputs.render") && out.contains("Screen.show"), "{out}");
     // A receiver named unlike any type: a guess by name.
     let out = fox_code(&p, "glowFor", "callers", 800);
-    assert!(out.contains("1 guessed by name") && out.contains(":9 Screen.glow c:") && out.contains(" guess by name"), "{out}");
+    assert!(out.contains("1 guessed by name") && out.contains(":10 Screen.glow c:") && out.contains(" guess by name"), "{out}");
     let out = fox_code(&p, "stepOnce", "impact", 800);
     assert!(out.contains("Screen.total"), "{out}");
 }
@@ -415,4 +415,111 @@ fn go_embedded_field_call_reaches_the_named_type() {
     assert!(out.contains("1 call sites in 1 files") && out.contains("Plugin.PostFilter"), "{out}");
     let out = fox_code(&p, "GroupEvaluator.Preempt", "callers", 800);
     assert!(out.contains("0 call sites"), "{out}");
+}
+
+/// A one-word name whose other uses have no reference row (a function-pointer initializer, a
+/// field assignment, a macro body, an argument) still gets the completeness line, from every
+/// identifier of every file, not only from indexed symbol text.
+#[test]
+fn completeness_counts_one_word_names_and_uses_outside_symbols() {
+    let _g = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    let (_h, _r, p) = inline_project(&[
+        ("lib/helper.c", "int helper(int x) { return x; }\n"),
+        ("src/direct.c", "int direct(void) { return helper(1); }\n"),
+        ("src/fp.c", "static int (*fp)(int) = helper;\n"),
+        ("src/field.c", "struct o { int (*cb)(int); };\nvoid set(struct o *o) { o->cb = helper; }\n"),
+        ("src/macro.c", "#define CALL(x) helper(x)\n"),
+        ("src/arg.c", "int apply(int (*g)(int), int v);\nint a(void) { return apply(helper, 1); }\n"),
+        ("src/other.c", "int helpers(void) { return 0; }\n"),
+        ("lib/fs.c", "int simple_open(void) { return 0; }\n"),
+        ("drivers/x.c", "#define FOPS(n) static const struct fops n = { .open = simple_open }\n"),
+    ]);
+    for (rel, lead) in [("callers", "may be incomplete"), ("refs", "may be incomplete"), ("impact", "partial at d1")] {
+        let out = fox_code(&p, "helper", rel, 800);
+        assert!(out.contains(&format!("{lead}: `helper` also appears in 4 other files")), "{rel}: {out}");
+    }
+    let out = fox_code(&p, "simple_open", "refs", 800);
+    assert!(out.contains("may be incomplete: `simple_open` also appears in 1 other file;"), "{out}");
+}
+
+/// Directories named `target` are build output only beside a build manifest (or with a cache
+/// tag); a source directory of that name (Linux `drivers/target`) is indexed.
+#[test]
+fn source_directories_named_target_are_indexed() {
+    let _g = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    let (_h, _r, p) = inline_project(&[
+        ("drivers/target/core.c", "int target_core(void) { return 0; }\n"),
+        ("tool/Cargo.toml", "[package]\nname = \"tool\"\n"),
+        ("tool/target/debug/build/out.rs", "pub fn generated_only() {}\n"),
+    ]);
+    let out = fox_code(&p, "target_core", "src", 800);
+    assert!(out.contains("drivers/target/core.c:1"), "{out}");
+    let c = db::open_ro().unwrap();
+    let out = code::run(&c, &p, "generated_only", &code::CodeOpts { rel: "src", depth: 2, budget: 800, cursor: 0, fallback: false });
+    assert!(out.as_deref().is_ok_and(|o| !o.contains("out.rs")), "{out:?}");
+}
+
+/// A receiver named like a type in another file is no proof of the receiver's type: a one-word
+/// method stays unresolved, a longer name is a guess.
+#[test]
+fn receiver_named_like_a_type_is_not_certain() {
+    let _g = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    let (_h, _r, p) = inline_project(&[
+        ("a/State.kt", "package a\n\nclass State {\n    fun update() {}\n}\n\nclass PlaybackSession {\n    fun close() {}\n}\n"),
+        (
+            "b/Use.kt",
+            "package b\n\nfun use() {\n    val state = MutableStateFlow(0)\n    state.update()\n    val session = android.media.session.MediaSession(null, \"x\")\n    session.close()\n}\n",
+        ),
+    ]);
+    for q in ["State.update", "PlaybackSession.close"] {
+        let out = fox_code(&p, q, "callers", 800);
+        assert!(out.contains("0 call sites"), "{q}: {out}");
+        let out = fox_code(&p, q, "impact", 800);
+        assert!(out.contains(": 0 symbols"), "{q}: {out}");
+    }
+}
+
+/// Standard-library method names (`toString`, `hashCode`, `is_empty`, `to_vec`) called through
+/// a receiver are no guess at a project's own same-name method.
+#[test]
+fn library_method_names_are_not_guessed() {
+    let _g = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    let (_h, _r, p) = inline_project(&[
+        ("a/Foo.kt", "package a\n\nclass Foo {\n    override fun toString(): String = \"f\"\n    override fun hashCode(): Int = 1\n}\n"),
+        ("b/Use.kt", "package b\n\nfun use(sb: StringBuilder) {\n    val s = sb.toString()\n    val h = listOf(1).hashCode()\n}\n"),
+        (
+            "src/list.rs",
+            "pub struct MyList;\n\nimpl MyList {\n    pub fn is_empty(&self) -> bool { true }\n    pub fn to_vec(&self) -> Vec<u8> { vec![] }\n}\n",
+        ),
+        ("src/ui/view.rs", "fn view(items: &Vec<u8>, v: String) -> bool {\n    let _ = items.to_vec();\n    v.is_empty()\n}\n"),
+    ]);
+    for q in ["Foo.toString", "Foo.hashCode", "MyList.is_empty", "MyList.to_vec"] {
+        let out = fox_code(&p, q, "callers", 800);
+        assert!(out.contains("0 call sites"), "{q}: {out}");
+    }
+}
+
+/// A parameter or local in a keyed literal or designated initializer (`Name: name`,
+/// `.size = size`) is not a reference to a same-name function; a function value still is.
+#[test]
+fn local_values_in_initializers_are_not_function_references() {
+    let _g = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    let (_h, _r, p) = inline_project(&[
+        (
+            "pkg/a/a.go",
+            "package a\n\nfunc name() string { return \"n\" }\n\nfunc runIt() {}\n\ntype T struct {\n\tName string\n\tRun  func()\n}\n\nfunc mk() T {\n\tname := \"x\"\n\treturn T{Name: name, Run: runIt}\n}\n",
+        ),
+        ("pkg/a/c.go", "package a\n\nfunc use(name string) interface{} { return struct{ N string }{N: name} }\n"),
+        ("lib/size.c", "int size(void) { return 1; }\nint open_dev(void) { return 0; }\n"),
+        (
+            "lib/ops.c",
+            "struct ops { int size; int (*open)(void); };\nvoid f(int size) { struct ops o = { .size = size, .open = open_dev }; (void)o; }\n",
+        ),
+    ]);
+    for q in ["name", "size"] {
+        let out = fox_code(&p, q, "refs", 800);
+        assert!(out.contains("0 refs"), "{q}: {out}");
+    }
+    assert!(fox_code(&p, "runIt", "refs", 800).contains("1 refs in 1 files"));
+    assert!(fox_code(&p, "open_dev", "refs", 800).contains("1 refs in 1 files"));
 }

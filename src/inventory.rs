@@ -199,7 +199,7 @@ pub(crate) fn walk(root: &Path, ov: &Arc<Overrides>, keep: Option<Keep>) -> Walk
             if keep.as_ref().is_some_and(|k| !k(&rel)) {
                 return false;
             }
-            match tiers::classify_dir(&rel, &ov) {
+            match tiers::classify_dir_at(&root, &rel, &ov) {
                 Tier::Skip => {
                     notes.lock().unwrap().push(DirNote::Skip(rel));
                     false
@@ -279,7 +279,7 @@ fn index_tree(c: &mut Connection, p: &Project, st: &mut Stats) -> Result<()> {
             if noted.contains(&rel) || !e.file_type().is_ok_and(|t| t.is_dir()) {
                 continue;
             }
-            match tiers::classify_dir(&rel, &ov) {
+            match tiers::classify_dir_at(&root, &rel, &ov) {
                 Tier::Skip => notes.push(DirNote::Skip(rel)),
                 Tier::NameOnly => notes.push(DirNote::NameOnly(rel)),
                 _ => {}

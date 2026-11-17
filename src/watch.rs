@@ -46,7 +46,7 @@ pub fn watch_dirs(p: &Project) -> Vec<PathBuf> {
             return false;
         }
         let rel = e.path().strip_prefix(&r2).unwrap_or(e.path()).to_string_lossy().replace('\\', "/");
-        rel != ".git" && tiers::classify_dir(&rel, &ov) >= tiers::Tier::Text
+        rel != ".git" && tiers::classify_dir_at(&r2, &rel, &ov) >= tiers::Tier::Text
     });
     wb.build().flatten().filter(|e| e.file_type().is_some_and(|t| t.is_dir())).map(|e| e.into_path()).collect()
 }
@@ -64,6 +64,7 @@ pub fn classify(root: &Path, stores: &[PathBuf], path: &Path, d: &mut Dirty) {
     if rel.starts_with(".git/")
         || rel == ".git"
         || tiers::is_denied_path(&rel)
+        || tiers::in_build_output(root, &rel)
         || tiers::is_secret_name(&path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default())
     {
         return;
