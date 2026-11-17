@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased (intended as 0.2.1)
+## 0.2.1 (2026-11-17)
 
 Caller and impact answers no longer look complete when they are not, and more calls resolve.
 
