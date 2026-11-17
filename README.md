@@ -17,12 +17,12 @@ machine; nothing is written into your repositories.
 Paste this into Claude Code, Codex, opencode or any coding agent:
 
 > Set up foxdb from https://github.com/ManavA/foxdb by following its
-> [AGENTS-SETUP.md](AGENTS-SETUP.md) from top to bottom. Ask me before changing any harness setting.
+> [AGENTS-SETUP.md](https://github.com/ManavA/foxdb/blob/main/AGENTS-SETUP.md)
+> from top to bottom. Ask me before changing any harness setting.
 
 The agent checks prerequisites, installs `fox` and `foxd` into `~/.foxdb/bin` (no root), indexes
 your projects, registers the MCP server and skill for each harness it finds, backs up every
-settings file first, verifies the result and tells you how to undo it. The repository is private,
-so the agent's machine needs a logged-in `gh` or git credentials for github.com.
+settings file first, verifies the result and tells you how to undo it. No GitHub login is needed.
 
 ## What it can do
 
@@ -35,15 +35,14 @@ so the agent's machine needs a logged-in `gh` or git credentials for github.com.
 
 ## Manual install (5 minutes)
 
-You need Linux or macOS, git, and access to the repository, which is private: the GitHub CLI
-(`gh`, logged in) is simplest, or git credentials for github.com. On Linux x86_64 a logged-in
-`gh` also fetches the prebuilt binary; otherwise you need a Rust toolchain (`cargo`) to build
-from source, which takes several minutes.
+You need Linux or macOS and git. On Linux x86_64 the installer downloads the prebuilt binary
+with curl (or wget); elsewhere you need a Rust toolchain (`cargo`) to build from source, which
+takes several minutes. No GitHub login is needed.
 
 1. Get the code and install `fox` and `foxd` into `~/.foxdb/bin` (no root):
 
 ```sh
-gh repo clone ManavA/foxdb && cd foxdb     # or: git clone https://github.com/ManavA/foxdb.git (needs credentials)
+git clone https://github.com/ManavA/foxdb.git && cd foxdb
 ```
 
 ```sh runnable

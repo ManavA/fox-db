@@ -55,6 +55,8 @@ small and medium repos). The README now leads with agent-driven install.
   a re-import replaces the previous one. `fox status` shows the SCIP tier and its freshness;
   `fox drift` reports a symbol moved to another file by its SCIP id. No new dependency, and
   nothing changes for a project without an import.
+- The repository is public. Cloning and install need no GitHub login: `scripts/install.sh`
+  downloads the release asset with curl or wget and checks its sha256 (`gh` only as a fallback).
 
 ## 0.1.0 (2026-11-16)
 

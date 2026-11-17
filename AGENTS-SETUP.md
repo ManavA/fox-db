@@ -24,17 +24,16 @@ replace. `scripts/docs-test.sh` runs these same blocks in a scratch home, so the
 ```sh runnable
 uname -sm                                   # Linux x86_64 gets a prebuilt binary; anything else builds from source
 git --version
-command -v gh >/dev/null && gh auth status >/dev/null 2>&1 && echo "gh: logged in" || echo "gh: not logged in (source build)"
+command -v curl >/dev/null || command -v wget >/dev/null && echo "download: ok" || echo "no curl or wget (source build)"
 command -v cargo >/dev/null && cargo --version || echo "cargo: missing (needed only for a source build)"
 for h in claude codex opencode jq; do command -v "$h" >/dev/null && echo "found $h" || echo "no $h"; done
 [ -z "${FOXDB_HOME:-}" ] || [ "$FOXDB_HOME" = "$HOME/.foxdb" ] || echo "FOXDB_HOME=$FOXDB_HOME is not ~/.foxdb: read the note below before going on"
 ```
 
-The repository is private, so you need access to it: a logged-in `gh` (simplest) or git
-credentials for github.com. Then either a logged-in `gh` on Linux x86_64 (for the prebuilt release
-asset) or `cargo` 1.88 or newer for a source build (install from https://rustup.rs if missing,
-after asking). `jq` is needed only for the Claude Code hooks step. Note which harnesses were found: you
-will set up only those.
+The repository is public; no GitHub login is needed. You need either curl or wget on Linux
+x86_64 (for the prebuilt release asset) or `cargo` 1.88 or newer for a source build (install
+from https://rustup.rs if missing, after asking). `jq` is needed only for the Claude Code hooks
+step. Note which harnesses were found: you will set up only those.
 
 This guide uses the default data directory `~/.foxdb`. If `FOXDB_HOME` is set to anything else,
 ask the user to unset it for foxdb (simplest). Otherwise replace `~/.foxdb` and `$HOME/.foxdb`
@@ -45,11 +44,11 @@ with that directory in every command and snippet below, and make sure each harne
 
 If the user named a local checkout (for example "set up foxdb from ~/foxdb"), `cd` into it and
 run `scripts/install.sh --source` instead of the block below, so that checkout is what gets built
-(without `--source` the installer prefers the v0.2.0 release asset when `gh` is logged in).
+(without `--source` the installer prefers the v0.2.0 release asset on Linux x86_64).
 Otherwise clone the repository and run the installer from inside the clone:
 
 ```sh
-gh repo clone ManavA/foxdb && cd foxdb
+git clone https://github.com/ManavA/foxdb.git && cd foxdb
 ```
 
 ```sh runnable
@@ -58,8 +57,10 @@ export PATH="$HOME/.foxdb/bin:$PATH"
 fox --version
 ```
 
-`scripts/install.sh` downloads the v0.2.0 release tarball with `gh release download` and checks
-its sha256 when `gh` is logged in, and otherwise builds `fox` and `foxd` from source with cargo.
+On Linux x86_64 `scripts/install.sh` downloads the v0.2.0 release tarball and its `.sha256` from
+the GitHub release with curl or wget (no login) and checks the checksum; otherwise it builds `fox`
+and `foxd` from source with cargo (cloning tag v0.2.0 when run outside a checkout).
+`FOXDB_RELEASE_URL` overrides where the asset is downloaded from.
 It copies them to `~/.foxdb/bin` (or `$FOXDB_HOME/bin`) and the skill to `~/.foxdb/skill/`, and
 touches nothing else. `--source` forces a source build; `--tarball FILE` installs a tarball you
 already downloaded. The prebuilt binary needs glibc 2.39 or newer; on an older system the

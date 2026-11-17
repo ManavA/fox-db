@@ -3,7 +3,9 @@
 # AGENTS-SETUP.md, in order, as one bash script per file (set -euo pipefail), each in its own
 # scratch HOME with FOXDB_HOME=$HOME/.foxdb and a small fixture project at ~/src/my-app.
 # A block tagged "needs=<cmd>" is skipped (and reported) when <cmd> is not installed.
-# Then, when dist/ holds the release tarball, it installs that with scripts/install.sh --tarball.
+# Then, when dist/ holds the release tarball, it installs that with scripts/install.sh --tarball
+# and through the download path (curl against a file:// URL). Nothing here uses the network: the
+# doc runs point FOXDB_RELEASE_URL at a missing file:// directory, so they build from source.
 #
 # Usage: scripts/docs-test.sh [--keep]        (--keep leaves the scratch dir for inspection)
 # The real home is never written: HOME points into the scratch dir, and the script fails if the
@@ -89,7 +91,7 @@ run_doc() {
     blocks=$(grep -c '^```sh runnable' "$repo/$doc")
     if (cd "$repo" && env -i HOME="$home" FOXDB_HOME="$home/.foxdb" PATH="$clean_path" \
         CARGO_HOME="$cargo_home" RUSTUP_HOME="$rustup_home" LANG=C.UTF-8 TERM=dumb \
-        bash -euo pipefail "$script") >"$log" 2>&1; then
+        FOXDB_RELEASE_URL="file://$scratch/no-release" bash -euo pipefail "$script") >"$log" 2>&1; then
         echo "PASS $doc: $blocks runnable blocks, $(grep -c '^SKIPPED' "$log" || true) skipped"
     else
         echo "FAIL $doc (exit $?), last block: $(grep '^--- block' "$log" | tail -n1)"
@@ -133,8 +135,23 @@ if [ -f "$tarball" ]; then
         echo "FAIL install.sh --tarball: $out"
         status=1
     fi
+    # The default path: download the asset and its .sha256 (here from a file:// URL), then install.
+    if command -v curl >/dev/null 2>&1; then
+        home=$scratch/download/home
+        mkdir -p "$home"
+        if out=$(env -i HOME="$home" PATH="$clean_path" FOXDB_RELEASE_URL="file://$repo/dist" \
+            sh "$repo/scripts/install.sh" 2>&1) && printf '%s' "$out" | grep -q 'sha256 ok' \
+            && [ "$("$home/.foxdb/bin/fox" --version)" = "fox $version" ]; then
+            echo "PASS install.sh download (file://dist)"
+        else
+            echo "FAIL install.sh download: $out"
+            status=1
+        fi
+    else
+        echo "no curl: skipped install.sh download"
+    fi
 else
-    echo "no tarball in dist/: skipped install.sh --tarball"
+    echo "no tarball in dist/: skipped install.sh --tarball and download"
 fi
 
 if [ "$(fingerprint)" != "$before" ]; then
