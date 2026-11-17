@@ -32,6 +32,10 @@ pub struct Def {
     pub container: Option<usize>,
     /// Explicit container name from a `@container` capture (Go receivers, C++ `A::f`).
     pub container_name: Option<String>,
+    /// A declaration without a body (a C/C++ prototype): it stands for its definition.
+    pub decl: bool,
+    /// Declared `static` (C/C++): visible only in its own file, unless that file is a header.
+    pub stat: bool,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -44,6 +48,8 @@ pub struct Ref {
     pub caller: Option<usize>,
     /// Called through a receiver (`x.f()`), not bare (`f()`).
     pub recv: bool,
+    /// The receiver's last name (`a.inputs.f()` -> `inputs`), when it is a plain name.
+    pub via: Option<String>,
     pos: usize,
 }
 
@@ -98,6 +104,30 @@ fn has_receiver(n: tree_sitter::Node) -> bool {
         return p.named_child(0).is_some_and(|c| c.id() != n.id());
     }
     ["object", "receiver", "scope"].iter().any(|f| p.child_by_field_name(f).is_some_and(|c| c.id() != n.id()))
+}
+
+/// The last name of the receiver a call goes through: `x` in `x.f()`, `Evaluator` in
+/// `pl.Evaluator.Preempt()`. None for calls, indexing or literals as receivers.
+fn receiver_name(n: tree_sitter::Node, src: &[u8]) -> Option<String> {
+    let p = n.parent()?;
+    let mut r = p.child_by_field_name("object").or_else(|| p.child_by_field_name("operand")).or_else(|| p.child_by_field_name("argument"));
+    if r.is_none() {
+        r = p.named_child(0).filter(|c| c.id() != n.id());
+    }
+    let mut r = r?;
+    // A chain: its last name (`a.b` -> `b`).
+    while r.named_child_count() > 0 && ["navigation", "member", "field", "selector", "attribute"].iter().any(|w| r.kind().contains(w)) {
+        let last = r.named_child(r.named_child_count() as u32 - 1)?;
+        if last.named_child_count() > 0 {
+            // `navigation_suffix` and the like wrap the name.
+            r = last.named_child(last.named_child_count() as u32 - 1)?;
+        } else {
+            r = last;
+        }
+    }
+    let t = r.utf8_text(src).ok()?;
+    (r.named_child_count() == 0 && !t.is_empty() && t.len() <= 80 && t.chars().all(|c| c.is_alphanumeric() || c == '_'))
+        .then(|| t.to_string())
 }
 
 /// Parse one file and extract definitions and references.
@@ -158,6 +188,8 @@ pub fn extract(l: &Lang, src: &[u8]) -> Parsed {
             {
                 last = b;
             }
+            let mut w = node.walk();
+            let stat = node.children(&mut w).any(|ch| ch.kind() == "storage_class_specifier" && text(ch) == "static");
             out.defs.push(Def {
                 kind,
                 name,
@@ -167,6 +199,8 @@ pub fn extract(l: &Lang, src: &[u8]) -> Parsed {
                 end: last.end_byte(),
                 container: None,
                 container_name: container,
+                decl: node.kind() == "declaration",
+                stat,
             });
         } else if let Some(k) = cn.strip_prefix("reference.") {
             out.refs.push(Ref {
@@ -175,6 +209,7 @@ pub fn extract(l: &Lang, src: &[u8]) -> Parsed {
                 line: nn.start_position().row as u32 + 1,
                 caller: None,
                 recv: has_receiver(nn),
+                via: if has_receiver(nn) { receiver_name(nn, src) } else { None },
                 pos: nn.start_byte(),
             });
         }
@@ -627,7 +662,13 @@ fn store_file(
     for (i, d) in p.defs.iter().enumerate() {
         let parent = p.container_of(i);
         let pid_ref = d.container.map(|c| ids[c]);
-        let meta = serde_json::json!({"k": d.kind, "parent": parent, "pid": pid_ref, "ts": 1});
+        let mut meta = serde_json::json!({"k": d.kind, "parent": parent, "pid": pid_ref, "ts": 1});
+        if d.decl {
+            meta["d"] = 1.into();
+        }
+        if d.stat {
+            meta["s"] = 1.into();
+        }
         ins.execute(params![pid, format!("t:{pid}:{path}#{i}"), d.name, path, d.line, d.end_line, lang, meta.to_string(), now])?;
         let id = tx.last_insert_rowid();
         ids.push(id);
@@ -649,11 +690,11 @@ fn store_file(
             }
         }
     }
-    let mut r =
-        tx.prepare_cached("INSERT INTO ts_ref(project_id, path, src, name, line, kind, recv, dst) VALUES (?1,?2,?3,?4,?5,?6,?7,0)")?;
+    let mut r = tx
+        .prepare_cached("INSERT INTO ts_ref(project_id, path, src, name, line, kind, recv, dst, via) VALUES (?1,?2,?3,?4,?5,?6,?7,0,?8)")?;
     for x in &p.refs {
         let src = x.caller.map(|i| ids[i]).unwrap_or(0);
-        r.execute(params![pid, path, src, x.name, x.line, x.kind, x.recv])?;
+        r.execute(params![pid, path, src, x.name, x.line, x.kind, x.recv, x.via])?;
     }
     Ok(())
 }
@@ -725,6 +766,10 @@ struct Cand {
     family: &'static str,
     /// Declared inside a function body: visible only in its own file.
     local: bool,
+    /// A C/C++ prototype (no body).
+    decl: bool,
+    /// C/C++ `static` outside a header: visible only in its own file.
+    file_local: bool,
 }
 
 /// One reference row to score.
@@ -739,6 +784,8 @@ struct RefRow {
     amb: i64,
     /// Container of the calling definition (-1 when unknown).
     caller_parent: i64,
+    /// Last name of the receiver (`Evaluator` in `pl.Evaluator.Preempt()`).
+    via: Option<String>,
     line: i64,
 }
 
@@ -788,6 +835,39 @@ impl FileImports {
 
 const UNIQUE_FALLBACK: &[&str] = &["c", "bash", "lua", "ruby", "php", "dart", "dotnet", "swift"];
 
+/// Most same-score candidates a name-only guess picks among (receiver calls, C free functions).
+const GUESS_MAX: usize = 3;
+
+fn is_header(p: &str) -> bool {
+    [".h", ".hh", ".hpp", ".hxx"].iter().any(|e| p.ends_with(e))
+}
+
+/// Leading directories two paths share.
+fn common_dirs(a: &str, b: &str) -> i32 {
+    dir_of(a).split('/').zip(dir_of(b).split('/')).take_while(|(x, y)| x == y && !x.is_empty()).count() as i32
+}
+
+/// How well a receiver name of three or more characters matches a type name: 20 for the same
+/// name in any case, 12 when the type name ends with it as a word (`inputs` / `SessionInputs`).
+fn via_match(via: &str, ty: &str) -> i32 {
+    // One- and two-letter receivers (`t`, `ev`) say too little.
+    if via.len() < 3 {
+        return 0;
+    }
+    if via.eq_ignore_ascii_case(ty) {
+        return 20;
+    }
+    let (v, t) = (via.to_lowercase(), ty.to_lowercase());
+    let cut = ty.len().wrapping_sub(via.len());
+    let word = ty.is_char_boundary(cut) && ty[cut..].starts_with(|c: char| c.is_uppercase());
+    if via.len() >= 4 && t.ends_with(&v) && word { 12 } else { 0 }
+}
+
+/// Under a test, sample or tooling directory: loses a tie against a candidate that is not.
+fn is_aux(p: &str) -> bool {
+    p.split('/').rev().skip(1).any(|d| matches!(d, "test" | "tests" | "testing" | "samples" | "examples" | "tools"))
+}
+
 fn dir_of(p: &str) -> &str {
     p.rsplit_once('/').map(|x| x.0).unwrap_or("")
 }
@@ -803,15 +883,26 @@ fn stem_of(p: &str) -> &str {
 fn score(r: &RefRow, cands: &[Cand], imp: Option<&FileImports>) -> (i64, i64) {
     let fam = lang::for_path(&r.path).map(|l| l.family).unwrap_or("");
     let call = r.kind == "call";
-    let mut best = (0i32, 0i64, 0usize, false);
+    // C/C++: one global namespace. A prototype stands for its definition, so it is no candidate
+    // while a visible definition of the name exists.
+    let c_fam = fam == "c";
+    let has_def = c_fam && cands.iter().any(|s| s.family == fam && !s.decl && (s.path == r.path || !s.file_local && !s.local));
+    // A receiver named exactly like a candidate's type (`pl.Evaluator.Preempt()`) rules out a
+    // same-file member of another type (a local interface with the same method).
+    let via = if r.recv { r.via.as_deref() } else { None };
+    let via_hit = via.is_some_and(|v| cands.iter().any(|s| s.family == fam && via_match(v, &s.parent) == 20));
+    let mut best = (0i32, 0i64, 0usize, false, false);
     let mut eligible = 0i64;
     for s in cands {
         if s.family != fam || s.id == r.src && call && is_type_kind(&s.kind) {
             continue;
         }
+        if via_hit && s.path == r.path && via.is_some_and(|v| via_match(v, &s.parent) < 20) {
+            continue;
+        }
         let same_file = s.path == r.path;
-        // Local declarations (inside a function) are only visible in their own file.
-        if !same_file && s.local {
+        // Local declarations (inside a function) and C `static` ones are only visible in their own file.
+        if !same_file && (s.local || s.file_local) || has_def && s.decl {
             continue;
         }
         eligible += 1;
@@ -827,49 +918,71 @@ fn score(r: &RefRow, cands: &[Cand], imp: Option<&FileImports>) -> (i64, i64) {
         if s.pid != 0 && s.pid == r.caller_parent {
             score += 15;
         }
+        // The receiver is named like the candidate's type (`inputs.render()` -> `Inputs`,
+        // `pl.Evaluator.Preempt()` -> `Evaluator`, an embedded field), or like its last word
+        // (`inputs` -> `SessionInputs`).
+        if !same_file && !s.parent.is_empty() {
+            score += via.map_or(0, |v| via_match(v, &s.parent));
+        }
         if call && !(is_callable_kind(&s.kind) || is_type_kind(&s.kind)) {
             score -= 5;
         }
+        let member = s.pid != 0 || !s.parent.is_empty();
         if call && !same_file {
             // `f()` rarely reaches another type's member; `x.f()` rarely a free function.
             if !r.recv && s.pid != 0 && s.pid != r.caller_parent {
                 score -= 25;
             }
-            if r.recv && s.pid == 0 && s.parent.is_empty() {
+            if r.recv && !member {
                 score -= 20;
             }
         }
+        if c_fam && score == 10 {
+            // No scope signal in C: the definition nearest in the tree, then not under tests or tools.
+            score += common_dirs(&s.path, &r.path).min(5) - is_aux(&s.path) as i32;
+        }
         if score > best.0 {
-            best = (score, s.id, 1, same_file);
+            best = (score, s.id, 1, same_file, member);
         } else if score == best.0 {
             best.2 += 1;
         }
     }
+    let name_only = best.0 > 0 && best.0 < 20;
     // No scope signal: only languages without captured imports may fall back to a unique name.
-    let dst = if best.0 >= 20 || best.0 > 0 && best.2 == 1 && UNIQUE_FALLBACK.contains(&fam) { best.1 } else { 0 };
-    let guess = dst != 0 && !best.3 && eligible > 1 && (best.2 > 1 || call && r.recv);
+    // A C free function call, or a call through a receiver chain (`a.b.c.loadItems()`) whose
+    // name has several words (so `x.push()` on a library type is no candidate), takes a guess
+    // among a few same-name candidates instead.
+    let unique = name_only && best.2 == 1 && UNIQUE_FALLBACK.contains(&fam);
+    let distinctive = crate::search::ident_parts(&r.name).len() > 1;
+    let few = name_only && call && best.2 <= GUESS_MAX && (r.recv && best.4 && distinctive || c_fam && !r.recv);
+    let dst = if best.0 >= 20 || unique || few { best.1 } else { 0 };
+    let guess = dst != 0 && !best.3 && (eligible > 1 && (best.2 > 1 || call && r.recv || name_only) || name_only && call && r.recv);
     (dst, if guess { eligible } else { 0 })
 }
 
 fn map_cand(r: &rusqlite::Row) -> rusqlite::Result<(String, Cand)> {
     let lang: String = r.get(6)?;
+    let path: String = r.get(2)?;
+    let file_local = r.get::<_, Option<i64>>(8)?.is_some() && !is_header(&path);
     Ok((
         r.get(1)?,
         Cand {
             id: r.get(0)?,
-            path: r.get(2)?,
+            path,
             kind: r.get(3)?,
             pid: r.get(4)?,
             parent: r.get::<_, String>(5)?.rsplit('.').next().unwrap_or("").to_string(),
             family: lang::by_name(&lang).map(|l| l.family).unwrap_or(""),
             local: false,
+            decl: r.get::<_, Option<i64>>(7)?.is_some(),
+            file_local,
         },
     ))
 }
 
-const CAND_COLS: &str =
-    "id, name, path, json_extract(meta,'$.k'), COALESCE(json_extract(meta,'$.pid'),0), COALESCE(json_extract(meta,'$.parent'),''), lang";
-const REF_COLS: &str = "rowid, path, src, name, kind, dst, recv, amb, line";
+const CAND_COLS: &str = "id, name, path, json_extract(meta,'$.k'), COALESCE(json_extract(meta,'$.pid'),0), \
+     COALESCE(json_extract(meta,'$.parent'),''), lang, json_extract(meta,'$.d'), json_extract(meta,'$.s')";
+const REF_COLS: &str = "rowid, path, src, name, kind, dst, recv, amb, line, via";
 
 fn map_ref(r: &rusqlite::Row) -> rusqlite::Result<RefRow> {
     Ok(RefRow {
@@ -883,6 +996,7 @@ fn map_ref(r: &rusqlite::Row) -> rusqlite::Result<RefRow> {
         amb: r.get(7)?,
         caller_parent: -1,
         line: r.get(8)?,
+        via: r.get(9)?,
     })
 }
 
@@ -1087,4 +1201,17 @@ pub fn resolve_scoped(tx: &Connection, pid: i64, scope: Option<(&HashSet<String>
 /// Does the project have native tree-sitter symbols?
 pub fn has_symbols(c: &Connection, pid: i64) -> bool {
     c.query_row("SELECT 1 FROM node WHERE project_id = ?1 AND source = 'treesitter' AND kind = 'symbol' LIMIT 1", [pid], |_| Ok(())).is_ok()
+}
+
+#[cfg(test)]
+mod via_tests {
+    #[test]
+    fn receiver_names_match_type_names() {
+        assert_eq!(super::via_match("inputs", "Inputs"), 20);
+        assert_eq!(super::via_match("Evaluator", "Evaluator"), 20);
+        assert_eq!(super::via_match("inputs", "SessionInputs"), 12);
+        assert_eq!(super::via_match("puts", "SessionInputs"), 0);
+        assert_eq!(super::via_match("t", "T"), 0);
+        assert_eq!(super::via_match("longerThanType", "Type"), 0);
+    }
 }

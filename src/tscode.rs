@@ -64,7 +64,7 @@ fn is_test(p: &str) -> bool {
 /// symbol of the project; the name index is a direct seek.
 fn resolve_sql() -> String {
     format!(
-        "SELECT {COLS}, (SELECT COUNT(*) FROM ts_ref r WHERE r.dst = n.id AND r.dst != 0)
+        "SELECT {COLS}, (SELECT COUNT(*) FROM ts_ref r WHERE r.dst = n.id AND r.dst != 0), json_extract(n.meta,'$.d')
          FROM node n INDEXED BY node_sym_name
          WHERE n.project_id = ?1 AND n.kind = 'symbol' AND n.source = 'treesitter' AND n.name = ?2 COLLATE NOCASE LIMIT 300"
     )
@@ -83,24 +83,27 @@ pub fn resolve(c: &Connection, pid: i64, q: &str) -> Result<Vec<TSym>> {
         _ => (None, q),
     };
     let mut s = c.prepare_cached(&resolve_sql())?;
-    let mut v: Vec<(TSym, i64)> = s
-        .query_map(params![pid, name], |r| Ok((map(r)?, r.get::<_, i64>(7)?)))?
+    let mut v: Vec<(TSym, i64, bool)> = s
+        .query_map(params![pid, name], |r| Ok((map(r)?, r.get::<_, i64>(7)?, r.get::<_, Option<i64>>(8)?.is_some())))?
         .flatten()
-        .filter(|(t, _)| {
+        .filter(|(t, ..)| {
             qual.is_none_or(|w| t.parent.as_deref().is_some_and(|p| p.rsplit('.').next().unwrap_or(p).eq_ignore_ascii_case(w)))
         })
         .collect();
-    v.sort_by_key(|(t, n)| {
+    // The name as typed (and its type as typed) beats a same-name symbol in another case
+    // (`render` the method, not `Render` the class); a definition beats its C prototype.
+    v.sort_by_key(|(t, n, decl)| {
         let rank = if is_callable_kind(&t.kind) || is_type_kind(&t.kind) { 0 } else { 1 };
-        (rank, is_test(&t.path) as u8, std::cmp::Reverse(*n), t.id)
+        let exact_qual = qual.is_none_or(|w| t.parent.as_deref().is_some_and(|p| p.rsplit('.').next().unwrap_or(p) == w));
+        (t.name != name || !exact_qual, rank, *decl, is_test(&t.path) as u8, std::cmp::Reverse(*n), t.id)
     });
     Ok(v.into_iter().map(|x| x.0).collect())
 }
 
 /// Call or reference sites of `targets`, grouped by file: `path (n)` then `  :line Caller c:h`.
 /// A site whose target was guessed by name among several same-name definitions ends in
-/// `guess 1 of N`. Returns (sites, files, guessed sites).
-fn sites(c: &Connection, targets: &[i64], calls_only: bool, lines: &mut Vec<String>) -> Result<(usize, usize, usize)> {
+/// `guess 1 of N`. Returns (sites, their files, guessed sites).
+fn sites(c: &Connection, targets: &[i64], calls_only: bool, lines: &mut Vec<String>) -> Result<(usize, HashSet<String>, usize)> {
     let ids = targets.iter().map(i64::to_string).collect::<Vec<_>>().join(",");
     let kind = if calls_only { "AND r.kind = 'call'" } else { "" };
     let sql = format!(
@@ -147,15 +150,14 @@ fn sites(c: &Connection, targets: &[i64], calls_only: bool, lines: &mut Vec<Stri
             guessed += 1;
         }
     }
-    let files = by.len();
+    let files: HashSet<String> = by.keys().cloned().collect();
     group_by_dir(
         by.into_iter().map(|(path, v)| {
             let count: usize = v.iter().map(|x| x.1.len()).sum();
             let rows = v
                 .into_iter()
                 .map(|(who, ls, amb)| {
-                    let guess = if amb > 0 { format!(" guess 1 of {amb}") } else { String::new() };
-                    format!("  :{} {who}{guess}", ls.iter().map(i64::to_string).collect::<Vec<_>>().join(","))
+                    format!("  :{} {who}{}", ls.iter().map(i64::to_string).collect::<Vec<_>>().join(","), guess_note(amb))
                 })
                 .collect();
             (path, count, rows)
@@ -163,6 +165,67 @@ fn sites(c: &Connection, targets: &[i64], calls_only: bool, lines: &mut Vec<Stri
         lines,
     );
     Ok((n, files, guessed))
+}
+
+/// One line when `top`'s name occurs in more files than `listed` (its resolved sites) and its
+/// own file: `{lead}: `name` also appears in N other files; confirm with: rg -nw name`. None when
+/// the counts agree. Read from the index only (no file is opened): files with a reference of
+/// that name not resolved with certainty to another symbol, and, for a name of several words
+/// (`wake_up_process`, `loadItems`), files whose indexed symbol text holds it as a whole word.
+fn completeness(c: &Connection, pid: i64, top: &TSym, listed: &HashSet<String>, lead: &str) -> Result<Option<String>> {
+    let n = unlisted_files(c, pid, top, listed)?;
+    let name = &top.name;
+    Ok((n > 0)
+        .then(|| format!("{lead}: `{name}` also appears in {n} other file{}; confirm with: rg -nw {name}", if n == 1 { "" } else { "s" })))
+}
+
+fn unlisted_files(c: &Connection, pid: i64, top: &TSym, listed: &HashSet<String>) -> Result<usize> {
+    let name = top.name.as_str();
+    let mut skip: HashSet<String> = listed.clone();
+    skip.insert(top.path.clone());
+    // Files with an occurrence that may be ours, and files whose references all go elsewhere.
+    let (mut open, mut closed): (HashSet<String>, HashSet<String>) = Default::default();
+    let mut q = c.prepare_cached("SELECT path, dst, amb FROM ts_ref WHERE project_id = ?1 AND name = ?2 AND kind != 'import'")?;
+    for (path, dst, amb) in
+        q.query_map(params![pid, name], |r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?, r.get::<_, i64>(2)?)))?.flatten()
+    {
+        if dst == top.id {
+            skip.insert(path);
+        } else if dst != 0 && amb <= 0 {
+            closed.insert(path);
+        } else {
+            open.insert(path);
+        }
+    }
+    // A single word (`load`) is also a part of longer names in the word index; only a name of
+    // several parts is one distinctive indexed word (`wakeupprocess`, `loaditems`).
+    let word: String = name.chars().filter(|ch| *ch != '_').collect::<String>().to_lowercase();
+    if crate::search::ident_parts(name).len() > 1 && word.chars().all(char::is_alphanumeric) {
+        let mut d = c.prepare_cached(
+            "SELECT path FROM node INDEXED BY node_sym_name WHERE project_id = ?1 AND kind = 'symbol' AND name = ?2 COLLATE NOCASE AND source = 'treesitter'",
+        )?;
+        let defs: HashSet<String> = d.query_map(params![pid, name], |r| r.get::<_, String>(0))?.flatten().collect();
+        let mut f = c.prepare_cached(
+            "SELECT DISTINCT n.path FROM fts_body f JOIN node n ON n.id = f.rowid
+             WHERE fts_body MATCH ?1 AND n.project_id = ?2 AND n.kind = 'symbol' AND n.source = 'treesitter' LIMIT 20000",
+        )?;
+        for path in f.query_map(params![format!("body:\"{word}\""), pid], |r| r.get::<_, String>(0))?.flatten() {
+            if !closed.contains(&path) && !defs.contains(&path) {
+                open.insert(path);
+            }
+        }
+    }
+    Ok(open.iter().filter(|p| !skip.contains(*p)).count())
+}
+
+/// ` guess 1 of N` after a site resolved by name among N same-name definitions; ` guess by
+/// name` when the only candidate was taken on its name alone (a call through a receiver).
+fn guess_note(amb: i64) -> String {
+    match amb {
+        a if a > 1 => format!(" guess 1 of {a}"),
+        1 => " guess by name".into(),
+        _ => String::new(),
+    }
 }
 
 /// Emit `dir/` headers, then ` file (n)` and its rows, so no directory or path is repeated.
@@ -204,7 +267,10 @@ pub fn run(c: &Connection, p: &Project, sym: &str, rel: &str, depth: usize, curs
             let at = lines.len();
             let (n, files, guessed) = sites(c, &[top.id], calls, &mut lines)?;
             let g = if guessed > 0 { format!(", {guessed} guessed by name") } else { String::new() };
-            lines.insert(at, format!("{n} {} in {files} files{g}", if calls { "call sites" } else { "refs" }));
+            lines.insert(at, format!("{n} {} in {} files{g}", if calls { "call sites" } else { "refs" }, files.len()));
+            if let Some(l) = completeness(c, p.id, top, &files, "may be incomplete")? {
+                lines.insert(at + 1, l);
+            }
         }
         "callees" => {
             let mut q = c.prepare_cached(&format!(
@@ -220,8 +286,14 @@ pub fn run(c: &Connection, p: &Project, sym: &str, rel: &str, depth: usize, curs
             lines.push(format!("{} callees (project symbols){g}", v.len()));
             let mut by: BTreeMap<String, Vec<String>> = BTreeMap::new();
             for (s, at, amb) in v {
-                let guess = if amb > 0 { format!(" guess 1 of {amb}") } else { String::new() };
-                by.entry(s.path.clone()).or_default().push(format!("  :{} {} {} {} @{at}{guess}", s.line, s.kind, s.qname(), s.h()));
+                by.entry(s.path.clone()).or_default().push(format!(
+                    "  :{} {} {} {} @{at}{}",
+                    s.line,
+                    s.kind,
+                    s.qname(),
+                    s.h(),
+                    guess_note(amb)
+                ));
             }
             group_by_dir(by.into_iter().map(|(p, rows)| (p, rows.len(), rows)), &mut lines);
         }
@@ -285,6 +357,11 @@ pub fn run(c: &Connection, p: &Project, sym: &str, rel: &str, depth: usize, curs
                 levels.push(next.clone());
                 frontier = next;
             }
+            let direct: HashSet<String> = {
+                let mut q = c.prepare_cached("SELECT DISTINCT path FROM ts_ref WHERE dst = ?1 AND dst != 0")?;
+                q.query_map([top.id], |r| r.get::<_, String>(0))?.flatten().collect()
+            };
+            let partial = completeness(c, p.id, top, &direct, "partial at d1")?;
             let total: usize = levels.iter().map(Vec::len).sum();
             let guessed = levels.iter().flatten().filter(|i| guess.get(i).is_some_and(Option::is_some)).count();
             let g = if guessed > 0 { format!(", {guessed} through name guesses") } else { String::new() };
@@ -293,6 +370,7 @@ pub fn run(c: &Connection, p: &Project, sym: &str, rel: &str, depth: usize, curs
                 top.row(),
                 levels.iter().map(|l| l.len().to_string()).collect::<Vec<_>>().join("/")
             ));
+            lines.extend(partial);
             for (d, lvl) in levels.iter().enumerate() {
                 let mut v: Vec<TSym> = lvl.iter().filter_map(|i| by_id(c, *i)).collect();
                 v.sort_by(|a, b| (&a.path, a.line).cmp(&(&b.path, b.line)));
@@ -305,7 +383,7 @@ pub fn run(c: &Connection, p: &Project, sym: &str, rel: &str, depth: usize, curs
                     }
                     let mark = match guess.get(&s.id).copied().flatten() {
                         Some(0) => " guess (via a guessed caller)".to_string(),
-                        Some(n) => format!(" guess 1 of {n}"),
+                        Some(n) => guess_note(n),
                         None => String::new(),
                     };
                     lines.push(format!("  :{} {} {}{mark}", s.line, s.qname(), s.h()));

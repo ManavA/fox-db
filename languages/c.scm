@@ -8,3 +8,5 @@
 (enum_specifier name: (type_identifier) @name) @definition.enum
 (call_expression function: (identifier) @name) @reference.call
 (call_expression function: (field_expression field: (field_identifier) @name)) @reference.call
+; A function named as a value in a designated initializer (`.open = foo_open`): a reference.
+(initializer_pair value: (identifier) @name) @reference.ref

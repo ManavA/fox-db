@@ -1,5 +1,34 @@
 # Changelog
 
+## Unreleased (intended as 0.2.1)
+
+Caller and impact answers no longer look complete when they are not, and more calls resolve.
+
+- C and C++: a free function call resolves by name across the whole project (one global
+  namespace), not only near the definition. A header prototype stands for its definition
+  instead of competing with it, `static` functions outside headers stay in their own file, and
+  among several same-name definitions the one nearest in the tree that is not under a test,
+  sample or tools directory is taken (labelled `guess 1 of N`). A function named in a designated
+  initializer (`.open = foo_open`) is a reference.
+- Calls through a receiver chain or a property (`theme.current.palette.fill()`,
+  `inputs.render(plan)`) resolve by their last name. The receiver's last name counts when it
+  matches a type (`inputs` reaches `Inputs` or `SessionInputs`; Go embedded fields such as
+  `pl.Evaluator.Preempt()` reach `Evaluator.Preempt`). With no such signal, a receiver call whose
+  name has several words is a guess among at most three same-name members (`guess by name`,
+  `guess 1 of N`); one-word names (`push`, `get`) still stay unresolved.
+- Function references are references: Kotlin `::fn` and `Type::fn`, Go function values in keyed
+  composite literals.
+- A symbol query prefers the name as typed over a same-name symbol in another case
+  (`render` the method before `Render` the class), and a definition over its C prototype.
+- Completeness signal: `callers` and `refs` (CLI and MCP `fox_graph`) add one line when the
+  name occurs in more files than the answer lists, counted from the index only (unresolved or
+  guessed references of that name, and, for names of several words, symbol text holding the
+  name as a whole word): `may be incomplete: `name` also appears in N other files; confirm
+  with: rg -nw name`. `impact` adds the same line as `partial at d1: ...`. Nothing is added when
+  the counts agree.
+- The store moves to schema 14: on the next index run, C, C++, Objective-C, Kotlin and Go files
+  parse again once (handles of their symbols change) and every project re-scores its references.
+
 ## 0.2.0 (2026-11-17)
 
 Highlights: an opt-in precise tier from SCIP indexes, an opt-in tantivy backend for Linux-sized

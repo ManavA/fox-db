@@ -12,3 +12,5 @@
 (delegation_specifiers (delegation_specifier (user_type (identifier) @name))) @reference.implementation
 (import (qualified_identifier) @name) @reference.import
 (class_parameter ["val" "var"] (identifier) @name) @definition.property
+; A function reference (`::step`, `Type::method`): a reference to its last name.
+(callable_reference (identifier) @name .) @reference.ref

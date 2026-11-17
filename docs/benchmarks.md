@@ -65,6 +65,46 @@ The `bench/results/m0-baseline-*.json` files are the earlier baseline of the old
 from an environment with headroom on (`ANTHROPIC_BASE_URL` at the proxy). The CLI bench does not
 pass through a model, so the mode does not change those numbers, but it is labelled as recorded.
 
+## Versus grep+read, and caller recall (0.2.1)
+
+**A simulated estimate on a busy host, not a measured agent run.** A script played two agents
+over the same questions on a private Kotlin app, kubernetes and Linux (shallow clones): one
+answering with `fox` only, one with `rg` plus reading whole matching files (first 2,000 lines),
+counting answer bytes / 4 as tokens. Host load was 10-24 throughout.
+
+- Tokens per lookup: about 97-99% fewer with foxdb on medium to very large repos. Naive cost is
+  mostly whole-file reads; a frugal grep-first agent that reads about 120 lines around each hit
+  narrows the gap to roughly 2.5x-30x depending on how much it reads.
+- Tool calls: one `fox` call per lookup against several greps and reads.
+- Vague (natural-language) search: foxdb ranked the right file first or second on most
+  questions; grep listings held it, but usually far down a count-sorted list, so the naive agent
+  needed more reads to land on it.
+- Caller recall: before 0.2.1, C callers and impact covered only callers near the definition
+  (a header prototype tied with its definition), Kotlin calls through receiver chains and
+  properties and function references were missed, and Go calls through embedded fields went to
+  the wrong type. Measured against `rg -w` ground truth (call-shaped uses outside comments and
+  strings, in indexed files; callers of other same-name definitions count against foxdb):
+
+| Corpus | Queries | Mean file recall before | after | Pooled recall before | after |
+|---|---|---|---|---|---|
+| Linux, `callers` | 12 | 0.40 | 0.90 | 0.09 | 0.99 (one query, `mutex_lock`, paged past the bench budget and is left out of the pooled figure) |
+| Linux, `impact` | 2 | 0.52 | 0.96 | 0.09 | 0.93 |
+| kubernetes, `callers` | 15 | 0.84 | 0.86 | 0.88 | 0.89 |
+| Kotlin app, `callers` | 14 | 0.63 | 0.74 | 0.75 | 0.81 |
+| Kotlin app, `impact` | 3 | 0.50 | 0.72 | 0.55 | 0.73 |
+
+  Linux `wake_up_process` went from 3 caller files to 167 of 168, `fd_install` from 3 to 47 of
+  47. Of the 27 answers still short of ground truth, 23 now carry the `may be incomplete` (or
+  `partial at d1`) line; it also appears on 10 answers that were complete, mostly where a
+  same-name local variable or another same-name definition's callers share the word.
+- Cost of the change: complete answers are longer (the Linux `callers` set totals about 14,600
+  tokens against 1,800, because it now lists the callers), and the completeness line adds about
+  20-25 tokens when present. On a small repo, answers whose lists were complete are unchanged
+  except where they gained correct callers or now pick the symbol in the case typed. A `callers`
+  call on Linux took about 20-35 ms against 14-17 ms (median of 3, cold CLI). A first index run
+  after the upgrade parses C, C++, Objective-C, Kotlin and Go files again; store size grew about
+  3-4% (Linux 2.6 to 2.7 GB, kubernetes 689 to 713 MB).
+
 ## Scale (milestone 4)
 
 `bench/results/m4-scale-foxdb.json`: kubernetes (shallow clone, about 32k files) alone, then linux (about 97k files) added to the same store; 32 cores, store on tmpfs, shared host at load 9-24, so treat latencies as plus or minus 2x.

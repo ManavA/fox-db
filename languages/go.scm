@@ -8,3 +8,5 @@
 (type_spec name: (type_identifier) @name type: [(type_identifier) (qualified_type) (function_type) (map_type) (slice_type) (pointer_type) (generic_type)]) @definition.type
 (method_elem name: (field_identifier) @name) @definition.method
 (import_spec path: (interpreted_string_literal) @name) @reference.import
+; A function value in a keyed composite literal (`RunE: runCmd`).
+(keyed_element value: (literal_element (identifier) @name)) @reference.ref

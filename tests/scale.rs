@@ -421,8 +421,9 @@ fn upgraded_stores_label_existing_guessed_calls_on_the_next_index() {
         p
     };
     let mut c = db::open_rw().unwrap();
+    // Go files also parse again once (the 0.2.1 tag patterns).
     let st = tsindex::index_project(&mut c, &p).unwrap();
-    assert_eq!(st.parsed, 0);
+    assert!(st.rescored > 0);
     let amb: i64 = c.query_row("SELECT amb FROM ts_ref WHERE path = 'pkg/a/z.go' AND name = 'Errorf'", [], |r| r.get(0)).unwrap();
     assert_eq!(amb, 2);
     // Once only: the next run has nothing to re-score.

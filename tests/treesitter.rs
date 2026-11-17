@@ -287,3 +287,132 @@ fn savings_ledger_counts_and_notes_occasionally() {
     assert!(s.contains("today: ~4000 in 40 answers") && s.contains("top: code callers ~4000/40"), "{s}");
     assert!(savings::brief_line(&c).unwrap().contains("~4000 tokens this week"));
 }
+
+/// A project from inline files under a scratch FOXDB_HOME, indexed.
+fn inline_project(files: &[(&str, &str)]) -> (tempfile::TempDir, tempfile::TempDir, project::Project) {
+    let home = tempfile::tempdir().unwrap();
+    // SAFETY: tests touching FOXDB_HOME hold SERIAL.
+    unsafe { std::env::set_var("FOXDB_HOME", home.path()) };
+    let repo = tempfile::tempdir().unwrap();
+    for (path, text) in files {
+        let f = repo.path().join(path);
+        std::fs::create_dir_all(f.parent().unwrap()).unwrap();
+        std::fs::write(f, text).unwrap();
+    }
+    let mut c = db::open_rw().unwrap();
+    let p = project::ensure(&c, &project::locate(repo.path())).unwrap();
+    inventory::index_project(&mut c, &p).unwrap();
+    tsindex::index_project(&mut c, &p).unwrap();
+    (home, repo, p)
+}
+
+/// C has one namespace for non-static functions: a call in any directory reaches the one
+/// definition, not its header prototype; `static` functions stay in their own file.
+#[test]
+fn c_calls_resolve_across_directories_and_static_stays_file_local() {
+    let _g = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    let (_h, _r, p) = inline_project(&[
+        ("include/linux/sched.h", "struct task;\nint wake_task(struct task *p);\n"),
+        ("kernel/sched/core.c", "int wake_task(struct task *p) { return 1; }\nstatic int pick(void) { return wake_task(0); }\n"),
+        ("kernel/kthread.c", "int kthread_start(void) { return wake_task(0); }\n"),
+        ("fs/exec.c", "static int helper(void) { return 0; }\nint do_exec(void) { helper(); return wake_task(0); }\n"),
+        ("drivers/tty/tty.c", "static int helper(void) { return 2; }\nint tty_open(void) { return helper(); }\n"),
+        ("tools/perf/util/wake.c", "int wake_task(void *p) { return 0; }\n"),
+        ("fs/ops.c", "struct ops { int (*open)(void); };\nstatic struct ops fops = { .open = tty_open };\n"),
+    ]);
+    let out = fox_code(&p, "wake_task", "callers", 800);
+    assert!(out.contains("~c:") && out.contains("kernel/sched/core.c:1"), "{out}");
+    assert!(out.contains("3 call sites in 3 files"), "{out}");
+    assert!(out.contains("kthread.c (1)") && out.contains("exec.c (1)") && out.contains("core.c (1)"), "{out}");
+    assert!(!out.contains("may be incomplete"), "{out}");
+    // `src` leads with the definition, not the prototype or the tools/ copy.
+    let out = fox_code(&p, "wake_task", "src", 800);
+    assert!(out.contains("kernel/sched/core.c:1-1"), "{out}");
+    // Each static helper is called only from its own file.
+    let out = fox_code(&p, "helper", "callers", 800);
+    assert!(out.contains("2 matches") && out.contains("1 call sites in 1 files"), "{out}");
+    assert!(out.contains(" exec.c (1)\n  :2 do_exec") || out.contains(" tty.c (1)\n  :2 tty_open"), "{out}");
+    // A function named in a designated initializer is a reference.
+    let out = fox_code(&p, "tty_open", "refs", 800);
+    assert!(out.contains("fs/\n ops.c (1)"), "{out}");
+}
+
+/// Kotlin calls through a receiver chain or a property reach a member of another package
+/// (as a name guess), a function reference `::fn` is a reference, and the name as typed beats
+/// a same-name class in another case.
+#[test]
+fn kotlin_receiver_chains_function_references_and_exact_case() {
+    let _g = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    let (_h, _r, p) = inline_project(&[
+        (
+            "app/ui/theme/Palette.kt",
+            "package app.ui.theme\n\nclass Palette {\n    fun tintFor(x: Int): Int = x\n    fun glowFor(x: Int): Int = x\n}\n",
+        ),
+        ("app/plan/Inputs.kt", "package app.plan\n\nclass Inputs {\n    fun render(plan: String): String = plan\n}\n"),
+        ("app/plan/Render.kt", "package app.plan\n\nclass Render\n"),
+        ("app/math/Steps.kt", "package app.math\n\nfun stepOnce(acc: Int, x: Int): Int = acc + x\n"),
+        (
+            "app/feature/Screen.kt",
+            "package app.feature\n\nimport app.math.stepOnce\n\nclass Screen(val theme: Theme, val inputs: Inputs) {\n    fun draw() = theme.current.palette.tintFor(1)\n    fun show(plan: String) = inputs.render(plan)\n    fun total(xs: List<Int>) = xs.fold(0, ::stepOnce)\n    fun glow() = theme.current.colors.glowFor(2)\n}\n",
+        ),
+    ]);
+    let out = fox_code(&p, "tintFor", "callers", 800);
+    // The receiver `palette` names the type `Palette`: no guess.
+    assert!(out.contains("1 call sites in 1 files\n") && out.contains(":6 Screen.draw c:"), "{out}");
+    // `render` is the method, not the class `Render`; its call through a property is found.
+    let out = fox_code(&p, "render", "impact", 800);
+    assert!(out.contains("method Inputs.render") && out.contains("Screen.show"), "{out}");
+    // A receiver named unlike any type: a guess by name.
+    let out = fox_code(&p, "glowFor", "callers", 800);
+    assert!(out.contains("1 guessed by name") && out.contains(":9 Screen.glow c:") && out.contains(" guess by name"), "{out}");
+    let out = fox_code(&p, "stepOnce", "impact", 800);
+    assert!(out.contains("Screen.total"), "{out}");
+}
+
+/// When the name occurs in more files than the resolved sites, one line says so; when the
+/// counts agree, nothing is added.
+#[test]
+fn callers_say_when_the_name_occurs_in_unlisted_files() {
+    let _g = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    let (_h, _r, p) = inline_project(&[
+        ("kernel/core.c", "int wake_task(int p) { return p; }\nint run(void) { return wake_task(1); }\n"),
+        ("mm/a.c", "int (*cb)(int);\nint use_a(void) { register_cb(wake_task); return 0; }\n"),
+        ("mm/b.c", "int use_b(void) { return queue_work(wake_task, 2); }\n"),
+    ]);
+    let out = fox_code(&p, "wake_task", "callers", 800);
+    assert!(
+        out.contains(
+            "1 call sites in 1 files\nmay be incomplete: `wake_task` also appears in 2 other files; confirm with: rg -nw wake_task"
+        ),
+        "{out}"
+    );
+    let out = fox_code(&p, "wake_task", "impact", 800);
+    assert!(out.contains("\npartial at d1: `wake_task` also appears in 2 other files"), "{out}");
+    let out = fox_code(&p, "run", "callers", 800);
+    assert!(!out.contains("may be incomplete"), "{out}");
+}
+
+/// A Go call through an embedded field (`pl.Evaluator.Preempt()`) reaches the method of the type
+/// the field is named after, not a same-name method of another type in the imported package.
+#[test]
+fn go_embedded_field_call_reaches_the_named_type() {
+    let _g = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    let (_h, _r, p) = inline_project(&[
+        (
+            "pkg/preemption/group.go",
+            "package preemption\n\ntype GroupEvaluator struct{}\n\nfunc (g *GroupEvaluator) Preempt() int { return 0 }\n",
+        ),
+        (
+            "pkg/preemption/preemption.go",
+            "package preemption\n\ntype Evaluator struct{}\n\nfunc (ev *Evaluator) Preempt() int { return 1 }\n",
+        ),
+        (
+            "pkg/plugins/defaultpreemption/plugin.go",
+            "package defaultpreemption\n\nimport \"example.com/pkg/preemption\"\n\ntype groupEvaluator interface {\n\tPreempt() int\n}\n\ntype Plugin struct {\n\t*preemption.Evaluator\n\tgroup groupEvaluator\n}\n\nfunc (pl *Plugin) PostFilter() int { return pl.Evaluator.Preempt() + pl.group.Preempt() }\n",
+        ),
+    ]);
+    let out = fox_code(&p, "Evaluator.Preempt", "callers", 800);
+    assert!(out.contains("1 call sites in 1 files") && out.contains("Plugin.PostFilter"), "{out}");
+    let out = fox_code(&p, "GroupEvaluator.Preempt", "callers", 800);
+    assert!(out.contains("0 call sites"), "{out}");
+}

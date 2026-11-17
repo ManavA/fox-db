@@ -331,6 +331,19 @@ pub(crate) fn migrate(c: &Connection) -> Result<()> {
             Ok(())
         })?;
     }
+    if v < 14 {
+        // 0.2.1: new tag patterns (function references, C prototypes and `static`), the last
+        // name of a call's receiver (`pl.Evaluator.Preempt()` -> `Evaluator`), and new scoring.
+        // Files of the changed grammars parse again on the next index run (an empty hash and
+        // size force it), and every project with references re-scores them all once.
+        add_column(c, "ts_ref", "via", "TEXT")?;
+        c.execute_batch(
+            "UPDATE ts_file SET hash = '', size = -1 WHERE lang IN ('c', 'cpp', 'objc', 'kotlin', 'go');
+             INSERT OR REPLACE INTO meta(k, v)
+               SELECT 'rescore:' || p.id, 1 FROM project p WHERE EXISTS (SELECT 1 FROM ts_ref r WHERE r.project_id = p.id);
+             PRAGMA user_version = 14;",
+        )?;
+    }
     // Cheap when already set: the setting lives in each table's own config.
     for t in FTS_TABLES {
         defer_merges(c, t)?;
@@ -624,7 +637,7 @@ pub fn minority(c: &Connection, ranges: &[(i64, i64)]) -> bool {
 }
 
 /// The schema version this build writes.
-pub const LATEST: i64 = 13;
+pub const LATEST: i64 = 14;
 
 /// Read-only connection for the hot paths. None if the store does not exist yet.
 pub fn open_ro() -> Option<Connection> {
