@@ -10,15 +10,30 @@ It also keeps a handoff board, so several agents in Claude Code, Codex, opencode
 can share findings, hand work over and run as a supervised swarm. Everything stays on your
 machine; nothing is written into your repositories.
 
+**AI agents:** to set foxdb up, read [AGENTS-SETUP.md](AGENTS-SETUP.md).
+
+## Install with your agent (recommended)
+
+Paste this into Claude Code, Codex, opencode or any coding agent:
+
+> Set up foxdb from https://github.com/ManavA/foxdb by following its
+> [AGENTS-SETUP.md](AGENTS-SETUP.md) from top to bottom. Ask me before changing any harness setting.
+
+The agent checks prerequisites, installs `fox` and `foxd` into `~/.foxdb/bin` (no root), indexes
+your projects, registers the MCP server and skill for each harness it finds, backs up every
+settings file first, verifies the result and tells you how to undo it. The repository is private,
+so the agent's machine needs a logged-in `gh` or git credentials for github.com.
+
 ## What it can do
 
-- **Search**: ranked search over symbols, files, doc sections, milestones and memory in milliseconds, with the project scope respected in a shared store.
-- **Call graph**: callers, callees, references, overrides, conformances and transitive impact of a change, plus outlines and source of one symbol.
+- **Search**: ranked search over symbols, files, doc sections, milestones and memory in milliseconds; plain questions also search doc comments and function bodies.
+- **Call graph**: callers, callees, references, overrides, conformances and transitive impact of a change, plus outlines and source of one symbol. Name-guessed links are labelled `guess 1 of N`.
 - **Docs, milestones and memory**: Markdown sections and milestone logs as searchable rows, Claude Code memory notes, read-only digests of past Claude Code and Codex sessions, and `fox drift` / `fox pack` for docs that cite code.
 - **Multi-agent handoff and orchestration**: a shared board, handoff packets, leased takes, writer leases, `fox dispatch` / `fox wait` for Codex and Claude workers, `fox switch` across harnesses, and `fox swarm` for a whole plan with dependencies and a review panel ([docs/swarm.md](docs/swarm.md)). Works under [T3 Code](docs/t3code.md) too.
 - **Token sparing**: answers are budgeted rows with handles instead of file dumps, repeated reads come back as one-line references, and every hook output is capped and stable so it stays in the prompt cache.
+- **Scales up when you need it**: shared stores of many projects, trees the size of Kubernetes and Linux, and three opt-in extras that change nothing until you turn them on (see Scaling).
 
-## Quickstart (5 minutes)
+## Manual install (5 minutes)
 
 You need Linux or macOS, git, and access to the repository, which is private: the GitHub CLI
 (`gh`, logged in) is simplest, or git credentials for github.com. On Linux x86_64 a logged-in
@@ -70,7 +85,141 @@ Start a new session and ask the agent to "use fox_find to find load_config". The
 brief, subagent hooks, opencode, T3 Code and multi-agent settings are in
 [AGENTS-SETUP.md](AGENTS-SETUP.md).
 
-**If you are an AI agent setting this up, read [AGENTS-SETUP.md](AGENTS-SETUP.md).**
+## Usage
+
+Agents call the four MCP tools (`fox_find`, `fox_graph`, `fox_read`, `fox_memory`); you and your
+scripts use the same features through the `fox` CLI. Every answer is a short list of rows ending
+in `path:line`, each with a handle (`s:1a2`, `d:4`, `h:7`) that `fox code` or `fox_read` expands.
+Full reference: [docs/usage.md](docs/usage.md).
+
+### Search
+
+```
+fox find "retry failed upload"            # plain question: names, paths, doc sections, comments and bodies
+fox find UploadWorker                     # bare identifier: exact and prefix name match first
+fox find "release checklist" --kind doc   # only doc sections (also: symbol, file, milestone, dir, memory)
+fox find config --all --limit 20          # every indexed project, not just the current one
+```
+
+Results from several search methods (exact name, keyword, substring, fuzzy name, graph
+neighbours, and body text for questions) are fused and ranked; definitions rank above tests and
+generated code. `fox eval retrieval` measures search quality on a fixed query set
+([docs/search-quality.md](docs/search-quality.md)).
+
+### Call graph and code
+
+```
+fox code UploadWorker --rel outline       # members of a type or file
+fox code upload --rel callers             # who calls it (also callees, refs, overrides, subtypes, impact)
+fox code upload --rel impact --depth 3    # everything that transitively depends on it
+fox code s:1a2 --rel src                  # the source of one symbol, budgeted
+```
+
+Swift links come from Xcode's index and are exact. Other languages are linked by name; a link
+picked among several same-name definitions says `guess 1 of N`. Import a SCIP index to make them
+exact (see Scaling).
+
+### Docs, milestones and memory
+
+```
+fox find "current gate" --kind milestone  # status rows from milestone logs
+fox drift docs/design.md                  # code the doc cites that changed, moved or vanished
+fox pack docs/design.md                   # the doc plus the code it cites, for a fresh reviewer
+fox ingest sessions --since-days 7        # read-only digests of past Claude Code and Codex sessions
+fox stats                                 # tokens saved versus reading files directly
+```
+
+### Multi-agent: share, hand off, switch
+
+All agents on the machine share one board. Findings, decisions and reports are posted once and
+read by handle, so siblings don't each pay for the same large read.
+
+```
+fox mem post "Upload retries ignore 429" --kind finding --evidence src/upload.rs:88
+fox mem read --since auto                 # only what is new to this agent
+fox handoff create --goal "Fix 429 retries" --next "add backoff in upload.rs"   # -> h:12
+fox handoff take h:12                     # claimed exactly once, even with several takers
+fox switch --to codex --handoff h:12      # prints the command to continue the task in Codex
+```
+
+Claude can run Codex workers and the other way round. Each worker is tracked, gets the foxdb
+MCP and the parent's packet pointer, and posts its final output as a report:
+
+```
+fox dispatch --harness codex --task "Audit upload.rs for retry bugs" --label audit   # -> cx-3
+fox dispatch --harness codex --task h:12 --writer                                    # one writer per repo
+fox wait cx-3 cx-4 --all --timeout 1800
+fox agents --tree                          # who is running, under whom, and their reports
+```
+
+Details: [docs/multi-agent.md](docs/multi-agent.md).
+
+### Swarms
+
+`fox swarm run plan.toml` runs a whole plan: tasks with dependencies, a concurrency cap, one
+writer per repo, a single summary at the end, and an optional reviewer panel that votes. Running
+it again resumes and never starts a task twice.
+
+```toml
+name = "audit-handlers"
+concurrency = 3
+
+[[task]]
+id = "scan"
+harness = "codex"
+task = "List every HTTP handler under api/ that reads the body twice. Report path:line."
+
+[[task]]
+id = "fix"
+harness = "codex"
+task = "Fix the handlers listed in the scan report."
+writer = true
+depends_on = ["scan"]
+
+[review]
+harnesses = ["claude", "codex", "claude"]
+task = "Check every handler in the scan was fixed and nothing else changed."
+```
+
+```
+fox swarm run audit.toml
+fox swarm status audit-handlers
+```
+
+Patterns (parallel investigators, one writer, review panels, Claude directing Codex and back):
+[docs/swarm.md](docs/swarm.md).
+
+### T3 Code
+
+Register foxdb once for the providers T3 Code runs (Codex, Claude, OpenCode) and every T3 thread
+shares the same index and board. T3's fork, handoff and merge-back map onto foxdb packets, and
+`--for t3` formats a packet to paste into a thread:
+
+```
+fox handoff render h:12 --for t3          # packet capped at 2,000 characters
+fox switch --for t3 --handoff h:12        # a one-line message pointing at the packet
+```
+
+Setup and caveats (Codex threads under one T3 app-server share one foxdb identity):
+[docs/t3code.md](docs/t3code.md).
+
+### Scaling
+
+One store holds every project; search stays inside the current project unless you pass `--all`.
+Kubernetes-sized trees index in about a minute and a one-file save re-checks only what changed;
+trees of 50,000 files or more skip the full file walk on save. Run `foxd` to keep the call graph
+in memory and answer from a warm cache (the CLI falls back to direct reads without it).
+
+Three opt-in extras change nothing until you turn them on:
+
+| Extra | Turn on | What it gives |
+|---|---|---|
+| Precise tier (SCIP) | `fox scip import index.scip` | exact definitions and call edges from an index your own build produced, replacing name guesses |
+| Tantivy backend | `[search] backend = "auto"` in config.toml, then `fox index rebuild` | about 3x faster keyword search on Linux-sized projects (about 1M rows and up) |
+| Vector arm | build with `--features vectors`, then `fox vectors setup` and `vectors = true` | meaning-based matches for long, vague questions |
+
+Measured trade-offs and open targets: [docs/benchmarks.md](docs/benchmarks.md),
+[docs/architecture.md](docs/architecture.md).
 
 ## Docs
 
@@ -87,9 +236,9 @@ brief, subagent hooks, opencode, T3 Code and multi-agent settings are in
 
 ## Status
 
-0.1.0 is the first release, used daily by one developer on large Kotlin, Swift and Rust
-codebases. It is single-machine and single-user, the call graph outside Swift is
-name-resolved (treat `callers` as a lower bound), and some performance targets are still open;
+0.2.0, used daily by one developer on large Kotlin, Swift and Rust codebases. It is
+single-machine and single-user, the call graph outside Swift is name-resolved unless you import
+a SCIP index (treat `callers` as a lower bound), and some performance targets are still open;
 see [docs/benchmarks.md](docs/benchmarks.md) and the limitations in
 [docs/usage.md](docs/usage.md#limitations).
 

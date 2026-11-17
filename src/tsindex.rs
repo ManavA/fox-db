@@ -8,6 +8,7 @@
 
 use crate::db;
 use crate::lang::{self, Lang};
+use crate::outbox::{self, Sink, TBL_BODY, TBL_NODE, TBL_TRI};
 use crate::project::Project;
 use anyhow::Result;
 use rayon::prelude::*;
@@ -357,10 +358,42 @@ pub fn split_words(text: &str) -> String {
 
 /// Incrementally (re)index the project's code files from the inventory.
 pub fn index_project(c: &mut Connection, p: &Project) -> Result<Stats> {
+    index_project_with(c, p, None)
+}
+
+/// [`index_project`], told which files the inventory pass of this run changed (a big tree with a
+/// walk record). It then reads only those, when it is known to have taken every earlier change
+/// (see `walkcache::filegen`) and owes no backfill, re-score or fill; otherwise it reads all.
+pub fn index_project_with(c: &mut Connection, p: &Project, delta: Option<&crate::inventory::Delta>) -> Result<Stats> {
     let t0 = std::time::Instant::now();
     let mut st = Stats::default();
+    // The file generation this run takes (trees with a walk record only).
+    let filegen: Option<i64> = c.query_row("SELECT v FROM meta WHERE k = 'files:' || ?1", [p.id], |r| r.get(0)).ok();
+    let only: Option<&Vec<String>> = delta
+        .filter(|d| {
+            let taken: Option<i64> = c.query_row("SELECT v FROM meta WHERE k = 'tsfiles:' || ?1", [p.id], |r| r.get(0)).ok();
+            taken == Some(d.filegen)
+                && !db::reindex_pending(c, p.id)
+                && !db::rescore_pending(c, p.id)
+                && outbox::state(c, p.id).is_none_or(|s| s.1 != "filling")
+                && c.query_row("SELECT 1 FROM swift_unit WHERE project_id = ?1 LIMIT 1", [p.id], |_| Ok(())).is_err()
+        })
+        .map(|d| &d.paths);
     // Inventory code files (tier 3) with a known grammar. Swift files the index store covers are skipped.
-    let files: Vec<(String, i64, i64)> = {
+    let files: Vec<(String, i64, i64)> = if let Some(paths) = only {
+        let mut q = c.prepare_cached(
+            "SELECT f.path, COALESCE(f.size,0), COALESCE(f.mtime,0) FROM node f WHERE f.project_id = ?1 AND f.path = ?2 AND f.kind = 'file' AND f.tier >= 2",
+        )?;
+        let mut v = vec![];
+        for path in paths {
+            v.extend(q.query_map(params![p.id, path], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?.flatten());
+        }
+        v.into_iter()
+            .filter(|(path, size, _): &(String, i64, i64)| {
+                lang::for_path(path).is_some() && (*size as u64) <= MAX_FILE && !crate::tiers::is_denied_path(path)
+            })
+            .collect()
+    } else {
         let mut q = c.prepare(
             "SELECT f.path, COALESCE(f.size,0), COALESCE(f.mtime,0) FROM node f WHERE f.project_id = ?1 AND f.kind = 'file' AND f.tier >= 2
              AND NOT (f.lang = 'swift' AND EXISTS (SELECT 1 FROM swift_rec r WHERE r.path = f.path))",
@@ -372,7 +405,14 @@ pub fn index_project(c: &mut Connection, p: &Project) -> Result<Stats> {
             })
             .collect()
     };
-    let old: HashMap<String, (String, i64, i64)> = {
+    let old: HashMap<String, (String, i64, i64)> = if let Some(paths) = only {
+        let mut q = c.prepare_cached("SELECT path, hash, size, mtime FROM ts_file WHERE project_id = ?1 AND path = ?2")?;
+        let mut m = HashMap::new();
+        for path in paths {
+            m.extend(q.query_map(params![p.id, path], |r| Ok((r.get::<_, String>(0)?, (r.get(1)?, r.get(2)?, r.get(3)?))))?.flatten());
+        }
+        m
+    } else {
         let mut q = c.prepare("SELECT path, hash, size, mtime FROM ts_file WHERE project_id = ?1")?;
         q.query_map([p.id], |r| Ok((r.get::<_, String>(0)?, (r.get(1)?, r.get(2)?, r.get(3)?))))?.flatten().collect()
     };
@@ -381,7 +421,10 @@ pub fn index_project(c: &mut Connection, p: &Project) -> Result<Stats> {
     let removed: Vec<String> = old.keys().filter(|k| !now.contains(k.as_str())).cloned().collect();
     // A body backfill (or a requested rebuild) reads every file once; unchanged ones only have
     // their symbols' body text written again, so their ids and handles stay.
-    let reindex = db::reindex_pending(c, p.id);
+    // A derived search index's fill (see `outbox`) reads every file once too, and writes every
+    // symbol's rows to its log. Only a fill the inventory pass of this run started counts.
+    let fill = outbox::state(c, p.id).is_some_and(|s| s.1 == "filling");
+    let reindex = db::reindex_pending(c, p.id) || fill;
     let todo: Vec<&(String, i64, i64)> =
         files.iter().filter(|(path, size, mtime)| reindex || old.get(path).is_none_or(|o| o.1 != *size || o.2 != *mtime)).collect();
     let root = p.root.clone();
@@ -405,6 +448,8 @@ pub fn index_project(c: &mut Connection, p: &Project) -> Result<Stats> {
         .collect();
     trace("ts parse", t0);
     let tx = c.transaction()?;
+    let sink = Sink::open(&tx);
+    let mut emitted: HashSet<i64> = HashSet::new();
     // A big cold run builds the name index once at the end: a sort, not millions of random inserts.
     let bulk = old.is_empty() && work.len() > 5000;
     if bulk {
@@ -413,7 +458,7 @@ pub fn index_project(c: &mut Connection, p: &Project) -> Result<Stats> {
     // Scope for incremental resolution: changed paths, and names defined there before or after.
     let mut sc_paths: HashSet<String> = HashSet::new();
     let mut sc_names: HashSet<String> = HashSet::new();
-    let full = old.is_empty();
+    let full = old.is_empty() && only.is_none();
     let old_names = |path: &str, out: &mut HashSet<String>| -> Result<()> {
         let mut q =
             tx.prepare_cached("SELECT name FROM node WHERE project_id = ?1 AND path = ?2 AND kind = 'symbol' AND source = 'treesitter'")?;
@@ -423,7 +468,7 @@ pub fn index_project(c: &mut Connection, p: &Project) -> Result<Stats> {
     for path in &removed {
         old_names(path, &mut sc_names)?;
         sc_paths.insert(path.clone());
-        drop_file(&tx, p.id, path)?;
+        drop_file(&tx, &sink, p.id, path)?;
         tx.execute("DELETE FROM ts_file WHERE project_id = ?1 AND path = ?2", params![p.id, path])?;
         st.removed += 1;
     }
@@ -441,17 +486,17 @@ pub fn index_project(c: &mut Connection, p: &Project) -> Result<Stats> {
                     "UPDATE ts_file SET size = ?3, mtime = ?4 WHERE project_id = ?1 AND path = ?2",
                     params![p.id, path, size, mtime],
                 )?;
-                store_bodies(&tx, p.id, &path, &texts)?;
+                store_bodies(&tx, &sink, p.id, &path, &texts, fill.then_some(&mut emitted))?;
                 st.unchanged += 1;
             }
             Work::Parse { path, lang, hash, size, mtime, parsed, texts } => {
                 if old.contains_key(&path) {
                     old_names(&path, &mut sc_names)?;
-                    drop_file(&tx, p.id, &path)?;
+                    drop_file(&tx, &sink, p.id, &path)?;
                 }
                 sc_names.extend(parsed.defs.iter().map(|d| d.name.clone()));
                 sc_paths.insert(path.clone());
-                store_file(&tx, p.id, &path, lang, &parsed, &texts)?;
+                store_file(&tx, &sink, p.id, &path, lang, &parsed, &texts, fill.then_some(&mut emitted))?;
                 tx.execute(
                     "INSERT OR REPLACE INTO ts_file(project_id, path, lang, hash, size, mtime) VALUES (?1,?2,?3,?4,?5,?6)",
                     params![p.id, path, lang, hash, size, mtime],
@@ -475,8 +520,19 @@ pub fn index_project(c: &mut Connection, p: &Project) -> Result<Stats> {
     if rescore {
         db::rescore_done(&tx, p.id)?;
     }
+    if fill {
+        fill_rest(&tx, &sink, p.id, &emitted)?;
+        outbox::fill_done(&tx, p.id)?;
+    }
     if reindex {
         db::reindex_done(&tx, p.id)?;
+    }
+    if let Some(fg) = filegen {
+        // Every file change up to this generation is taken (see `index_project_with`).
+        tx.execute("INSERT OR REPLACE INTO meta(k, v) VALUES ('tsfiles:' || ?1, ?2)", params![p.id, fg])?;
+    }
+    if only.is_some() {
+        st.files = tx.query_row("SELECT COUNT(*) FROM ts_file WHERE project_id = ?1", [p.id], |r| r.get::<_, i64>(0))? as usize;
     }
     trace("ts resolve", t0);
     let changed = st.parsed > 0 || st.removed > 0 || rescore || reindex;
@@ -498,8 +554,11 @@ fn trace(what: &str, t0: std::time::Instant) {
     }
 }
 
-fn drop_file(tx: &Connection, pid: i64, path: &str) -> Result<()> {
+fn drop_file(tx: &Connection, sink: &Sink, pid: i64, path: &str) -> Result<()> {
     let sel = "SELECT id FROM node WHERE project_id = ?1 AND path = ?2 AND kind = 'symbol' AND source = 'treesitter'";
+    for t in [TBL_NODE, TBL_TRI, TBL_BODY] {
+        sink.del_where(tx, pid, t, sel, &[&pid, &path])?;
+    }
     tx.execute(&format!("DELETE FROM edge WHERE src IN ({sel})"), params![pid, path])?;
     tx.execute(&format!("DELETE FROM edge WHERE dst IN ({sel})"), params![pid, path])?;
     tx.execute(&format!("DELETE FROM fts_node WHERE rowid IN ({sel})"), params![pid, path])?;
@@ -512,7 +571,16 @@ fn drop_file(tx: &Connection, pid: i64, path: &str) -> Result<()> {
 }
 
 /// Write the body-arm rows of an unchanged file's symbols again, found by their stable keys.
-fn store_bodies(tx: &Connection, pid: i64, path: &str, texts: &[String]) -> Result<()> {
+/// In a fill (`emitted` given) the rows only go to the derived index's log, all three of them:
+/// SQLite's own full-text rows are already current.
+fn store_bodies(
+    tx: &Connection,
+    sink: &Sink,
+    pid: i64,
+    path: &str,
+    texts: &[String],
+    mut emitted: Option<&mut HashSet<i64>>,
+) -> Result<()> {
     let mut get =
         tx.prepare_cached("SELECT id, name, COALESCE(json_extract(meta, '$.parent') || '.' || name, name) FROM node WHERE key = ?1")?;
     let mut del = tx.prepare_cached("DELETE FROM fts_body WHERE rowid = ?1")?;
@@ -521,13 +589,32 @@ fn store_bodies(tx: &Connection, pid: i64, path: &str, texts: &[String]) -> Resu
         let row: Option<(i64, String, String)> =
             get.query_row([format!("t:{pid}:{path}#{i}")], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?))).ok();
         let Some((id, name, q)) = row else { continue };
+        let split = crate::inventory::split_ident(&name);
+        if let Some(e) = emitted.as_deref_mut() {
+            sink.put(tx, pid, TBL_NODE, id, &[&split, &q, path, ""])?;
+            sink.put(tx, pid, TBL_TRI, id, &[path, &name])?;
+            sink.put(tx, pid, TBL_BODY, id, &[&split, &q, path, text])?;
+            e.insert(id);
+            continue;
+        }
         del.execute([id])?;
-        ins.execute(params![id, crate::inventory::split_ident(&name), q, path, text])?;
+        ins.execute(params![id, split, q, path, text])?;
+        sink.put(tx, pid, TBL_BODY, id, &[&split, &q, path, text])?;
     }
     Ok(())
 }
 
-fn store_file(tx: &Connection, pid: i64, path: &str, lang: &str, p: &Parsed, texts: &[String]) -> Result<()> {
+#[allow(clippy::too_many_arguments)]
+fn store_file(
+    tx: &Connection,
+    sink: &Sink,
+    pid: i64,
+    path: &str,
+    lang: &str,
+    p: &Parsed,
+    texts: &[String],
+    mut emitted: Option<&mut HashSet<i64>>,
+) -> Result<()> {
     let mut ins = tx.prepare_cached(
         "INSERT INTO node(project_id, kind, key, name, path, line, end_line, sig, lang, tier, source, meta, updated_at)
          VALUES (?1,'symbol',?2,?3,?4,?5,?6,?3,?7,3,'treesitter',?8,?9)",
@@ -549,15 +636,79 @@ fn store_file(tx: &Connection, pid: i64, path: &str, lang: &str, p: &Parsed, tex
             None => d.name.clone(),
         };
         let split = crate::inventory::split_ident(&d.name);
+        let text = texts.get(i).map(String::as_str).unwrap_or("");
         fts.execute(params![id, split, q, path])?;
         tri.execute(params![id, path, d.name])?;
-        body.execute(params![id, split, q, path, texts.get(i).map(String::as_str).unwrap_or("")])?;
+        body.execute(params![id, split, q, path, text])?;
+        if sink.on(pid) {
+            sink.put(tx, pid, TBL_NODE, id, &[&split, &q, path, ""])?;
+            sink.put(tx, pid, TBL_TRI, id, &[path, &d.name])?;
+            sink.put(tx, pid, TBL_BODY, id, &[&split, &q, path, text])?;
+            if let Some(e) = emitted.as_deref_mut() {
+                e.insert(id);
+            }
+        }
     }
     let mut r =
         tx.prepare_cached("INSERT INTO ts_ref(project_id, path, src, name, line, kind, recv, dst) VALUES (?1,?2,?3,?4,?5,?6,?7,0)")?;
     for x in &p.refs {
         let src = x.caller.map(|i| ids[i]).unwrap_or(0);
         r.execute(params![pid, path, src, x.name, x.line, x.kind, x.recv])?;
+    }
+    Ok(())
+}
+
+/// The rest of a fill: every symbol, session and note of project `pid` whose rows this run did
+/// not write to the log, rebuilt from `node` the way their importers write them. A tree-sitter
+/// symbol whose file could not be read again gets its names without body text.
+fn fill_rest(tx: &Connection, sink: &Sink, pid: i64, emitted: &HashSet<i64>) -> Result<()> {
+    let mut q = tx.prepare(
+        "SELECT id, kind, source, name, COALESCE(path, ''), COALESCE(sig, ''), json_extract(meta, '$.parent'), meta
+         FROM node WHERE project_id = ?1 AND kind IN ('symbol', 'session', 'memory')",
+    )?;
+    type Row = (i64, String, String, String, String, String, Option<String>, Option<String>);
+    let rows: Vec<Row> = q
+        .query_map([pid], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?, r.get(6)?, r.get(7)?)))?
+        .flatten()
+        .collect();
+    for (id, kind, source, name, path, sig, parent, meta) in rows {
+        if emitted.contains(&id) {
+            continue;
+        }
+        let split = crate::inventory::split_ident(&name);
+        let meta: serde_json::Value = meta.and_then(|m| serde_json::from_str(&m).ok()).unwrap_or_default();
+        match (kind.as_str(), source.as_str()) {
+            ("symbol", "indexstore") => {
+                // As `swiftimport` writes them: the declaration as signature, no body text.
+                let ident = parent.as_ref().map(|pn| format!("{pn}.{name}")).unwrap_or_else(|| name.clone());
+                sink.put(tx, pid, TBL_NODE, id, &[&split, &sig, &path, ""])?;
+                sink.put(tx, pid, TBL_BODY, id, &[&split, &sig, &path, ""])?;
+                sink.put(tx, pid, TBL_TRI, id, &[&path, &ident])?;
+            }
+            ("symbol", _) => {
+                let q = parent.as_ref().map(|pn| format!("{pn}.{name}")).unwrap_or_else(|| name.clone());
+                sink.put(tx, pid, TBL_NODE, id, &[&split, &q, &path, ""])?;
+                sink.put(tx, pid, TBL_TRI, id, &[&path, &name])?;
+                sink.put(tx, pid, TBL_BODY, id, &[&split, &q, &path, ""])?;
+            }
+            ("session", _) => {
+                let s = |k: &str| meta[k].as_str().unwrap_or("").to_string();
+                let anchors = meta["anchors"]
+                    .as_array()
+                    .map(|a| a.iter().filter_map(|x| x.as_str()).collect::<Vec<_>>().join(" "))
+                    .unwrap_or_default();
+                let title = if name == "(no prompt)" { String::new() } else { name.clone() };
+                let body = format!("{title}\n{}\n{anchors}", s("last"));
+                sink.put(tx, pid, TBL_NODE, id, &[&name, &s("harness"), &path, &body])?;
+                sink.put(tx, pid, TBL_TRI, id, &[&path, &name])?;
+            }
+            ("memory", "note") => {
+                let text = meta["text"].as_str().unwrap_or("");
+                sink.put(tx, pid, TBL_NODE, id, &[&split, "note", &path, text])?;
+                sink.put(tx, pid, TBL_TRI, id, &[&path, &name])?;
+            }
+            _ => {}
+        }
     }
     Ok(())
 }
@@ -588,6 +739,7 @@ struct RefRow {
     amb: i64,
     /// Container of the calling definition (-1 when unknown).
     caller_parent: i64,
+    line: i64,
 }
 
 /// One import: its last segment (imported name, module or `*`) and, for dotted JVM imports, the
@@ -717,7 +869,7 @@ fn map_cand(r: &rusqlite::Row) -> rusqlite::Result<(String, Cand)> {
 
 const CAND_COLS: &str =
     "id, name, path, json_extract(meta,'$.k'), COALESCE(json_extract(meta,'$.pid'),0), COALESCE(json_extract(meta,'$.parent'),''), lang";
-const REF_COLS: &str = "rowid, path, src, name, kind, dst, recv, amb";
+const REF_COLS: &str = "rowid, path, src, name, kind, dst, recv, amb, line";
 
 fn map_ref(r: &rusqlite::Row) -> rusqlite::Result<RefRow> {
     Ok(RefRow {
@@ -730,6 +882,7 @@ fn map_ref(r: &rusqlite::Row) -> rusqlite::Result<RefRow> {
         recv: r.get(6)?,
         amb: r.get(7)?,
         caller_parent: -1,
+        line: r.get(8)?,
     })
 }
 
@@ -738,6 +891,10 @@ fn map_ref(r: &rusqlite::Row) -> rusqlite::Result<RefRow> {
 pub struct Resolved {
     pub rescored: usize,
     pub resolved: usize,
+    /// References whose target came from a fresh SCIP import (`amb = -1`).
+    pub precise: usize,
+    /// Of those, references the name resolution alone would have guessed, missed or put elsewhere.
+    pub upgraded: usize,
 }
 
 /// Resolve every reference of the project by name: same file > same type > imported > same
@@ -843,11 +1000,28 @@ pub fn resolve_scoped(tx: &Connection, pid: i64, scope: Option<(&HashSet<String>
     }
     trace("resolve: candidates loaded", t0);
     // 3. Score in parallel; write only what changed.
-    let scored: Vec<(i64, i64)> =
+    let mut scored: Vec<(i64, i64)> =
         refs.par_iter().map(|r| score(r, cands.get(&r.name).map(Vec::as_slice).unwrap_or(&[]), imports.get(&r.path))).collect();
     trace("resolve: scored", t0);
+    let mut out = Resolved { rescored: refs.len(), ..Default::default() };
+    // 4. The precise tier: a fresh SCIP import overrides the name resolution where it knows the target.
+    if crate::scip::active(tx, pid) {
+        let mut by_path: HashMap<&str, HashMap<(i64, String), i64>> = HashMap::new();
+        for (r, s) in refs.iter().zip(scored.iter_mut()) {
+            if !by_path.contains_key(r.path.as_str()) {
+                by_path.insert(&r.path, crate::scip::targets(tx, pid, &r.path)?);
+            }
+            if let Some(&dst) = by_path[r.path.as_str()].get(&(r.line, r.name.clone())) {
+                if s.0 != dst || s.1 > 0 {
+                    out.upgraded += 1;
+                }
+                *s = (dst, -1);
+                out.precise += 1;
+            }
+        }
+        trace("resolve: scip overlay", t0);
+    }
     let mut upd = tx.prepare_cached("UPDATE ts_ref SET dst = ?2, amb = ?3 WHERE rowid = ?1")?;
-    let mut out = Resolved { rescored: refs.len(), resolved: 0 };
     let class = |k: &str| if k == "call" { "CALLS" } else { "REFERENCES" };
     let mut touched: HashSet<(i64, i64, &'static str)> = HashSet::new();
     let mut edges: HashSet<(i64, i64, &'static str)> = HashSet::new();

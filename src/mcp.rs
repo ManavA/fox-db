@@ -513,6 +513,12 @@ pub fn save_note(w: &Connection, pid: i64, text: &str) -> Result<i64> {
         params![id, crate::inventory::split_ident(&title), format!("~note/{date}"), text],
     )?;
     w.execute("INSERT INTO fts_trigram(rowid, path, name) VALUES (?1,?2,?3)", params![id, format!("~note/{date}"), title])?;
+    let sink = crate::outbox::Sink::open(w);
+    if sink.on(pid) {
+        let path = format!("~note/{date}");
+        sink.put(w, pid, crate::outbox::TBL_NODE, id, &[&crate::inventory::split_ident(&title), "note", &path, text])?;
+        sink.put(w, pid, crate::outbox::TBL_TRI, id, &[&path, &title])?;
+    }
     db::bump_generation(w)?;
     Ok(id)
 }

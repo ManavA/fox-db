@@ -15,6 +15,60 @@ pub struct Config {
     pub codanna: bool,
     #[serde(default)]
     pub hooks: Hooks,
+    #[serde(default)]
+    pub search: Search,
+    /// The vector arm (builds with the `vectors` feature, after `fox vectors setup`). Off unless set.
+    #[serde(default)]
+    pub vectors: bool,
+}
+
+/// Is the vector arm switched on? `FOXDB_VECTORS` (`1` or `0`) overrides the file. It also needs
+/// a build with the `vectors` feature and the model in place.
+pub fn vectors_on() -> bool {
+    match std::env::var("FOXDB_VECTORS").ok().as_deref() {
+        Some("1" | "true") => true,
+        Some("0" | "false") => false,
+        _ => get().vectors,
+    }
+}
+
+/// `[search]` in config.toml: which full-text engine serves a project. `fts5` (the default) never
+/// uses tantivy; `auto` keeps SQLite FTS5 for every project below `tantivy_min_docs` rows and
+/// gives a bigger one a tantivy index (in builds with the `tantivy` feature); `tantivy` gives
+/// every indexed project one. `[search.projects]` overrides it per project name. tantivy is
+/// opt-in because its recall trails FTS5 on the kubernetes eval sets (docs/benchmarks.md).
+#[derive(Debug, Deserialize)]
+#[serde(default)]
+pub struct Search {
+    pub backend: String,
+    pub tantivy_min_docs: i64,
+    pub projects: HashMap<String, String>,
+    /// Indexing memory of the tantivy writer inside `foxd`, in MB (one thread).
+    pub writer_mb: usize,
+}
+
+impl Default for Search {
+    fn default() -> Search {
+        Search { backend: "fts5".into(), tantivy_min_docs: 1_000_000, projects: HashMap::new(), writer_mb: 64 }
+    }
+}
+
+impl Search {
+    /// The backend setting for project `name`: `auto`, `fts5` or `tantivy`. `FOXDB_SEARCH_BACKEND`
+    /// overrides the file's global value (not a per-project one).
+    pub fn backend_for(&self, name: &str) -> String {
+        self.projects.get(name).cloned().unwrap_or_else(|| self.global())
+    }
+
+    /// The global backend setting (`FOXDB_SEARCH_BACKEND`, else the file's).
+    pub fn global(&self) -> String {
+        std::env::var("FOXDB_SEARCH_BACKEND").ok().filter(|v| !v.is_empty()).unwrap_or_else(|| self.backend.clone())
+    }
+
+    /// Could any project use tantivy under these settings?
+    pub fn tantivy_possible(&self) -> bool {
+        self.global() != "fts5" || self.projects.values().any(|b| b != "fts5")
+    }
 }
 
 /// `[hooks]` in config.toml.
@@ -48,5 +102,20 @@ mod tests {
         let c = super::parse("[module_tags]\nMyAppTV = \"tvOS\"\n");
         assert_eq!(c.module_tags.get("MyAppTV").map(String::as_str), Some("tvOS"));
         assert!(super::parse("garbage =").module_tags.is_empty());
+        assert!(!super::parse("").vectors);
+        assert!(super::parse("vectors = true\n").vectors);
+    }
+
+    #[test]
+    fn search_backend_defaults_to_fts5_with_opt_in_overrides() {
+        let c = super::parse("");
+        // tantivy is opt-in: its recall trails FTS5 on the kubernetes eval sets (docs/benchmarks.md).
+        assert_eq!((c.search.backend.as_str(), c.search.tantivy_min_docs), ("fts5", 1_000_000));
+        assert!(!c.search.tantivy_possible() || std::env::var_os("FOXDB_SEARCH_BACKEND").is_some());
+        let c = super::parse("[search]\nbackend = \"auto\"\n");
+        assert_eq!(c.search.backend, "auto");
+        let c = super::parse("[search]\nbackend = \"fts5\"\n[search.projects]\nlinux = \"tantivy\"\n");
+        assert_eq!(c.search.backend_for("linux"), "tantivy");
+        assert!(c.search.tantivy_possible());
     }
 }

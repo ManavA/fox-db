@@ -97,7 +97,7 @@ pub fn human_bytes(b: i64) -> String {
     }
 }
 
-fn ago(ts: i64) -> String {
+pub(crate) fn ago(ts: i64) -> String {
     let d = (crate::db::now() - ts).max(0);
     if d < 90 {
         format!("{d}s ago")
@@ -434,6 +434,17 @@ pub fn status(c: &Connection, cur: Option<&Project>) -> Result<String> {
             idx,
             if r.6 != 0 { " TRUNCATED by an older build's file cap: run fox index to list every file" } else { "" }
         );
+        if let Some(l) = crate::scip::status_line(c, r.0) {
+            let _ = writeln!(s, "{l}");
+        }
+        #[cfg(feature = "tantivy")]
+        if let Some(l) = crate::tantivy_index::status_line(c, r.0) {
+            let _ = writeln!(s, "{l}");
+        }
+        #[cfg(not(feature = "tantivy"))]
+        if crate::outbox::state(c, r.0).is_some() {
+            let _ = writeln!(s, "    search: a tantivy index is configured, but this build has none; FTS5 serves every search");
+        }
     }
     let size = std::fs::metadata(crate::db::db_path()).map(|m| m.len() as i64).unwrap_or(0);
     let _ = writeln!(s, "store: {} ({})", crate::db::db_path().display(), human_bytes(size));

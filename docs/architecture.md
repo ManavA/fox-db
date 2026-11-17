@@ -6,6 +6,40 @@ foxdb is one Rust crate with two binaries: `fox` (CLI, MCP server over stdio, ho
 
 `fox index` walks a project (honouring `.gitignore` and the per-project tiers), stores files, directories, Markdown sections and milestone entries as rows of `node`, parses changed code files with tree-sitter in parallel (or reads Xcode index stores for Swift) and resolves call references by name with scope awareness. Unchanged files are skipped by size, mtime and content hash. Secrets are never read. A project is registered the first time `fox` or the MCP server runs inside it, keyed by its git common dir, so worktrees share one project.
 
+**Change detection on big trees** (`walkcache`). A tree of at least 50,000 files keeps its last
+walk in `$FOXDB_HOME/walk/<project id>`: the directories it entered with their modification
+times (nanoseconds), the files in each with size and mtime, the notes on directories it left out,
+the ignore files it obeyed with their stamps, and the project's file generation (`meta
+files:<id>`, moved in the same transaction as every change to the project's file rows). The next
+run stats every recorded directory and ignore file in parallel; directories whose time moved
+are walked again, with their subtrees, by the same walker restricted to them (so their ignore
+rules are the same), and every other recorded file is stat'ed. Anything it cannot vouch for falls
+back to the full walk: a missing or unreadable record, a changed root, ignore file, git config or
+tier override file, a vanished directory or file, a dirty root, or a directory time within two
+seconds of the record (coarse timestamps). When the record's file generation is the store's, the
+store's file rows are exactly the record's, so only files whose size or mtime moved are looked up,
+and the tree-sitter pass of the same run reads only those files when it is known to have taken
+every earlier change (`meta tsfiles:<id>`); otherwise both read everything as before. Trees
+below the threshold never write a record, and their runs are unchanged.
+
+## Precise tier (SCIP)
+
+`fox scip import` decodes a SCIP index (only the fields it needs: metadata, documents,
+occurrences, roles) and stores, per project, `scip_doc` (path and the file's content hash when
+the text the index embedded is the file's current content, empty otherwise; a document without
+text is empty too unless the import was given `--trust-mtime`, which trusts a file last modified
+before the index file was written), `scip_sym`
+(definitions: SCIP symbol, name, container, path, line, and the previous path when a re-import
+finds the symbol in another file) and `scip_occ` (references: path, line, name, symbol). The
+tables are created by the first import. Resolution (`tsindex::resolve_scoped`, cold, incremental
+or after an import) scores references by name as before, then, for a project with an import,
+replaces the target of every reference at the same path, line and name as a SCIP occurrence
+whose own file and definition file both still match `ts_file.hash`, provided the definition maps
+to exactly one tree-sitter symbol at its name line. Those rows carry `ts_ref.amb = -1` (precise);
+edges follow from the final targets. A changed file fails the hash check, so its references, and
+references into it, fall back to the name resolution on the same save. Projects without an import
+pay one `sqlite_master` lookup per resolution run.
+
 ## Storage
 
 One SQLite file (WAL) is the system of record. The FTS5 tables are contentless
@@ -54,7 +88,8 @@ is the query) x3, a file whose stem is the query x1.5, test paths x0.3, vendored
 code x0.3, and each further hit from a file already shown counts half as much again (a twentieth
 less for questions, whose answer often sits beside a sibling). Keyword, substring and prefix
 retrieval sit behind the `SearchBackend` trait (with `IndexSink`, `VectorBackend` and `Embedder`
-beside it), so a tantivy index or a vector arm can plug in later; see
+beside it): SQLite FTS5 implements it, and so does a big project's tantivy index (see
+[below](#derived-tantivy-index-for-big-projects)); see
 [search-quality.md](search-quality.md) for the seam, the eval and the numbers.
 
 FTS5 never merges segments inside a write (`automerge` and `deletemerge` are off): an index run
@@ -70,6 +105,100 @@ substring arms read only those. There, keyword matches (prefixes included) are w
 frequency inside the project (whole words: name 10, signature 4, path 2, body 1; a prefix-only
 match 1), and substring hits rank names before paths, shortest first. The order can differ from
 the single-project BM25 order; the hits are the same.
+
+## Derived tantivy index for big projects
+
+Builds with the `tantivy` feature can keep a [tantivy](https://github.com/quickwit-oss/tantivy)
+index beside SQLite. It is opt-in (the default `backend` is `fts5`, because tantivy's recall
+trails FTS5's on the kubernetes eval sets): with `backend = "auto"` a project of at least
+`tantivy_min_docs` rows gets one (one million by default; a Linux-sized tree has about 1.3
+million, kubernetes about 270,000), and `backend = "tantivy"` gives one to any project. SQLite stays the only system of record; the index is derived and can
+be thrown away at any time.
+
+1. **One index per project**, at `$FOXDB_HOME/tantivy/<project id>/`. Each full-text row (of
+   `fts_node`, `fts_trigram` and `fts_body`) is one document keyed by node id and table, with the
+   node id as a fast field. It stores no content: hits go back to SQLite for display. Each arm
+   reads its own fields, so no query needs a filter.
+2. **One writer, owned by `foxd`.** The CLI and the MCP server only open readers (about a
+   millisecond); if `foxd` is not running, a project's index stops moving and its searches use
+   FTS5 after its next save.
+3. **Outbox in the same SQLite transaction** (`search_outbox`, `outbox.rs`). Every write to a
+   full-text row of a project with an index also appends `(seq, project, rowid, table, op,
+   text)` in the same transaction, so SQLite's commit is the single point of truth. The tables
+   exist only once a project has an index; for any other project every logging call is a no-op.
+4. **Apply after SQLite commits.** Once a second `foxd` applies a project's logged rows in `seq`
+   order (deletes, then upserts), commits with `prepare_commit().set_payload(last seq)`, and only
+   then deletes the applied rows. Readers reload on the next search.
+5. **Crash recovery on open.** A payload below the log replays from payload + 1 (the rows are
+   still there; rows at or below it are deleted); a payload above SQLite's highest `seq` means
+   SQLite lost a committed transaction, and an index that cannot be opened, has another layout,
+   or has a segment file missing or failing its checksum (`Index::validate_checksum`, read once
+   per open) is deleted: all start a fill, and FTS5 serves meanwhile. A missing or empty
+   directory gets a new index, and a fill unless the log still starts with the fill's reset; `fox
+   index` also asks for the fill when the directory is gone (`foxd` drains only while
+   `$FOXDB_HOME/tantivy` exists).
+   Every call into tantivy runs under `catch_unwind` (release builds unwind): a search that
+   panics falls back to FTS5 and leaves `<project id>.broken`, which stops searches reading that
+   index until `foxd` has opened (and so checked) it again; `fox status` leaves the same mark
+   when it finds a damaged file, and a panic in a tantivy thread makes `foxd` re-open every
+   index.
+6. **Staleness is visible and never served.** A search reads a project's index only when the
+   index has applied the project's whole fill and every logged row (`fox status` shows the lag);
+   otherwise that project falls back to FTS5. A save is therefore never missing from an answer;
+   it is served by FTS5 for the second or so before `foxd` applies it.
+7. **FTS5 is kept in full**, trigram included, so the fallback always works.
+8. **Writer settings:** one thread and `writer_mb` (64) MB inside `foxd`, fills included,
+   `del_docs_ratio_before_merge = 0.3` (each save deletes and re-adds a file's rows), and
+   readers on `ReloadPolicy::Manual`.
+
+A **fill** writes every full-text row of the project to the log once: it is how an index is
+created and rebuilt. `fox index` starts it when a project crosses the threshold (and `fox index
+rebuild` on request): the inventory pass logs a reset and re-stores every file as if changed,
+and the tree-sitter pass reads every file once and logs every symbol's rows without rewriting
+them in SQLite. Symbols, sessions and notes that no pass re-reads are logged from `node` the way
+their importers write them.
+
+Queries mirror the FTS5 ones. Keyword search over names and over body text weights the fields
+10, 4, 2, 1 as `bm25(...)` does; a prefix is expanded through the term dictionary (at most 128
+terms per field) and each match scores the prefix's own IDF, as FTS5 scores a prefix as one term.
+Substring search is a phrase of trigrams over paths and names, which is exactly FTS5's trigram
+semantics. Name prefixes stay on SQLite's name index, which is already a range scan. Hits are
+checked against SQLite (scope, kind, existence) before they are ranked or cut; the global notes
+in a project's scope are searched in FTS5 and interleaved.
+
+## Vector arm (opt-in)
+
+Builds with the `vectors` feature (not in the default build) add a sixth arm for sentences
+(`src/vectors.rs`). It runs only when `vectors = true`, the model is in place and the query has
+five or more words; the routing above never sends it an identifier, a token or a short phrase.
+
+- **Embeddings:** model2vec `potion-code-16M`, a static table of 256-d token vectors. A text's
+  vector is the mean of its WordPiece tokens' rows (times the model's per-token weights),
+  L2-normalized. The tokenizer is a small BERT WordPiece implementation that reads the model's
+  `tokenizer.json` (it matched the reference tokenizer on 2,305 of 2,306 sampled code and text
+  chunks; the one difference is in a non-ASCII text). A query reads only its own tokens' rows
+  from the safetensors file.
+- **What is embedded:** each tree-sitter symbol as its qualified name, path and the body arm's
+  text (comment block above it, then its source, 1,600 characters), and each doc heading and
+  milestone as its title and path. Headings are in because symbols alone pushed a heading that
+  answers a phrase below the code that agrees with the keyword arm.
+- **Store:** one file per project, `$FOXDB_HOME/vectors/p<id>.fv`: a JSON header (model commit,
+  dimensions, row count, a fingerprint of what the rows were built from, a checksum of the body),
+  then per row the node id, a hash of the embedded text, a hash of the file version it came
+  from, a scale and an int8 vector. Search is an exact scan (integer dot products, threads only
+  past 65,536 rows); no approximate index is needed at these sizes.
+- **Freshness:** a separate `p<id>.stamp` names the project generation the file is current for
+  and the file's checksum. The arm reads the index only when the stamp matches the project's
+  present generation and that file, and the file's own checksum holds; otherwise it returns
+  nothing and the other arms answer alone. After each index run (when on), the refresh reads the
+  store in one snapshot: if the fingerprint (tree-sitter file hashes, symbol ids, doc headings)
+  is unchanged, it only rewrites the stamp; otherwise it keeps rows whose node id and file
+  version are unchanged, parses changed files again, reuses any vector whose text hash it has
+  seen, embeds the rest, and writes the file and then the stamp (each atomically).
+- **Fusion:** the arm's ranked ids join the RRF with weight 0.5 (keyword 1.0) after the other
+  arms; re-ranking and damping are unchanged. Its hits are checked against SQLite like any other.
+- **Failure:** any error or panic inside the arm leaves it empty. Nothing in the arm writes to
+  SQLite.
 
 ## Daemon (`foxd`)
 

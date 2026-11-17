@@ -26,8 +26,8 @@ moves (searches walk SQL meanwhile), loaded from the edge table in parallel, wit
 arrays instead of a hash map; no file cap on the tree walk; and receiver calls resolved by
 name among several same-name definitions labelled `guess 1 of N` in `callers`, `refs`,
 `callees` and `impact` (stores indexed before this re-score every reference once, on their
-next index run). Open: a single save on a Linux-sized tree stays over 1 s, most of it the
-file walk that detects changes; a cheaper change detector would be needed.
+next index run). A single save on a Linux-sized tree stayed over 1 s, most of it the file walk
+that detects changes, until milestone 7's walk record.
 
 Milestone 5, search quality, the backend seam, swarms and T3 Code (done): FTS5 merges moved
 out of the write path; snake_case names as whole terms; the body arm (doc comments and bodies)
@@ -36,22 +36,59 @@ a quality gate (vague recall@5 on the kubernetes set 0.11 to 0.43); `fox swarm`;
 and `--for t3`. See [search-quality.md](search-quality.md), [swarm.md](swarm.md)
 and [docs/t3code.md](t3code.md).
 
-Milestone 6, a precise tier from SCIP:
-- Import SCIP indexes (scip-java for Java and Kotlin, rust-analyzer `scip`, scip-python,
-  scip-typescript) produced by your own builds, and upgrade `~` tree-sitter rows to resolved ones.
-  No live language servers.
-- Drift checks that follow a moved symbol by its SCIP id instead of its name.
+Milestone 6, a precise tier from SCIP (done): `fox scip import` reads SCIP indexes your own
+builds produce (scip-java, rust-analyzer `scip`, scip-python, scip-typescript, scip-go) with a
+small built-in protobuf reader (no new dependency) and upgrades matching tree-sitter references,
+and the call edges they carry, to the definitions SCIP names. Freshness is per file by content:
+a document counts only when the index embedded its text and that text is the current file, so a
+file changed since the index was built keeps its tree-sitter answers until the next import, and a
+re-import replaces the previous one. Documents without text (most indexers' default) are opt-in
+with `--trust-mtime`, since a modification time cannot prove what the indexer read. `fox status` shows each SCIP tier and how
+fresh it is; `fox drift` reports a symbol moved to another file by its SCIP id. A store that
+never imports gains no tables and no work. See [usage.md](usage.md#precise-tier-scip).
 
-Scale, each only on its trigger (the `SearchBackend` seam stays clean so a tantivy keyword
-backend or a vector arm can plug in without touching the arms, fusion or ranking):
+Milestone 7, big projects (done): an opt-in tantivy index for a project of about a million rows
+or more (with `[search] backend = "auto"` past `tantivy_min_docs`, or by `[search.projects]` in
+config.toml; off by default because its recall trails FTS5 on the kubernetes eval sets), kept by `foxd` from a change log written in the same SQLite transaction as the
+full-text rows, read only when it has applied every logged change and otherwise replaced by
+FTS5, which stays in full; and a walk record for trees of 50,000 files or more, so a save stats
+the recorded directories and files instead of walking the tree. On Linux, `find` p95 fell from
+about 450 to about 155 ms and a one-file save from 1.8 to 0.67 s; below the thresholds nothing
+changes. See
+[architecture.md](architecture.md#derived-tantivy-index-for-big-projects) and
+[benchmarks.md](benchmarks.md#big-projects-milestone-7). Not done: the `find` p95 trigger is not
+measured automatically (set `backend = "tantivy"` for such a project); tantivy's ranking does
+not yet match FTS5's recall on keyword and vague queries, which is what keeps it opt-in; `fox index check`,
+`repair` and `fox bench search` from the design were left out (`fox status` shows the lag,
+`fox index rebuild` rebuilds).
+
+Milestone 8, an optional vector arm (done, opt-in and not in the default build): the
+`vectors` Cargo feature, `vectors = true` in config.toml, and `fox vectors setup`, which names
+model2vec `potion-code-16M` (MIT, 65 MB, Hugging Face, pinned commit, sha256-checked) before it
+downloads it. Static embeddings computed in Rust over symbol body text and doc headings, one flat
+int8 file per project with an exact scan, refreshed after each index run (changed files only;
+otherwise only a stamp moves), read only when current and intact. Sentences of five or more
+words only, fused after the other arms with weight 0.5. On the retrieval eval, in a store
+holding only the project under test, it lifts vague queries on a private Kotlin app (recall@5
+0.56 to 0.68, MRR 0.38 to 0.48) and slightly on kubernetes (MRR 0.26 to 0.28, recall@5
+unchanged), with no loss on exact, keyword or lexical sets; in one store holding several
+projects, as a real `~/.foxdb` does, that gain is small or none; a warm `find` costs no more, a cold CLI `find` about 50 ms more. See
+[architecture.md](architecture.md#vector-arm-opt-in) and
+[benchmarks.md](benchmarks.md#vector-arm-milestone-8). Not done: the agent-task eval the design
+asked for before vectors ship (fewer turns or more first-try finds on vague tasks), so the arm
+stays opt-in; the gain is measured only in single-project stores and mostly goes away in a
+shared one, whose arm-off baseline is itself lower (a shared-store ranking issue that predates
+milestone 8 and is still open); the kubernetes gain is below the design's 0.08 MRR bar; the cold-CLI cost is mostly
+loading the tokenizer's vocabulary; a code model of higher quality (jina-v2-base-code, Qwen3)
+would need ONNX or a GPU.
+
+Scale, each only on its trigger (the `SearchBackend` seam stays clean so a vector arm can plug
+in without touching the arms, fusion or ranking):
 - One SQLite file per project plus a catalog, when a store holds more than about 5 projects or
   200k files.
-- A tantivy backend, opt-in per project, when a project holds about 1M rows or its `find` p95
-  is over 300 ms on a quiet host: SQLite stays the master copy, a change log in the same
-  transaction is replayed into tantivy, and FTS5 serves whenever tantivy lags.
 - A Postgres team mode, when an index must be shared or written across machines or people.
-- Vectors, only if an eval on our own agent tasks shows a gain: usearch with a code embedding
-  model in native Rust first (sentence queries only, never bare identifiers), Qdrant later.
+- Vectors beyond milestone 8's static arm, only if an eval on our own agent tasks shows a gain:
+  a transformer code model (ONNX) and usearch HNSW past about a million rows; Qdrant later.
 - Not planned: graph databases, Apache AGE, Milvus, Weaviate, Vespa, turbopuffer.
 
 Later, each only if the A/B runs show a gap:
@@ -60,6 +97,5 @@ Later, each only if the A/B runs show a gap:
 - Verified handoffs: check a report's `path:line` evidence against the current index when it is read.
 - Personalized PageRank over the graph and an Aider-style budgeted repo map.
 - Content-hash, worktree-tagged artifacts so new worktrees cost nothing to index.
-- A static-embedding arm (model2vec) for docs, memory and natural-language queries.
+- Notes, memory and session text in the vector arm (it covers symbols and doc headings).
 - Indexed regex over the trigram table with a dirty-file overlay.
-- A tantivy keyword backend behind `SearchBackend`, if FTS5 stays the bottleneck.

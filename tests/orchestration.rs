@@ -262,10 +262,12 @@ fn take_is_exactly_once_under_concurrency_and_expired_leases_are_retaken_once() 
             .collect();
         ts.into_iter().map(|t| t.join().unwrap()).collect()
     };
-    let r = race("a", Some(0));
+    // A 1 s lease: long enough that a busy host can't let it expire mid-race (leases have
+    // whole-second resolution, so a 0 s lease could legitimately lapse between racers).
+    let r = race("a", Some(1));
     assert_eq!(r.iter().filter(|s| s.starts_with("claimed")).count(), 1, "{r:?}");
-    // The lease (0 s) has expired: exactly one of eight retakers wins again.
-    std::thread::sleep(std::time::Duration::from_millis(1100));
+    // The lease has expired: exactly one of eight retakers wins again.
+    std::thread::sleep(std::time::Duration::from_millis(2100));
     let r = race("b", Some(600));
     assert_eq!(r.iter().filter(|s| s.starts_with("claimed")).count(), 1, "{r:?}");
     // A live lease holds against everyone else.

@@ -224,3 +224,66 @@ fn milestone_parser_unit_shape() {
     assert_eq!(s.len(), 2);
     assert_eq!(markdown::parse_milestone(&s[1]).state.as_deref(), Some("BLOCKED"));
 }
+
+/// Milestone 7: a tree that keeps a walk record (forced small here) ends every run with the same
+/// files, sections and symbols as a store that walks in full, through edits in place, new and
+/// removed files, renames, new directories and ignore-file changes.
+#[test]
+fn walk_record_runs_match_full_walk_runs() {
+    use foxdb::{search, tsindex};
+    let _g = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    let repo = tempfile::tempdir().unwrap();
+    let r = repo.path();
+    let homes = [tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap()];
+    let run = |i: usize| -> (Vec<String>, bool) {
+        unsafe {
+            std::env::set_var("FOXDB_HOME", homes[i].path());
+            std::env::set_var("FOXDB_CLAUDE_PROJECTS", homes[i].path().join("no-claude"));
+            std::env::set_var("FOXDB_WALK_MIN_FILES", if i == 0 { "1" } else { "100000000" });
+        }
+        let mut c = db::open_rw().unwrap();
+        let p = project::ensure(&c, &project::locate(r)).unwrap();
+        let st = inventory::index_project(&mut c, &p).unwrap();
+        let quick = st.delta.is_some();
+        tsindex::index_project_with(&mut c, &p, st.delta.as_ref()).unwrap();
+        let mut q = c
+            .prepare("SELECT kind || ' ' || COALESCE(path, '') || ' ' || name || ' ' || COALESCE(size, -1) FROM node WHERE project_id = ?1 AND kind != 'artifact_dir' ORDER BY 1")
+            .unwrap();
+        let mut rows: Vec<String> = q.query_map([p.id], |x| x.get(0)).unwrap().flatten().collect();
+        let o = query::FindOpts { kind: "any", all: false, budget: usize::MAX, limit: 5, offset: 0 };
+        rows.extend(search::hits(&c, Some(&p), "freshSymbol", &o, 5).unwrap().into_iter().map(|h| format!("hit {}", h.name)));
+        unsafe { std::env::remove_var("FOXDB_WALK_MIN_FILES") };
+        (rows, quick)
+    };
+    // `quick`: the recorded store must have skipped reading every file row.
+    let both = |label: &str, quick: bool| {
+        let ((a, qa), (b, qb)) = (run(0), run(1));
+        assert_eq!(a, b, "{label}");
+        assert!(!qb, "{label}: a small tree never uses a record");
+        assert_eq!(qa, quick, "{label}");
+    };
+    write(r, ".gitignore", "*.o\n");
+    for i in 0..30 {
+        write(r, &format!("src/m{}/f{i}.rs", i % 4), &format!("pub fn f{i}() {{}}\n"));
+    }
+    write(r, "docs/guide.md", "# Guide\n\n## Start\n\ntext\n");
+    both("first run", false);
+    assert!(homes[0].path().join("walk").read_dir().unwrap().next().is_some(), "the record is written");
+    // Directory times must be older than the record's two-second window to be trusted.
+    std::thread::sleep(std::time::Duration::from_millis(2100));
+    both("no change (record too fresh to trust)", false);
+    both("no change", true);
+    write(r, "src/m1/f1.rs", "pub fn freshSymbol() {}\n");
+    both("a file edited in place", true);
+    write(r, "src/m2/new.rs", "pub fn added() {}\n");
+    fs::rename(r.join("src/m3/f3.rs"), r.join("src/m3/moved.rs")).unwrap();
+    fs::remove_file(r.join("src/m0/f0.rs")).unwrap();
+    write(r, "src/m0/sub/deep.rs", "pub fn deep() {}\n");
+    write(r, "src/m0/sub/skip.o", "x");
+    both("added, renamed, removed, a new directory", true);
+    std::thread::sleep(std::time::Duration::from_millis(2100));
+    write(r, "src/m2/.gitignore", "f6.rs\n");
+    both("a new ignore file", true);
+    write(r, "docs/guide.md", "# Guide\n\n## Start\n\ntext\n\n## More\n\nmore text\n");
+    both("a markdown file edited", true);
+}

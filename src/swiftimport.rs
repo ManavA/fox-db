@@ -334,6 +334,7 @@ pub fn apply(c: &mut Connection, p: &Project, stores: &[StoreData], reached: &Ha
         }
     }
     // Upsert definition nodes.
+    let sink = crate::outbox::Sink::open(&tx);
     let usr_name: HashMap<String, (String, i32)> = defs.iter().map(|(u, d)| (u.clone(), (d.name.clone(), d.kind))).collect();
     for d in defs.values() {
         let parent_name = d.parent.as_ref().and_then(|u| usr_name.get(u).map(|x| x.0.clone()));
@@ -348,6 +349,9 @@ pub fn apply(c: &mut Connection, p: &Project, stores: &[StoreData], reached: &Ha
             params![p.id, key, d.name, d.path, d.line, d.sig, meta, db::now()],
             |r| r.get(0),
         )?;
+        for t in [crate::outbox::TBL_NODE, crate::outbox::TBL_TRI, crate::outbox::TBL_BODY] {
+            sink.del(&tx, p.id, t, id)?;
+        }
         tx.execute("DELETE FROM fts_node WHERE rowid = ?1", [id])?;
         tx.execute("DELETE FROM fts_trigram WHERE rowid = ?1", [id])?;
         tx.execute("DELETE FROM fts_body WHERE rowid = ?1", [id])?;
@@ -365,6 +369,12 @@ pub fn apply(c: &mut Connection, p: &Project, stores: &[StoreData], reached: &Ha
             params![id, split_ident(&d.name), d.sig, d.path],
         )?;
         tx.execute("INSERT INTO fts_trigram(rowid, path, name) VALUES (?1,?2,?3)", params![id, d.path, ident])?;
+        if sink.on(p.id) {
+            let split = split_ident(&d.name);
+            sink.put(&tx, p.id, crate::outbox::TBL_NODE, id, &[&split, &d.sig, &d.path, ""])?;
+            sink.put(&tx, p.id, crate::outbox::TBL_BODY, id, &[&split, &d.sig, &d.path, ""])?;
+            sink.put(&tx, p.id, crate::outbox::TBL_TRI, id, &[&d.path, &ident])?;
+        }
         ctx.ids.insert(d.usr.clone(), id);
     }
     st.symbols = defs.len() as i64;
@@ -458,6 +468,10 @@ fn prune_and_edges(tx: &Transaction, p: &Project, st: &mut ImportStats) -> Resul
         dead_syms.extend(q.query_map([p.id], |r| r.get::<_, i64>(0))?.flatten());
     }
     for id in &dead_syms {
+        let sink = crate::outbox::Sink::open(tx);
+        for t in [crate::outbox::TBL_NODE, crate::outbox::TBL_TRI, crate::outbox::TBL_BODY] {
+            sink.del(tx, p.id, t, *id)?;
+        }
         tx.execute("DELETE FROM fts_node WHERE rowid = ?1", [id])?;
         tx.execute("DELETE FROM fts_trigram WHERE rowid = ?1", [id])?;
         tx.execute("DELETE FROM fts_body WHERE rowid = ?1", [id])?;

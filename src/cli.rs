@@ -16,12 +16,15 @@ pub const USAGE: &str = "usage:
   fox status
   fox stats
   fox index [PATH] [--quiet] [--no-global]      fox index optimize   (merge the full-text tables now)
+  fox index rebuild [PATH] [--backend tantivy|fts5]   build (or drop) a big project's tantivy index
   fox eval retrieval --set bench/eval/SET.json [--repo DIR] [--limit K] [--json] [--gate BASELINE.json]
   fox mem brief [--budget TOKENS] [--harness claude|codex]
   fox mem post <text> [--kind finding|claim|request|decision|report] [--title T] [--evidence E]
   fox mem read [query] [--kind K]          fox mem pickup h:ID [--by NAME]
   fox drift [doc.md]                       cited symbols/paths changed, moved or vanished since the doc's last commit
   fox pack <doc.md> [--budget TOKENS]      the doc plus skeletons of the code it cites (for a fresh reviewer)
+  fox scip import <index.scip> [--project P] [--trust-mtime]   precise tier from a SCIP index your own build produced
+  fox vectors setup [--yes] | build [--project P] | status   the opt-in vector arm (builds with --features vectors)
   fox ingest sessions [--since-days N] [--claude DIR] [--codex DIR]   (read-only transcript digests)
   fox hook session-start|subagent-start|subagent-stop|pre-compact [--harness claude|codex]   (hook JSON on stdin)
 multi-agent:
@@ -101,13 +104,14 @@ pub fn parse(argv: Vec<String>) -> Result<Args, String> {
             "--no-codanna" => a.no_codanna = true,
             "--fallback" => a.fallback = true,
             "--fresh" => a.fresh = true,
-            "--tree" | "--any" | "--writer" | "--reviewer" | "--inline" | "--exec" | "--agents" | "--json" | "--no-wait" => {
+            "--tree" | "--any" | "--writer" | "--reviewer" | "--inline" | "--exec" | "--agents" | "--json" | "--no-wait"
+            | "--trust-mtime" | "--yes" => {
                 a.flags.insert(x.trim_start_matches('-').to_string());
             }
             "--title" | "--evidence" | "--by" | "--since-days" | "--claude" | "--codex" | "--goal" | "--state" | "--next"
             | "--question" | "--parent" | "--transcript" | "--agent" | "--for" | "--lease" | "--to" | "--from" | "--session" | "--task"
             | "--repo" | "--label" | "--model" | "--packet" | "--timeout" | "--since" | "--topic" | "--id" | "--role" | "--pid"
-            | "--status" | "--report" | "--handoff" | "--set" | "--gate" => {
+            | "--status" | "--report" | "--handoff" | "--set" | "--gate" | "--project" | "--backend" => {
                 let k = x.trim_start_matches('-').to_string();
                 let v = val(&x)?;
                 a.opt.insert(k, v);
@@ -421,6 +425,99 @@ pub fn docref(a: &Args, cwd: &Path) -> anyhow::Result<String> {
         ("pack", Some(d)) => crate::docref::pack(&c, &p, &d, a.budget.unwrap_or(4000)),
         _ => anyhow::bail!("{USAGE}"),
     }
+}
+
+/// `fox vectors setup [--yes] | build [--project P] | status`: the opt-in vector arm.
+pub fn vectors(a: &Args, cwd: &Path) -> anyhow::Result<String> {
+    #[cfg(not(feature = "vectors"))]
+    {
+        let _ = (a, cwd);
+        anyhow::bail!("this build has no vector arm (build with --features vectors)")
+    }
+    #[cfg(feature = "vectors")]
+    match a.pos.get(1).map(String::as_str) {
+        Some("setup") => {
+            use std::io::{BufRead, IsTerminal, Write};
+            let plan = crate::vectors::setup_plan();
+            if !a.flags.contains("yes") {
+                if !std::io::stdin().is_terminal() {
+                    anyhow::bail!("{plan}nothing downloaded: run `fox vectors setup --yes` to fetch it");
+                }
+                print!("{plan}download it? [y/N] ");
+                std::io::stdout().flush()?;
+                let mut line = String::new();
+                std::io::stdin().lock().read_line(&mut line)?;
+                if !matches!(line.trim(), "y" | "Y" | "yes") {
+                    return Ok("nothing downloaded".into());
+                }
+            } else {
+                print!("{plan}");
+            }
+            let log = crate::vectors::setup()?;
+            Ok(format!(
+                "{log}
+set `vectors = true` in {} and run `fox vectors build` in a project",
+                db::home().join("config.toml").display()
+            ))
+        }
+        Some("build") => {
+            if !crate::vectors::model_present() {
+                anyhow::bail!("no model yet: run `fox vectors setup` first");
+            }
+            let c = db::open_rw()?;
+            let p = match a.opt.get("project") {
+                Some(name) => project::by_name(&c, name)?.ok_or_else(|| anyhow::anyhow!("no project named {name}; see fox status"))?,
+                None => project::find(&c, &project::locate(cwd))?
+                    .ok_or_else(|| anyhow::anyhow!("project not indexed; run `fox index` first"))?,
+            };
+            let s = crate::vectors::refresh(&c, &p, true)?;
+            let mut out = if s.current {
+                format!("{}: vector index already current ({} rows)", p.name, s.rows)
+            } else {
+                format!(
+                    "{}: vector index of {} rows ({} files parsed, {} texts embedded) in {} ms",
+                    p.name, s.rows, s.parsed, s.embedded, s.ms
+                )
+            };
+            if !crate::config::vectors_on() {
+                out += "
+the arm is off: set `vectors = true` in config.toml to use it";
+            }
+            Ok(out)
+        }
+        Some("status") => match db::open_ro() {
+            Some(c) => crate::vectors::status(&c),
+            None => Ok("no store yet".into()),
+        },
+        _ => anyhow::bail!("usage: fox vectors setup [--yes] | build [--project P] | status"),
+    }
+}
+
+/// `fox scip import <index.scip> [--project P] [--trust-mtime]`: the precise tier (see [`crate::scip`]).
+pub fn scip(a: &Args, cwd: &Path) -> anyhow::Result<String> {
+    let (Some("import"), Some(file)) = (a.pos.get(1).map(String::as_str), a.pos.get(2)) else {
+        anyhow::bail!("usage: fox scip import <index.scip> [--project P] [--trust-mtime]")
+    };
+    let mut c = db::open_rw()?;
+    let p = match a.opt.get("project") {
+        Some(name) => project::by_name(&c, name)?.ok_or_else(|| anyhow::anyhow!("no project named {name}; see fox status"))?,
+        None => project::find(&c, &project::locate(cwd))?.ok_or_else(|| anyhow::anyhow!("project not indexed; run `fox index` first"))?,
+    };
+    let s = crate::scip::import(&mut c, &p, &cwd.join(file), a.flags.contains("trust-mtime"))?;
+    let mut out = format!(
+        "{}: scip import of {} documents ({} fresh, {} changed since the index was built, {} without text, {} outside the project), {} definitions, {} references; {} tree-sitter references now precise ({} of them were guesses, unresolved or elsewhere) in {} ms",
+        p.name, s.documents, s.fresh, s.stale, s.unverified, s.outside, s.definitions, s.references, s.precise, s.upgraded, s.ms
+    );
+    if s.stale > 0 {
+        out.push_str("\nchanged files keep their tree-sitter answers; rebuild the index and import it again to cover them");
+    }
+    if s.unverified > 0 {
+        out.push_str(&format!(
+            "\n{} documents carry no text, so nothing proves the index read the files as they are now; they keep their tree-sitter answers. Rebuild with an indexer option that embeds document text, or pass --trust-mtime to trust files not modified after the index file (wrong answers if a file changed while the index was being built, or the index file was copied or touched later)",
+            s.unverified
+        ));
+    }
+    Ok(out)
 }
 
 /// `fox ingest sessions`.

@@ -331,6 +331,7 @@ pub fn ingest_since(c: &mut Connection, claude: Option<&Path>, codex: Option<&Pa
     }
     let mut project_of: HashMap<String, i64> = HashMap::new();
     let tx = c.transaction()?;
+    let sink = crate::outbox::Sink::open(&tx);
     for (harness, path) in files {
         st.files += 1;
         let Ok(md) = std::fs::metadata(&path) else { continue };
@@ -351,6 +352,10 @@ pub fn ingest_since(c: &mut Connection, claude: Option<&Path>, codex: Option<&Pa
         }
         let d = if harness == "claude" { digest_claude(&path) } else { digest_codex(&path) };
         if let Some((id, _, _)) = prev {
+            if let Ok(old_pid) = tx.query_row("SELECT project_id FROM node WHERE id = ?1", [id], |r| r.get::<_, i64>(0)) {
+                sink.del(&tx, old_pid, crate::outbox::TBL_NODE, id)?;
+                sink.del(&tx, old_pid, crate::outbox::TBL_TRI, id)?;
+            }
             tx.execute("DELETE FROM fts_node WHERE rowid = ?1", [id])?;
             tx.execute("DELETE FROM fts_trigram WHERE rowid = ?1", [id])?;
             tx.execute("DELETE FROM node WHERE id = ?1", [id])?;
@@ -383,6 +388,8 @@ pub fn ingest_since(c: &mut Connection, claude: Option<&Path>, codex: Option<&Pa
             params![id, title, d.harness, shown, body],
         )?;
         tx.execute("INSERT INTO fts_trigram(rowid, path, name) VALUES (?1,?2,?3)", params![id, shown, title])?;
+        sink.put(&tx, pid, crate::outbox::TBL_NODE, id, &[&title, d.harness, &shown, &body])?;
+        sink.put(&tx, pid, crate::outbox::TBL_TRI, id, &[&shown, &title])?;
         st.sessions += 1;
     }
     if st.sessions > 0 {

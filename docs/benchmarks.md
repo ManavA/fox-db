@@ -7,7 +7,7 @@ Read these numbers with their conditions. Every run below was taken on a shared 
 | Target | Status |
 |---|---|
 | `find` on one mid-sized project | Measured in milestone 1: p95 47 ms cold CLI, 9.2 ms via `foxd` (busy host, load 7-11); see below. Milestone 5's body arm made `find` about 1.4x slower (kubernetes p95 216 to 299 ms, [search quality](#search-quality-milestone-5)), so the milestone 1 figure is out of date |
-| A single save re-indexed in about 1 s on a large tree | Met on kubernetes (about 1.0 s median); **open** on a Linux-sized tree, where a single save takes about 1.5-2 s, most of it the file walk that detects changes |
+| A single save re-indexed in about 1 s on a large tree | Met: kubernetes about 0.9 s median; Linux 0.67 s median since milestone 7's walk record (1.8 s before), see [big projects](#big-projects-milestone-7) |
 | Shared-store `find` p95 under 150 ms (kubernetes beside linux) | **Open, likely missed.** Measured 153 ms p95 on a busy host (load 11-24) before the milestone 4 follow-up fixes and milestone 5; since milestone 5 single-project kubernetes `find` alone is p95 299 ms (busy host, load about 10), above this target. Not re-measured on a quiet host |
 | Retrieval quality never regresses | Gated by `fox eval retrieval --gate` on checked-in sets |
 
@@ -85,6 +85,177 @@ The "after" latencies were measured before the follow-up fixes (scope checked pe
 ## Search quality (milestone 5)
 
 Recall@5 and MRR on checked-in query sets over kubernetes, before and after the body arm and routing, with the cost in store size and latency: see [search-quality.md](search-quality.md#results). Vague recall@5 went from 0.11 to 0.43; `find` p50 rose from 92 to 142 ms on a host at load about 10.
+
+## Precise tier (milestone 6): no cost without an import
+
+Old (v0.1.0, `a59d4f3`) against new, same host, back to back, alternating order, host load about
+10-14 on 32 cores. Without a SCIP import the store schema is identical (the SCIP tables are only
+created by the first import) and every `find`, `code` and `drift` answer compared was
+byte-identical.
+
+| Repo | Measure | Old | New |
+|---|---|---|---|
+| foxdb (this repo) | cold index, median | 1.07 s | 1.09 s |
+| foxdb | one-file save, median | 0.076 s | 0.070 s |
+| foxdb | `find`/`code` p50 / p95 (CLI, 10 queries x 15) | 21.9 / 29.9 ms | 22.1 / 32.0 ms |
+| foxdb | store | 3,497,984 B | 3,497,984 B |
+| private Kotlin project (2,214 files) | cold index, median | 6.88 s | 7.01 s |
+| private Kotlin project | one-file save, median | 0.196 s | 0.184 s |
+| private Kotlin project | `find`/`code` p50 / p95 (9 queries x 15) | 36.4 / 52.6 ms | 36.3 / 53.5 ms |
+| private Kotlin project | store | 80.60 MB | 80.58 MB |
+
+The cold-index gap is noise: `FOXDB_TRACE` phase times (parse, store, resolve, optimize) match
+run for run. The fixture eval and both kubernetes sets give identical scores and pass their
+gates (kubernetes retrieval: exact 1.00, keyword 1.00, vague 0.43 recall@5). `fox` grows by
+75 KB (45.83 to 45.90 MB) and `foxd` by 128 bytes; the SCIP reader is built in and needs no
+new dependency.
+
+## Big projects (milestone 7)
+
+`bench/results/m7-big-projects.json`. Old is `5b735b0` (milestone 6), new is the milestone 7
+default build (tantivy feature on). Same host, back to back, alternating order where a measure
+repeats; 32 cores, data on tmpfs, a shared host at load 8-13 throughout, so treat latencies as
+plus or minus 30%.
+
+**Linux** (shallow clone, 97,132 files, 1.2M tree-sitter symbols: about 1.3M rows, past the
+1M trigger, so it gets a tantivy index):
+
+| Measure | Old (FTS5) | New (tantivy) |
+|---|---|---|
+| `find` p50 / p95, cold CLI, the 15 linux-lexical queries x 5, two runs | 69.5 / 442 and 76.2 / 451 ms | 52.1 / 166 and 52.6 / 145 ms |
+| linux-lexical recall@5 / MRR, all 15 | 0.733 / 0.671 | 0.867 / 0.792 |
+| one-file save, median of 7 | 1.80 s | 0.67 s |
+| no-change save, median of 7 | 1.71 s | 0.35 s |
+| SQLite store / of it free pages | 2.92 GB / 0.20 GB | 4.28 GB / 1.52 GB |
+| tantivy index | | 0.47-0.56 GB (by segment count) |
+| a save visible to tantivy after `fox index` returns | | 0.3-0.6 s (FTS5 serves meanwhile) |
+
+Recall@5 did not drop for any query type (symbol, keyword, phrase, prefix, substring, regex);
+one keyword query (`dock station present`) moved from rank 1 to 3, so keyword MRR is 0.78 against
+1.00. The free pages are the fill's change log, applied and deleted; SQLite reuses them (`VACUUM`
+returns them). A fill took 2.4 minutes in `fox index` and under 2 in `foxd`, whose memory peaked at
+1.6 GB while it built and merged the index (four writer threads, since cut to one: see below) and settled at about 100 MB
+(11 MB idle after a restart, 44 MB after searches).
+
+**Below the trigger nothing changes.** Kubernetes (31,915 files, 272,618 rows: below both the
+1M-row tantivy trigger and the 50,000-file walk record) and this repository, old against new:
+
+| Repo | Measure | Old | New |
+|---|---|---|---|
+| kubernetes | `find` p50 / p95 (lexical set, 17 queries x 3) | 53.5 / 131.3 ms | 53.0 / 135.4 ms |
+| kubernetes | cold index | 81.9 s | 83.7 s |
+| kubernetes | one-file save, median of 10 | 0.89 s | 0.95 s |
+| kubernetes | store | 728,014,848 B | 728,018,944 B |
+| foxdb | `find`/`code` p50 / p95 (21 queries x 15) | 22.2 / 30.0 ms | 22.2 / 29.3 ms |
+| foxdb | cold index, median of 3 | 1.04 s | 1.08 s |
+| foxdb | one-file save, median of 5 | 0.070 s | 0.064 s |
+| foxdb | store | 3,694,592 B | 3,690,496 B |
+
+Every `find` and `code` answer compared was byte-identical (17 on kubernetes, 21 on foxdb, 28 on
+a private 2,214-file Kotlin project, whose numbers match the same way), the store schema and the
+files under `FOXDB_HOME` were identical, and the kubernetes retrieval and lexical eval reports
+were identical (the retrieval gate passes). Store sizes differ by one 4 KB page either way. A
+`foxd` on these stores had the same threads (2 idle, 34 after 20 searches), the same memory
+(within 1 MB) and created no new files.
+
+The kubernetes one-file save is within the stated noise (old 0.892 s, new 0.949 s in the
+results file; an earlier version of this table had the two swapped).
+
+**Why tantivy is opt-in.** A review forced `backend = "tantivy"` on the same kubernetes store
+(272,618 rows, below the trigger) and compared it with FTS5 on the committed eval sets:
+kubernetes-lexical recall@5 / MRR 0.80 / 0.666 against 1.00 / 0.883 (keyword 0.667 against 1.0,
+regex 0.5 against 1.0, symbol 0.75 against 1.0), and kubernetes-retrieval 0.313 against 0.667
+(keyword 0.5 against 1.0, vague 0.0 against 0.429: fourteen vague queries FTS5 answers at ranks
+1-22 found nothing in the top 5). The Linux lexical set has no vague and only three keyword
+queries, so it did not show this. Recall must not drop, so the default `backend` is now `fts5`
+and `auto` (the trigger) or `tantivy` is opt-in. The fill also now writes with one thread and
+`writer_mb` MB inside `foxd` (the design's budget) instead of four threads; the 1.6 GB peak above
+was with four, and the one-thread fill time and peak have not been measured again.
+
+**Binaries and build.** `fox` grows from 45.90 MB to 46.05 MB without tantivy and to 48.02 MB
+with it; `foxd` from 43.76 to 43.78 and 46.91 MB. A clean release build of both took 317 s
+without tantivy (80 crates) and 349 s with it (164 crates). Tantivy is in the default build,
+since it costs nothing at run time below the trigger; `--no-default-features` leaves it out.
+Release builds now unwind on panic instead of aborting (so a panic in tantivy falls back to
+FTS5): `fox` is 49.29 MB and `foxd` 47.47 MB in the default build (48.54 and 46.93 MB with
+abort), 46.50 and 43.92 MB without tantivy. On this repository old (abort) against new, back to
+back at host load 16-23: the same `find` answers byte for byte (8 queries), `find` 28 against
+25-26 ms, the same files under `FOXDB_HOME` and store sizes within one 4 KB page.
+
+## Vector arm (milestone 8)
+
+`bench/results/m8-vector-arm.json`. Old is `0b0ab9d` (milestone 7). Same host, back to back,
+alternating order; 32 cores, data on tmpfs, a shared host at load 8-13 throughout, so treat
+latencies as plus or minus 30%.
+
+**Off, nothing changes.** Old against the new default build, and against a build with the
+`vectors` feature but without `vectors = true` (fresh homes for each build):
+
+| Repo | Measure | Old | New default | New `vectors` build, arm off |
+|---|---|---|---|---|
+| foxdb | `find`/`code` p50 / p95 (21 queries x 5) | 21.6 / 29.8 ms | 22.2 / 30.8 ms | 22.7 / 31.5 ms (old 21.7 / 31.3) |
+| foxdb | cold index, median of 3 | 1.06 s | 1.12 s | 1.06 s (old 1.01) |
+| foxdb | one-file save, median of 5 | 0.071 s | 0.069 s | 0.066 s (old 0.071) |
+| private Kotlin project (2,214 files) | `find`/`code` p50 / p95 | 28.6 / 51.0 ms | 29.3 / 51.2 ms | 28.3 / 53.7 ms (old 29.0 / 53.6) |
+| private Kotlin project | cold index, median of 3 | 6.63 s | 6.69 s | 6.63 s (old 6.52) |
+| private Kotlin project | one-file save, median of 5 | 0.26 s | 0.25 s | 0.23 s (old 0.26) |
+| kubernetes | `find` p50 / p95 (retrieval set, 48 x 3, two runs) | 161.7 / 287.1, 157.3 / 270.7 ms | | 161.2 / 274.1, 158.9 / 268.2 ms |
+| kubernetes | cold index | 82.1 s | | 83.6 s |
+| kubernetes | one-file save, median of 5 | 0.99 s | | 1.00 s |
+
+Every answer compared was byte-identical (21 on foxdb, 28 on the Kotlin project, 48 on
+kubernetes), and so were the store schemas and the files under `FOXDB_HOME`; store sizes are
+equal or within a page (kubernetes ten pages, 0.006%). A `foxd` on the Kotlin store had the same
+threads and memory (46 MB). The eval gates pass unchanged.
+
+**Binaries.** The default build is unchanged (`fox` 49.28 MB, `foxd` 47.47 MB; the feature is
+not compiled in). With `--features vectors`, `fox` is 51.64 MB (+2.4 MB) and `foxd` 47.73 MB
+(+0.3 MB), from 27 more crates (`ureq` with rustls for `fox vectors setup`, `sha2`,
+`unicode-normalization`). It stays out of the default build and the release tarball: the arm is
+opt-in and its gain is uneven (below).
+
+**On.** `potion-code-16M`, weight 0.5, sentences of five words or more:
+
+| Set | Type | Off: recall@5 / hit@10 / MRR | On |
+|---|---|---|---|
+| kubernetes-retrieval | vague (28) | 0.43 / 0.43 / 0.26 | 0.43 / 0.46 / 0.28 |
+| kubernetes-retrieval | keyword (10) | 1.00 / 1.00 / 0.61 | 1.00 / 1.00 / 0.67 |
+| kubernetes-retrieval | exact (10) | 1.00 / 1.00 / 1.00 | unchanged |
+| kubernetes-lexical | all (15) | 1.00 / 1.00 / 0.88 | unchanged (two to four words: the arm never runs) |
+| private Kotlin project | vague (25) | 0.56 / 0.72 / 0.38 | 0.68 / 0.76 / 0.48 |
+| private Kotlin project | keyword (5), exact (6) | 1.00 / 1.00 / 0.61, 1.00 | unchanged |
+
+On kubernetes ten queries rose and five fell (one from rank 1 to 7); on the Kotlin project
+fifteen rose and two fell. The gate in the design (vague MRR up by 0.08, exact recall@5 still
+1.00) is met on the Kotlin project and not on kubernetes. Before the five-word rule, the arm
+moved a heading that answers the phrase `version skew policy` from first to second on the
+lexical set (and to eleventh before headings were embedded).
+
+**Only in a store holding one project.** Every number in the table above came from a fresh
+`FOXDB_HOME` holding just the project under test. A review re-run reproduced them exactly in such
+homes, then measured one store holding foxdb, kubernetes and the Kotlin project together, as a
+real `~/.foxdb` does. There the gain mostly goes away: kubernetes vague MRR 0.278 off against
+0.277 on (only hit@10 rose, 0.43 to 0.46, and one query fell from rank 1 to 2), and the Kotlin
+project's vague recall@5 stayed at 0.24 (MRR 0.13 to 0.15). The arm-off baseline itself is lower
+in the shared store (the Kotlin project's vague recall@5 0.56 to 0.24, keyword 1.00 to 0.40, also
+with `FOXDB_VECTORS=0` and so not caused by milestone 8). So the vague-set gain above holds for a
+store with one project; in a shared store it is small or none. This is a further reason the arm
+stays opt-in and out of the default build.
+
+| Cost | kubernetes (240,674 rows) | Kotlin project (30,131 rows) |
+|---|---|---|
+| first `fox vectors build` | 9.0-9.6 s | 1.1 s |
+| index file | 68 MB | 8.6 MB |
+| one-file save with the arm on (off) | 2.0 s (0.97 s) | |
+| save that changed nothing, on (off) | 1.18 s (0.83 s) | |
+| cold CLI `find` p50 / p95, on (off), two runs | 231 / 330, 219 / 302 (178 / 286, 172 / 283) ms | 101 / 130, 105 / 129 (44 / 62, 49 / 73) ms |
+| warm `find` through `foxd` p50 / p95, on (off) | | 35.5 / 53.6 (34.1 / 56.4) ms |
+| `foxd` memory, on (off) | 142 MB (53 MB) | 53 MB (27 MB) |
+
+A cold CLI process pays about 50 ms to read the tokenizer's vocabulary, the needed model rows
+and the project's index; `foxd` and `fox mcp` pay it once. A save with the arm on re-reads the
+store's symbol list and rewrites the index file; a save that changes nothing the index covers
+rewrites only its stamp.
 
 ## Orchestration (milestones 2 and 3)
 

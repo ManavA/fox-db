@@ -112,6 +112,16 @@ fn resolve_symbol(c: &Connection, pid: i64, cite: &str) -> Option<Resolved> {
     Some(Resolved { path: pick.0.clone(), line: pick.1, end: pick.2.max(pick.1), name: s.to_string() })
 }
 
+/// The cited symbol's definition in a fresh SCIP import, when the project has one: the same
+/// name and container, preferring non-test paths.
+fn scip_symbol(c: &Connection, pid: i64, cite: &str) -> Option<crate::scip::Def> {
+    let s = cite.strip_suffix("()").unwrap_or(cite);
+    let segs: Vec<&str> = s.split("::").flat_map(|p| p.split('.')).collect();
+    let name = *segs.last()?;
+    let parent = (segs.len() > 1).then(|| segs[segs.len() - 2]);
+    crate::scip::defs_named(c, pid, name, parent).into_iter().min_by_key(|d| (crate::search::is_test_path(&d.path), d.path.clone(), d.line))
+}
+
 fn file_known(c: &Connection, p: &Project, rel: &str) -> bool {
     c.query_row("SELECT 1 FROM node WHERE project_id = ?1 AND path = ?2 AND kind = 'file'", params![p.id, rel], |_| Ok(())).is_ok()
         || p.root.join(rel).is_file()
@@ -125,6 +135,8 @@ fn git(root: &Path, args: &[&str]) -> Option<String> {
 #[derive(Default)]
 struct Changes {
     base: Option<String>,
+    /// Commit time of `base` (unix seconds).
+    base_time: i64,
     /// New-side line ranges touched per current path.
     hunks: HashMap<String, Vec<(i64, i64)>>,
     renamed: HashMap<String, String>,
@@ -133,9 +145,12 @@ struct Changes {
 
 fn changes_since_doc(root: &Path, doc: &str) -> Changes {
     let mut ch = Changes::default();
-    let Some(base) = git(root, &["log", "-1", "--format=%H", "--", doc]).map(|s| s.trim().to_string()).filter(|s| !s.is_empty()) else {
+    let Some(head) = git(root, &["log", "-1", "--format=%H %ct", "--", doc]).filter(|s| !s.trim().is_empty()) else {
         return ch;
     };
+    let mut it = head.split_whitespace();
+    let base = it.next().unwrap_or_default().to_string();
+    ch.base_time = it.next().and_then(|t| t.parse().ok()).unwrap_or(0);
     if let Some(ns) = git(root, &["diff", "--name-status", "-M", &base]) {
         for l in ns.lines() {
             let f: Vec<&str> = l.split('\t').collect();
@@ -202,6 +217,22 @@ pub fn drift(c: &Connection, p: &Project, doc: &str) -> Result<String> {
             } else {
                 n_gone += 1;
                 Some(format!("  vanished `{}`{}", ci.text, if ch.deleted.contains(rel) { " (deleted)" } else { "" }))
+            }
+        } else if let Some(d) = scip_symbol(c, p.id, &ci.text) {
+            // Followed by its SCIP id: a move to another file is reported as a move, not an edit.
+            let renamed = ch.renamed.values().any(|n| *n == d.path);
+            let moved_after = d.prev_path.as_ref().filter(|_| d.moved_at.is_some_and(|t| t > ch.base_time) && ch.base.is_some());
+            if renamed || moved_after.is_some() {
+                n_moved += 1;
+                let from = moved_after.map(|f| format!(" from {f}")).unwrap_or_default();
+                Some(format!("  moved    `{}` -> {}:{}{from} (SCIP {})", ci.text, d.path, d.line, d.symbol))
+            } else {
+                let touched = ch.hunks.get(&d.path).is_some_and(|hs| hs.iter().any(|&(a, b)| a <= d.end && b >= d.line));
+                touched.then(|| {
+                    n_changed += 1;
+                    let name = ci.text.strip_suffix("()").unwrap_or(&ci.text);
+                    format!("  changed  `{}` -> {}:{} ({name} edited since the doc)", ci.text, d.path, d.line)
+                })
             }
         } else {
             match resolve_symbol(c, p.id, &ci.text) {

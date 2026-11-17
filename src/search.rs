@@ -6,8 +6,11 @@
 //! (the CSR graph only replaces the SQL walk), so both return the same answer. Re-ranking boosts the definition of the
 //! queried name, demotes tests, vendored and generated code, and damps repeat hits from one file.
 //!
-//! The keyword and substring arms sit behind [`SearchBackend`], so another engine (tantivy) can be
-//! dropped in later if measurements ever demand it. Today FTS5 is the only implementation.
+//! Builds with the `vectors` feature can add an opt-in vector arm for sentences (`vectors`).
+//!
+//! The keyword and substring arms sit behind [`SearchBackend`]. SQLite FTS5 serves them; in
+//! builds with the `tantivy` feature a project big enough to get a tantivy index (see
+//! `tantivy_index`) is served by that index whenever it is current, and by FTS5 otherwise.
 
 use crate::graph::Graph;
 use crate::project::Project;
@@ -132,13 +135,13 @@ pub trait VectorBackend {
     fn nearest(&self, v: &[f32], s: &Scope, k: usize) -> Result<Vec<(i64, f32)>>;
 }
 
-/// Text to vectors. Nothing ships one yet: the vector arm stays off until it earns its place.
+/// Text to vectors. `vectors::Model` implements it in builds with the `vectors` feature.
 pub trait Embedder {
     fn dims(&self) -> usize;
     fn embed(&self, texts: &[&str]) -> Result<Vec<Vec<f32>>>;
 }
 
-/// The vector arm while there is none: no neighbours.
+/// No vector arm: no neighbours. (`vectors::Index` is the opt-in one.)
 pub struct NoVectors;
 
 impl VectorBackend for NoVectors {
@@ -797,6 +800,56 @@ fn damp_same_file(mut v: Vec<(Hit, f64)>, damp: f64) -> Vec<Hit> {
 
 type ArmFn<'a> = Box<dyn FnOnce(&Connection) -> Result<Vec<i64>> + Send + 'a>;
 
+/// Readers on derived indexes that a long-lived process keeps between searches.
+#[cfg(feature = "tantivy")]
+pub type DerivedCache = HashMap<i64, crate::tantivy_index::Cached>;
+#[cfg(not(feature = "tantivy"))]
+pub type DerivedCache = ();
+
+/// The engine behind the keyword and substring arms for one search.
+#[derive(Clone)]
+enum Engine {
+    Fts5,
+    #[cfg(feature = "tantivy")]
+    Tantivy(crate::tantivy_index::Handle, Scope),
+}
+
+impl Engine {
+    /// The scope's project's tantivy index when it has one that is current; FTS5 otherwise.
+    #[allow(unused_variables)]
+    fn choose(c: &Connection, sc: &Scope, cache: Option<&mut DerivedCache>) -> Engine {
+        #[cfg(feature = "tantivy")]
+        if let Some((h, rest)) = crate::tantivy_index::for_scope(c, sc, cache) {
+            return Engine::Tantivy(h, rest);
+        }
+        Engine::Fts5
+    }
+
+    fn keyword(&self, c: &Connection, sc: &Scope, f: &Filter, t: &Terms, field: Field, k: usize) -> Result<Vec<i64>> {
+        match self {
+            Engine::Fts5 => Sqlite::with_filter(c, sc, f).keyword(t, field, sc, k),
+            // An index that fails mid-search (a segment gone under a reader) or panics (a damaged
+            // file) never empties the arm: FTS5 answers instead.
+            #[cfg(feature = "tantivy")]
+            Engine::Tantivy(h, rest) => {
+                crate::tantivy_index::search(h.pid, || crate::tantivy_index::Tantivy { c, h, rest }.keyword(t, field, sc, k))
+                    .or_else(|_| Sqlite::with_filter(c, sc, f).keyword(t, field, sc, k))
+            }
+        }
+    }
+
+    fn substring(&self, c: &Connection, sc: &Scope, f: &Filter, needle: &str, k: usize) -> Result<Vec<i64>> {
+        match self {
+            Engine::Fts5 => Sqlite::with_filter(c, sc, f).substring(needle, sc, k),
+            #[cfg(feature = "tantivy")]
+            Engine::Tantivy(h, rest) => {
+                crate::tantivy_index::search(h.pid, || crate::tantivy_index::Tantivy { c, h, rest }.substring(needle, sc, k))
+                    .or_else(|_| Sqlite::with_filter(c, sc, f).substring(needle, sc, k))
+            }
+        }
+    }
+}
+
 /// Run arms concurrently: the first on `main`, the others on the pool's connections. Falls back
 /// to running them one after another on `main` when the pool is too small.
 fn run_arms(main: &Connection, pool: &mut [Connection], arms: Vec<(f64, ArmFn<'_>)>) -> Vec<(f64, Vec<i64>)> {
@@ -854,6 +907,7 @@ pub struct Warm {
     pool: Vec<Connection>,
     cache: HashMap<String, String>,
     hits: usize,
+    derived: DerivedCache,
 }
 
 const CACHE_MAX: usize = 1024;
@@ -965,7 +1019,7 @@ pub fn find(c: &Connection, cur: Option<&Project>, q: &str, o: &FindOpts) -> Res
     let t0 = std::time::Instant::now();
     let mut pool: Vec<Connection> = (0..4).filter_map(|_| crate::db::open_ro()).collect();
     trace("search pool", t0);
-    find_inner(c, &mut pool, None, cur, q, o)
+    find_inner(c, &mut pool, None, None, cur, q, o)
 }
 
 /// Warm search: graph and connections from `w`, and the generation-keyed result cache.
@@ -988,9 +1042,9 @@ pub fn find_warm(w: &mut Warm, c: &Connection, cur: Option<&Project>, q: &str, o
         Some(p) if identifier(q).is_some() && matches!(o.kind, "any" | "symbol") => w.graph_now(c, p.id).is_some(),
         _ => false,
     };
-    let Warm { graphs, pool, .. } = w;
+    let Warm { graphs, pool, derived, .. } = w;
     let warm = WarmRefs { graph: cur.filter(|_| current).and_then(|p| graphs.get(&p.id)).map(|x| &x.1) };
-    let out = find_inner(c, pool, Some(warm), cur, q, o)?;
+    let out = find_inner(c, pool, Some(warm), Some(derived), cur, q, o)?;
     if w.cache.len() >= CACHE_MAX {
         w.cache.clear();
     }
@@ -1007,11 +1061,12 @@ fn find_inner(
     c: &Connection,
     pool: &mut [Connection],
     warm: Option<WarmRefs<'_>>,
+    derived: Option<&mut DerivedCache>,
     cur: Option<&Project>,
     q: &str,
     o: &FindOpts,
 ) -> Result<String> {
-    let hits = ranked(c, pool, warm, cur, q, o, o.offset + o.limit.max(1))?;
+    let hits = ranked(c, pool, warm, derived, cur, q, o, o.offset + o.limit.max(1))?;
     let show_project = o.all || cur.is_none();
     let mut rows: Vec<Row> =
         hits.iter().map(|h| Row { full: render(h, show_project), skeleton: render_skeleton(h, show_project), id: render_id(h) }).collect();
@@ -1026,19 +1081,22 @@ fn find_inner(
 /// `show` symbols carry their reference counts.
 pub fn hits(c: &Connection, cur: Option<&Project>, q: &str, o: &FindOpts, show: usize) -> Result<Vec<Hit>> {
     let mut pool: Vec<Connection> = (0..4).filter_map(|_| crate::db::open_ro()).collect();
-    ranked(c, &mut pool, None, cur, q, o, show)
+    ranked(c, &mut pool, None, None, cur, q, o, show)
 }
 
+#[allow(clippy::too_many_arguments)]
 fn ranked(
     c: &Connection,
     pool: &mut [Connection],
     warm: Option<WarmRefs<'_>>,
+    derived: Option<&mut DerivedCache>,
     cur: Option<&Project>,
     q: &str,
     o: &FindOpts,
     show: usize,
 ) -> Result<Vec<Hit>> {
     let sc = scope(c, cur, o);
+    let engine = Engine::choose(c, &sc, derived);
     let f = Filter::render(Some(c), &sc);
     let t = Terms::new(q);
     let ident = t.ident.clone();
@@ -1052,14 +1110,14 @@ fn ranked(
     {
         // The route: body text for words, names for an identifier or any other single token.
         let field = if route == Route::Text { Field::Body } else { Field::Names };
-        let (t, sc, f) = (t.clone(), sc.clone(), f.clone());
-        arms.push((W_KEYWORD, Box::new(move |c: &Connection| Sqlite::with_filter(c, &sc, &f).keyword(&t, field, &sc, ARM_K))));
+        let (t, sc, f, e) = (t.clone(), sc.clone(), f.clone(), engine.clone());
+        arms.push((W_KEYWORD, Box::new(move |c: &Connection| e.keyword(c, &sc, &f, &t, field, ARM_K))));
     }
     // Trigram substring of a single token (a path fragment, part of a name). Words skip it:
     // one word of a sentence matched inside paths agreed with the body arm on the wrong rows.
     if route != Route::Text {
-        let (sc, f, needle) = (sc.clone(), f.clone(), q.trim().to_string());
-        arms.push((W_SUBSTRING, Box::new(move |c: &Connection| Sqlite::with_filter(c, &sc, &f).substring(&needle, &sc, ARM_K))));
+        let (sc, f, needle, e) = (sc.clone(), f.clone(), q.trim().to_string(), engine.clone());
+        arms.push((W_SUBSTRING, Box::new(move |c: &Connection| e.substring(c, &sc, &f, &needle, ARM_K))));
     }
     if let Some(id) = ident.clone() {
         let (sc, f) = (sc.clone(), f.clone());
@@ -1071,6 +1129,20 @@ fn ranked(
         let g = warm.and_then(|w| w.graph);
         let pid = p.id;
         arms.push((W_GRAPH, Box::new(move |c: &Connection| graph_arm(c, g, &id, pid, 20))));
+    }
+    // The opt-in vector arm (feature `vectors`, `vectors = true`): sentences of five words or
+    // more only, never an identifier, a token or a short phrase; symbols and doc headings of the
+    // current project. Off, or without a
+    // current index, it adds nothing and the answer is the one above.
+    #[cfg(feature = "vectors")]
+    if let Some(p) = cur
+        && route == Route::Text
+        && matches!(o.kind, "any" | "symbol" | "doc")
+        && crate::vectors::wants(q)
+        && crate::config::vectors_on()
+    {
+        let (pid, q) = (p.id, q.to_string());
+        arms.push((crate::vectors::W_VECTOR, Box::new(move |c: &Connection| crate::vectors::arm(c, pid, &q, ARM_K))));
     }
     let t0 = std::time::Instant::now();
     let ranked = run_arms(c, pool, arms);

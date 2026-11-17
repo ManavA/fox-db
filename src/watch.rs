@@ -81,12 +81,14 @@ pub fn classify(root: &Path, stores: &[PathBuf], path: &Path, d: &mut Dirty) {
 pub fn apply(p: &Project, d: Dirty) -> Result<String> {
     let mut c = db::open_rw()?;
     let mut log = vec![];
+    let mut delta = None;
     if d.other {
         let st = inventory::index_project(&mut c, p)?;
         log.push(format!("inventory {} changed", st.files_changed));
+        delta = st.delta;
     }
     if d.ts_src || d.other {
-        let st = crate::tsindex::index_project(&mut c, p)?;
+        let st = crate::tsindex::index_project_with(&mut c, p, delta.as_ref())?;
         if st.parsed + st.removed > 0 {
             log.push(format!("tree-sitter {} parsed, {} removed", st.parsed, st.removed));
         }
@@ -94,6 +96,13 @@ pub fn apply(p: &Project, d: Dirty) -> Result<String> {
     if d.ts_src && crate::config::get().codanna && crate::codanna::available() && crate::codanna::needed(&c, p) {
         let st = crate::codanna::sync(&c, p)?;
         log.push(format!("codanna {} copied, {} removed", st.copied, st.removed));
+    }
+    #[cfg(feature = "vectors")]
+    if crate::config::vectors_on() && crate::vectors::model_present() && (d.ts_src || d.other) {
+        let st = crate::vectors::refresh(&c, p, false)?;
+        if !st.current {
+            log.push(format!("vectors {} files parsed, {} embedded", st.parsed, st.embedded));
+        }
     }
     if d.store {
         let st = swiftimport::import_project(&mut c, p)?;

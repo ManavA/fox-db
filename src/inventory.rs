@@ -2,6 +2,7 @@
 //! and the global memory corpus (~/.claude/projects/*/memory).
 
 use crate::markdown;
+use crate::outbox::{self, Sink, TBL_BODY, TBL_NODE, TBL_TRI};
 use crate::project::Project;
 use crate::tiers::{self, Overrides, Tier};
 use crate::{db, guard};
@@ -15,8 +16,18 @@ use std::sync::{Arc, Mutex};
 const SUMMARY_MAX_ENTRIES: usize = 300_000;
 const FTS_BODY_MAX: usize = 32 * 1024;
 
+/// The files one index run changed or removed, when it knew them without reading every file row
+/// (a tree with a walk record): the tree-sitter pass of the same run then looks only at these.
+#[derive(Debug, Clone)]
+pub struct Delta {
+    /// The project's file generation before this run.
+    pub filegen: i64,
+    pub paths: Vec<String>,
+}
+
 #[derive(Debug, Default)]
 pub struct Stats {
+    pub delta: Option<Delta>,
     pub files_seen: usize,
     pub files_changed: usize,
     pub files_removed: usize,
@@ -27,25 +38,25 @@ pub struct Stats {
     pub ms: u128,
 }
 
-struct Entry {
-    rel: String,
-    abs: PathBuf,
-    size: u64,
-    mtime: i64,
+pub(crate) struct Entry {
+    pub(crate) rel: String,
+    pub(crate) abs: PathBuf,
+    pub(crate) size: u64,
+    pub(crate) mtime: i64,
 }
 
-#[derive(Clone)]
-enum DirNote {
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum DirNote {
     NameOnly(String),
     Skip(String),
     NestedRepo(String),
 }
 
-fn mtime_ms(md: &std::fs::Metadata) -> i64 {
+pub(crate) fn mtime_ms(md: &std::fs::Metadata) -> i64 {
     md.modified().ok().and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok()).map(|d| d.as_millis() as i64).unwrap_or(0)
 }
 
-fn rel_of(root: &Path, p: &Path) -> String {
+pub(crate) fn rel_of(root: &Path, p: &Path) -> String {
     p.strip_prefix(root).unwrap_or(p).to_string_lossy().replace('\\', "/")
 }
 
@@ -102,13 +113,24 @@ pub fn index_project(c: &mut Connection, p: &Project) -> Result<Stats> {
     if st.files_changed + st.files_removed + st.summaries > 0 {
         db::bump_project(c, p.id)?;
         db::optimize(c, false);
+        trace("inventory optimize", t0);
     }
     Ok(st)
+}
+
+fn trace(what: &str, t0: std::time::Instant) {
+    if std::env::var_os("FOXDB_TRACE").is_some() {
+        eprintln!("{what} {:?}", t0.elapsed());
+    }
 }
 
 /// Home directory or `/`: top-level names only, never descend, never open.
 fn index_huge(c: &mut Connection, p: &Project, st: &mut Stats) -> Result<()> {
     let tx = c.transaction()?;
+    let sink = Sink::open(&tx);
+    for t in [TBL_NODE, TBL_TRI, TBL_BODY] {
+        sink.del_where(&tx, p.id, t, "SELECT id FROM node WHERE project_id = ?1", &[&p.id])?;
+    }
     for t in crate::db::FTS_TABLES {
         tx.execute(&format!("DELETE FROM {t} WHERE rowid IN (SELECT id FROM node WHERE project_id = ?1)"), [p.id])?;
     }
@@ -137,6 +159,7 @@ fn index_huge(c: &mut Connection, p: &Project, st: &mut Stats) -> Result<()> {
                 None,
             )?;
             tx.execute("INSERT INTO fts_trigram(rowid, path, name) VALUES (?1, ?2, ?3)", params![id, name, name])?;
+            sink.put(&tx, p.id, TBL_TRI, id, &[&name, &name])?;
             st.files_seen += 1;
         }
     }
@@ -144,15 +167,25 @@ fn index_huge(c: &mut Connection, p: &Project, st: &mut Stats) -> Result<()> {
     Ok(())
 }
 
-fn index_tree(c: &mut Connection, p: &Project, st: &mut Stats) -> Result<()> {
-    let root = p.root.clone();
-    let ov = Arc::new(overrides_for(&p.name));
-    let notes: Arc<Mutex<Vec<DirNote>>> = Arc::default();
+/// What a walk of a project tree found: the files it would index, notes on directories it did
+/// not enter, and every directory it entered (`""` is the root), in walk order.
+pub(crate) struct Walk {
+    pub(crate) entries: Vec<Entry>,
+    pub(crate) notes: Vec<DirNote>,
+    pub(crate) dirs: Vec<String>,
+}
 
-    let mut wb = WalkBuilder::new(&root);
+/// Directory paths a restricted walk may enter (see `walkcache`); None walks everything.
+pub(crate) type Keep = Arc<dyn Fn(&str) -> bool + Send + Sync>;
+
+/// Walk `root` as an index run does: `.gitignore`, `.ignore`, git excludes and the tier rules;
+/// secrets, skip, name-only and nested-repository directories left out (the last three noted).
+pub(crate) fn walk(root: &Path, ov: &Arc<Overrides>, keep: Option<Keep>) -> Walk {
+    let notes: Arc<Mutex<Vec<DirNote>>> = Arc::default();
+    let mut wb = WalkBuilder::new(root);
     wb.hidden(false).git_ignore(true).git_global(true).git_exclude(true).ignore(true).parents(false).require_git(false).follow_links(false);
     {
-        let (root, ov, notes) = (root.clone(), ov.clone(), notes.clone());
+        let (root, ov, notes) = (root.to_path_buf(), ov.clone(), notes.clone());
         wb.filter_entry(move |e| {
             if e.depth() == 0 {
                 return true;
@@ -162,6 +195,9 @@ fn index_tree(c: &mut Connection, p: &Project, st: &mut Stats) -> Result<()> {
             if !is_dir {
                 // Secrets are dropped here: never stat'ed for content, never recorded.
                 return !tiers::is_secret_name(&e.file_name().to_string_lossy());
+            }
+            if keep.as_ref().is_some_and(|k| !k(&rel)) {
+                return false;
             }
             match tiers::classify_dir(&rel, &ov) {
                 Tier::Skip => {
@@ -184,17 +220,40 @@ fn index_tree(c: &mut Connection, p: &Project, st: &mut Stats) -> Result<()> {
         });
     }
     let mut entries = Vec::new();
+    let mut dirs = vec![String::new()];
     for r in wb.build() {
         let Ok(e) = r else { continue };
+        if e.depth() > 0 && e.file_type().is_some_and(|t| t.is_dir()) {
+            dirs.push(rel_of(root, e.path()));
+            continue;
+        }
         if !e.file_type().is_some_and(|t| t.is_file()) {
             continue;
         }
         let Ok(md) = e.metadata() else { continue };
-        entries.push(Entry { rel: rel_of(&root, e.path()), abs: e.path().to_path_buf(), size: md.len(), mtime: mtime_ms(&md) });
+        entries.push(Entry { rel: rel_of(root, e.path()), abs: e.path().to_path_buf(), size: md.len(), mtime: mtime_ms(&md) });
     }
+    let notes = notes.lock().unwrap().clone();
+    Walk { entries, notes, dirs }
+}
+
+fn index_tree(c: &mut Connection, p: &Project, st: &mut Stats) -> Result<()> {
+    let root = p.root.clone();
+    let ov = Arc::new(overrides_for(&p.name));
+    // Big trees reuse their last walk and re-read only directories that changed since.
+    let t0 = std::time::Instant::now();
+    let scan = crate::walkcache::scan(p, &root, &ov);
+    trace("inventory walk", t0);
+    let recorded = scan.recorded();
+    let filegen = if recorded { crate::walkcache::filegen(c, p.id) } else { 0 };
+    let fill = outbox::fill_pending(c, p.id);
+    // The record's file list is the store's when no run changed the files since it was written:
+    // then only the files whose size or time moved are looked up, not every row.
+    let delta = scan.prev.as_ref().filter(|pv| pv.0 == filegen && !fill).map(|pv| &pv.1);
+    let entries = &scan.walk.entries;
 
     let mut existing: HashMap<String, (i64, i64, i64)> = HashMap::new();
-    {
+    if delta.is_none() {
         let mut q = c.prepare("SELECT id, path, size, mtime FROM node WHERE project_id = ?1 AND kind = 'file'")?;
         let rows = q.query_map([p.id], |r| {
             Ok((r.get::<_, String>(1)?, (r.get(0)?, r.get::<_, Option<i64>>(2)?.unwrap_or(-1), r.get::<_, Option<i64>>(3)?.unwrap_or(-1))))
@@ -203,38 +262,10 @@ fn index_tree(c: &mut Connection, p: &Project, st: &mut Stats) -> Result<()> {
             existing.insert(r.0, r.1);
         }
     }
-
-    let tx = c.transaction()?;
-    let mut seen: HashSet<String> = HashSet::with_capacity(entries.len());
-    for e in &entries {
-        st.files_seen += 1;
-        seen.insert(e.rel.clone());
-        if let Some(&(_, size, mtime)) = existing.get(&e.rel)
-            && size == e.size as i64
-            && mtime == e.mtime
-        {
-            continue;
-        }
-        st.files_changed += 1;
-        remove_file(&tx, p.id, &e.rel)?;
-        let tier = tiers::classify_file(&e.rel, e.size, &ov);
-        if tier == Tier::Skip {
-            continue;
-        }
-        index_file(&tx, p.id, e, tier, st)?;
-    }
-    for rel in existing.keys() {
-        if !seen.contains(rel) {
-            remove_file(&tx, p.id, rel)?;
-            st.files_removed += 1;
-        }
-    }
+    trace("inventory known files", t0);
 
     // Summary nodes for skipped / name-only / nested-repo directories.
-    tx.execute("DELETE FROM fts_trigram WHERE rowid IN (SELECT id FROM node WHERE project_id = ?1 AND kind = 'artifact_dir')", [p.id])?;
-    tx.execute("DELETE FROM fts_node WHERE rowid IN (SELECT id FROM node WHERE project_id = ?1 AND kind = 'artifact_dir')", [p.id])?;
-    tx.execute("DELETE FROM node WHERE project_id = ?1 AND kind = 'artifact_dir'", [p.id])?;
-    let mut notes = notes.lock().unwrap().clone();
+    let mut notes = scan.walk.notes.clone();
     // Top-level dirs hidden by .gitignore (e.g. .DerivedData*) still get one summary node each.
     let noted: HashSet<String> = notes
         .iter()
@@ -255,33 +286,118 @@ fn index_tree(c: &mut Connection, p: &Project, st: &mut Stats) -> Result<()> {
             }
         }
     }
-    for n in notes {
-        let (rel, tier, meta) = match &n {
+    let summaries: Vec<(String, i64, serde_json::Value)> = notes
+        .iter()
+        .map(|n| match n {
             DirNote::NameOnly(rel) => (rel.clone(), 1, summarize_dir(&root.join(rel))),
             DirNote::Skip(rel) => (rel.clone(), 0, serde_json::json!({"policy": "skip"})),
             DirNote::NestedRepo(rel) => (rel.clone(), 0, serde_json::json!({"policy": "nested_repo"})),
+        })
+        .collect();
+
+    let tx = c.transaction()?;
+    let mut sink = Sink::open(&tx);
+    // A derived search index's fill starts here: a reset, then every row written again (files as
+    // if changed; the tree-sitter pass of this run writes the symbols and finishes the fill).
+    if fill {
+        tx.execute("UPDATE search_index SET state = 'filling' WHERE project_id = ?1", [p.id])?;
+        sink = Sink::open(&tx);
+        sink.reset(&tx, p.id)?;
+    }
+    let mut changed_paths: Vec<String> = vec![];
+    let mut seen: HashSet<&str> = HashSet::with_capacity(entries.len());
+    for e in entries {
+        st.files_seen += 1;
+        seen.insert(e.rel.as_str());
+        let same = match delta {
+            Some(d) => d.get(&e.rel) == Some(&(e.size, e.mtime)),
+            None => existing.get(&e.rel).is_some_and(|&(_, size, mtime)| size == e.size as i64 && mtime == e.mtime),
         };
-        let name = rel.rsplit('/').next().unwrap_or(&rel).to_string();
-        let id = insert_node(
-            &tx,
-            p.id,
-            "artifact_dir",
-            &format!("{}:{rel}/", p.id),
-            &name,
-            Some(&rel),
-            None,
-            None,
-            tier,
-            meta.get("bytes").and_then(|b| b.as_u64()),
-            0,
-            "inventory",
-            Some(&meta.to_string()),
-        )?;
-        tx.execute("INSERT INTO fts_trigram(rowid, path, name) VALUES (?1, ?2, ?3)", params![id, rel, name])?;
-        tx.execute("INSERT INTO fts_node(rowid, name, sig, path, body) VALUES (?1, ?2, '', ?3, '')", params![id, name, rel])?;
-        st.summaries += 1;
+        if same && !fill {
+            continue;
+        }
+        st.files_changed += 1;
+        if delta.is_some() {
+            changed_paths.push(e.rel.clone());
+        }
+        remove_file(&tx, &sink, p.id, &e.rel)?;
+        let tier = tiers::classify_file(&e.rel, e.size, &ov);
+        if tier == Tier::Skip {
+            continue;
+        }
+        index_file(&tx, &sink, p.id, e, tier, st)?;
+    }
+    let gone: Vec<String> = match delta {
+        Some(d) => d.keys().filter(|k| !seen.contains(k.as_str())).cloned().collect(),
+        None => existing.keys().filter(|k| !seen.contains(k.as_str())).cloned().collect(),
+    };
+    for rel in &gone {
+        remove_file(&tx, &sink, p.id, rel)?;
+        st.files_removed += 1;
+    }
+    if delta.is_some() {
+        changed_paths.extend(gone);
+    }
+
+    // A tree with a record rewrites its summary rows only when they changed (or files did).
+    let unchanged_summaries = recorded
+        && st.files_changed + st.files_removed == 0
+        && !fill
+        && {
+            let mut have: Vec<(String, i64, String)> = {
+                let mut q = tx.prepare("SELECT COALESCE(path, ''), COALESCE(tier, 0), COALESCE(meta, '') FROM node WHERE project_id = ?1 AND kind = 'artifact_dir'")?;
+                q.query_map([p.id], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?.flatten().collect()
+            };
+            let mut want: Vec<(String, i64, String)> = summaries.iter().map(|(r, t, m)| (r.clone(), *t, m.to_string())).collect();
+            have.sort();
+            want.sort();
+            have == want
+        };
+    if !unchanged_summaries {
+        for t in [TBL_TRI, TBL_NODE] {
+            sink.del_where(&tx, p.id, t, "SELECT id FROM node WHERE project_id = ?1 AND kind = 'artifact_dir'", &[&p.id])?;
+        }
+        tx.execute("DELETE FROM fts_trigram WHERE rowid IN (SELECT id FROM node WHERE project_id = ?1 AND kind = 'artifact_dir')", [p.id])?;
+        tx.execute("DELETE FROM fts_node WHERE rowid IN (SELECT id FROM node WHERE project_id = ?1 AND kind = 'artifact_dir')", [p.id])?;
+        tx.execute("DELETE FROM node WHERE project_id = ?1 AND kind = 'artifact_dir'", [p.id])?;
+        for (rel, tier, meta) in &summaries {
+            let name = rel.rsplit('/').next().unwrap_or(rel).to_string();
+            let id = insert_node(
+                &tx,
+                p.id,
+                "artifact_dir",
+                &format!("{}:{rel}/", p.id),
+                &name,
+                Some(rel),
+                None,
+                None,
+                *tier,
+                meta.get("bytes").and_then(|b| b.as_u64()),
+                0,
+                "inventory",
+                Some(&meta.to_string()),
+            )?;
+            tx.execute("INSERT INTO fts_trigram(rowid, path, name) VALUES (?1, ?2, ?3)", params![id, rel, name])?;
+            tx.execute("INSERT INTO fts_node(rowid, name, sig, path, body) VALUES (?1, ?2, '', ?3, '')", params![id, name, rel])?;
+            sink.put(&tx, p.id, TBL_TRI, id, &[rel, &name])?;
+            sink.put(&tx, p.id, TBL_NODE, id, &[&name, "", rel, ""])?;
+            st.summaries += 1;
+        }
+    }
+    let files_moved = st.files_changed + st.files_removed > 0;
+    if recorded && files_moved {
+        crate::walkcache::bump_filegen(&tx, p.id)?;
+    } else if recorded {
+        // The tree-sitter pass records the generation it took only once the counter exists.
+        tx.execute("INSERT OR IGNORE INTO meta(k, v) VALUES ('files:' || ?1, 0)", [p.id])?;
+    }
+    if delta.is_some() {
+        st.delta = Some(Delta { filegen, paths: changed_paths });
     }
     tx.commit()?;
+    trace("inventory store", t0);
+    let now = if recorded { crate::walkcache::filegen(c, p.id) } else { 0 };
+    crate::walkcache::save(&scan, &root, now, files_moved);
     Ok(())
 }
 
@@ -335,7 +451,10 @@ fn summarize_dir(abs: &Path) -> serde_json::Value {
 }
 
 /// Drops the inventory nodes for a path. Code-graph symbols (owned by the importers) are kept.
-fn remove_file(tx: &Transaction, pid: i64, rel: &str) -> Result<()> {
+fn remove_file(tx: &Transaction, sink: &Sink, pid: i64, rel: &str) -> Result<()> {
+    for t in [TBL_NODE, TBL_TRI] {
+        sink.del_where(tx, pid, t, "SELECT id FROM node WHERE project_id = ?1 AND path = ?2 AND kind != 'symbol'", &[&pid, &rel])?;
+    }
     tx.execute(
         "DELETE FROM fts_node WHERE rowid IN (SELECT id FROM node WHERE project_id = ?1 AND path = ?2 AND kind != 'symbol')",
         params![pid, rel],
@@ -398,7 +517,7 @@ fn cap(s: &str, n: usize) -> &str {
     &s[..i]
 }
 
-fn index_file(tx: &Transaction, pid: i64, e: &Entry, tier: Tier, st: &mut Stats) -> Result<()> {
+fn index_file(tx: &Transaction, sink: &Sink, pid: i64, e: &Entry, tier: Tier, st: &mut Stats) -> Result<()> {
     let name = e.rel.rsplit('/').next().unwrap_or(&e.rel).to_string();
     let file_id = insert_node(
         tx,
@@ -416,11 +535,13 @@ fn index_file(tx: &Transaction, pid: i64, e: &Entry, tier: Tier, st: &mut Stats)
         None,
     )?;
     tx.execute("INSERT INTO fts_trigram(rowid, path, name) VALUES (?1, ?2, ?3)", params![file_id, e.rel, name])?;
+    sink.put(tx, pid, TBL_TRI, file_id, &[&e.rel, &name])?;
     if tier != Tier::Text {
         tx.execute(
             "INSERT INTO fts_node(rowid, name, sig, path, body) VALUES (?1, ?2, '', ?3, '')",
             params![file_id, split_ident(&name), e.rel],
         )?;
+        sink.put(tx, pid, TBL_NODE, file_id, &[&split_ident(&name), "", &e.rel, ""])?;
         return Ok(());
     }
     let is_md = name.to_ascii_lowercase().ends_with(".md") || name.to_ascii_lowercase().ends_with(".markdown");
@@ -438,12 +559,14 @@ fn index_file(tx: &Transaction, pid: i64, e: &Entry, tier: Tier, st: &mut Stats)
             "INSERT INTO fts_node(rowid, name, sig, path, body) VALUES (?1, ?2, '', ?3, ?4)",
             params![file_id, split_ident(&name), e.rel, cap(&text, FTS_BODY_MAX)],
         )?;
+        sink.put(tx, pid, TBL_NODE, file_id, &[&split_ident(&name), "", &e.rel, cap(&text, FTS_BODY_MAX)])?;
         return Ok(());
     }
     tx.execute(
         "INSERT INTO fts_node(rowid, name, sig, path, body) VALUES (?1, ?2, '', ?3, '')",
         params![file_id, split_ident(&name), e.rel],
     )?;
+    sink.put(tx, pid, TBL_NODE, file_id, &[&split_ident(&name), "", &e.rel, ""])?;
     let mlog = markdown::is_milestone_log(&name);
     for s in markdown::split(&text, if mlog { Some(2) } else { None }) {
         if s.line == 0 {
@@ -480,6 +603,7 @@ fn index_file(tx: &Transaction, pid: i64, e: &Entry, tier: Tier, st: &mut Stats)
             "INSERT INTO fts_node(rowid, name, sig, path, body) VALUES (?1, ?2, ?3, ?4, ?5)",
             params![id, s.title, meta["state"].as_str().unwrap_or(""), e.rel, cap(&s.body, FTS_BODY_MAX)],
         )?;
+        sink.put(tx, pid, TBL_NODE, id, &[&s.title, meta["state"].as_str().unwrap_or(""), &e.rel, cap(&s.body, FTS_BODY_MAX)])?;
     }
     Ok(())
 }
@@ -551,6 +675,7 @@ pub fn index_global(c: &mut Connection) -> Result<usize> {
         }
     }
     let tx = c.transaction()?;
+    let sink = Sink::open(&tx);
     let mut seen = HashSet::new();
     for (proj, name, abs, size, mtime) in &files {
         let rel = format!("{proj}/memory/{name}");
@@ -559,7 +684,7 @@ pub fn index_global(c: &mut Connection) -> Result<usize> {
         if existing.get(&key) == Some(&(*size as i64, *mtime)) {
             continue;
         }
-        remove_file(&tx, g.id, &rel)?;
+        remove_file(&tx, &sink, g.id, &rel)?;
         let Some(text) = guard::read_text(abs, &rel, 256 * 1024, false) else { continue };
         let title = text
             .lines()
@@ -585,11 +710,13 @@ pub fn index_global(c: &mut Connection) -> Result<usize> {
             params![id, split_ident(&title), proj, rel, cap(&text, FTS_BODY_MAX)],
         )?;
         tx.execute("INSERT INTO fts_trigram(rowid, path, name) VALUES (?1, ?2, ?3)", params![id, rel, title])?;
+        sink.put(&tx, g.id, TBL_NODE, id, &[&split_ident(&title), proj, &rel, cap(&text, FTS_BODY_MAX)])?;
+        sink.put(&tx, g.id, TBL_TRI, id, &[&rel, &title])?;
     }
     for key in existing.keys() {
         if !seen.contains(key) {
             let rel = key.trim_start_matches("g:").to_string();
-            remove_file(&tx, g.id, &rel)?;
+            remove_file(&tx, &sink, g.id, &rel)?;
         }
     }
     tx.commit()?;

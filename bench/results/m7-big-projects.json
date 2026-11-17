@@ -1,0 +1,378 @@
+{
+ "host": "32 cores, data on tmpfs, shared host at load 8-13 (1-minute average during each run)",
+ "old": "5b735b0 (v0.1.0 + milestone 6)",
+ "new": "milestone 7, default build (tantivy feature on)",
+ "kubernetes": {
+  "old": {
+   "cold_s_median": 81.867,
+   "save_s_median": 0.892,
+   "query_p50_ms": 53.5,
+   "query_p95_ms": 131.3,
+   "store_bytes": 728014848
+  },
+  "new": {
+   "cold_s_median": 83.667,
+   "save_s_median": 0.949,
+   "query_p50_ms": 53.0,
+   "query_p95_ms": 135.4,
+   "store_bytes": 728018944
+  },
+  "identical_outputs": true,
+  "n_outputs": 17,
+  "schema_identical": true,
+  "home_files_identical": true,
+  "load_before": [
+   10.1,
+   10.9,
+   11.8
+  ],
+  "load_after": [
+   10.0,
+   10.9,
+   11.7
+  ],
+  "eval": {
+   "kubernetes-retrieval": "identical, gate vs m5-eval-kubernetes-retrieval.json passes",
+   "kubernetes-lexical": "identical"
+  }
+ },
+ "foxdb": {
+  "old": {
+   "cold_s_median": 1.038,
+   "save_s_median": 0.07,
+   "query_p50_ms": 22.2,
+   "query_p95_ms": 30.0,
+   "store_bytes": 3694592
+  },
+  "new": {
+   "cold_s_median": 1.08,
+   "save_s_median": 0.064,
+   "query_p50_ms": 22.2,
+   "query_p95_ms": 29.3,
+   "store_bytes": 3690496
+  },
+  "identical_outputs": true,
+  "n_outputs": 21,
+  "schema_identical": true,
+  "home_files_identical": true,
+  "load_before": [
+   8.8,
+   10.9,
+   11.9
+  ],
+  "load_after": [
+   8.8,
+   10.8,
+   11.9
+  ]
+ },
+ "linux": {
+  "rows": "97,132 files, 1,200,305 tree-sitter symbols (about 1.3M node rows)",
+  "find_cli_cold_15_queries_x5": {
+   "old": [
+    {
+     "n": 75,
+     "p50": 69.5,
+     "p95": 442.1,
+     "load": 10.7294921875
+    },
+    {
+     "n": 75,
+     "p50": 76.2,
+     "p95": 450.9,
+     "load": 10.1123046875
+    }
+   ],
+   "new": [
+    {
+     "n": 75,
+     "p50": 52.1,
+     "p95": 165.8,
+     "load": 11.31298828125
+    },
+    {
+     "n": 75,
+     "p50": 52.6,
+     "p95": 144.5,
+     "load": 10.5908203125
+    }
+   ]
+  },
+  "eval_linux_lexical": {
+   "old": {
+    "set": "linux-lexical",
+    "commit": "666539eecdf4db623f5e3c3e55cf9f2dfad24aa4",
+    "k": 50,
+    "types": {
+     "all": {
+      "n": 15,
+      "recall5": 0.733,
+      "hit10": 0.733,
+      "mrr": 0.671
+     },
+     "keyword": {
+      "n": 3,
+      "recall5": 1.0,
+      "hit10": 1.0,
+      "mrr": 1.0
+     },
+     "phrase": {
+      "n": 2,
+      "recall5": 0.0,
+      "hit10": 0.0,
+      "mrr": 0.0
+     },
+     "prefix": {
+      "n": 2,
+      "recall5": 0.5,
+      "hit10": 0.5,
+      "mrr": 0.517
+     },
+     "regex": {
+      "n": 2,
+      "recall5": 0.5,
+      "hit10": 0.5,
+      "mrr": 0.514
+     },
+     "substring": {
+      "n": 2,
+      "recall5": 1.0,
+      "hit10": 1.0,
+      "mrr": 1.0
+     },
+     "symbol": {
+      "n": 4,
+      "recall5": 1.0,
+      "hit10": 1.0,
+      "mrr": 0.75
+     }
+    },
+    "queries": [
+     [
+      "l01",
+      1
+     ],
+     [
+      "l02",
+      2
+     ],
+     [
+      "l03",
+      1
+     ],
+     [
+      "l04",
+      2
+     ],
+     [
+      "l05",
+      1
+     ],
+     [
+      "l06",
+      1
+     ],
+     [
+      "l07",
+      1
+     ],
+     [
+      "l08",
+      null
+     ],
+     [
+      "l09",
+      null
+     ],
+     [
+      "l10",
+      29
+     ],
+     [
+      "l11",
+      1
+     ],
+     [
+      "l12",
+      1
+     ],
+     [
+      "l13",
+      1
+     ],
+     [
+      "l14",
+      1
+     ],
+     [
+      "l15",
+      35
+     ]
+    ]
+   },
+   "new": {
+    "set": "linux-lexical",
+    "commit": "666539eecdf4db623f5e3c3e55cf9f2dfad24aa4",
+    "k": 50,
+    "types": {
+     "all": {
+      "n": 15,
+      "recall5": 0.867,
+      "hit10": 0.867,
+      "mrr": 0.792
+     },
+     "keyword": {
+      "n": 3,
+      "recall5": 1.0,
+      "hit10": 1.0,
+      "mrr": 0.778
+     },
+     "phrase": {
+      "n": 2,
+      "recall5": 0.5,
+      "hit10": 0.5,
+      "mrr": 0.5
+     },
+     "prefix": {
+      "n": 2,
+      "recall5": 0.5,
+      "hit10": 0.5,
+      "mrr": 0.521
+     },
+     "regex": {
+      "n": 2,
+      "recall5": 1.0,
+      "hit10": 1.0,
+      "mrr": 1.0
+     },
+     "substring": {
+      "n": 2,
+      "recall5": 1.0,
+      "hit10": 1.0,
+      "mrr": 1.0
+     },
+     "symbol": {
+      "n": 4,
+      "recall5": 1.0,
+      "hit10": 1.0,
+      "mrr": 0.875
+     }
+    },
+    "queries": [
+     [
+      "l01",
+      1
+     ],
+     [
+      "l02",
+      1
+     ],
+     [
+      "l03",
+      1
+     ],
+     [
+      "l04",
+      2
+     ],
+     [
+      "l05",
+      3
+     ],
+     [
+      "l06",
+      1
+     ],
+     [
+      "l07",
+      1
+     ],
+     [
+      "l08",
+      null
+     ],
+     [
+      "l09",
+      1
+     ],
+     [
+      "l10",
+      24
+     ],
+     [
+      "l11",
+      1
+     ],
+     [
+      "l12",
+      1
+     ],
+     [
+      "l13",
+      1
+     ],
+     [
+      "l14",
+      1
+     ],
+     [
+      "l15",
+      1
+     ]
+    ]
+   }
+  },
+  "save_one_file_s": {
+   "old": 1.8,
+   "new": 0.67,
+   "old_nochange": 1.71,
+   "new_nochange": 0.345,
+   "rounds": 7
+  },
+  "store_bytes": {
+   "old": 2922430464,
+   "old_free": 203599872,
+   "new": 4277309440,
+   "new_free": 1519808512,
+   "tantivy_index": 557854906
+  },
+  "fill": {
+   "fox_index_s": 144,
+   "foxd_apply_s": 106,
+   "outbox_rows": 3989587
+  },
+  "save_visible_in_tantivy_ms": [
+   579,
+   392,
+   319
+  ],
+  "foxd_rss_mb": {
+   "peak_during_fill_and_merges": 1644,
+   "after_merges_settle": 99,
+   "idle_after_restart": 11,
+   "after_queries": 44
+  }
+ },
+ "binaries": {
+  "old": {
+   "fox": 45904336,
+   "foxd": 43758704
+  },
+  "new_no_tantivy": {
+   "fox": 46046768,
+   "foxd": 43775344
+  },
+  "new_default": {
+   "fox": 48021552,
+   "foxd": 46914672
+  },
+  "clean_release_build_s": {
+   "no_tantivy": 317,
+   "tantivy": 349
+  },
+  "crates_compiled": {
+   "no_tantivy": 80,
+   "tantivy": 164
+  }
+ }
+}

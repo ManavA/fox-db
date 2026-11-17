@@ -58,6 +58,13 @@ cd ~/src/my-app && ~/.foxdb/bin/fox index .
 | `FOXDB_SESSION` | unset | Session id for CLI "already sent" references |
 | `FOXDB_CODEX_SESSIONS` | `~/.codex/sessions` | Codex rollouts for `fox ingest sessions` |
 | `[hooks] skip_agents` (config.toml) | `["egm-*", "*goldfish*", "*reviewer*"]` | Agents that get no SubagentStart brief |
+| `[search] backend` (config.toml) | `fts5` | `fts5`: never use tantivy; `auto` (opt-in): a project with at least `tantivy_min_docs` rows gets a tantivy index, smaller ones keep FTS5 only; `tantivy`: every project. `[search.projects]` overrides it per project name. See [Big projects](#big-projects-tantivy-and-the-walk-record) |
+| `[search] tantivy_min_docs` (config.toml) | `1000000` | Rows a project needs before `auto` gives it a tantivy index |
+| `[search] writer_mb` (config.toml) | `64` | Indexing memory of `foxd`'s tantivy writer (one thread) |
+| `FOXDB_SEARCH_BACKEND` | unset | Overrides the global `[search] backend` |
+| `vectors` (config.toml) | `false` | The opt-in vector arm (builds with `--features vectors`). See [Vector arm](#vector-arm-opt-in) |
+| `FOXDB_VECTORS` | unset | `1` or `0` overrides `vectors` |
+| `FOXDB_VECTORS_MODEL` | unset | A directory holding a model2vec model (`tokenizer.json`, `model.safetensors`) to use instead of the one `fox vectors setup` fetches |
 | `codanna` (config.toml) | `false` | Use an external [codanna](https://github.com/bartolli/codanna) binary at `~/.foxdb/bin/codanna` instead of the built-in tree-sitter index |
 
 `~/.foxdb/config.toml` (see [`config.example.toml`](../config.example.toml)) maps build
@@ -93,6 +100,7 @@ fox status
 fox stats
 fox index [PATH] [--quiet] [--no-global]
 fox index optimize
+fox index rebuild [PATH] [--backend tantivy|fts5]
 fox eval retrieval --set bench/eval/SET.json [--repo DIR] [--limit K] [--json] [--gate BASELINE.json]
 fox mem brief [--budget TOKENS] [--harness claude|codex]
 fox mem post <text> [--kind finding|claim|request|decision|report] [--title T] [--evidence E]
@@ -101,6 +109,8 @@ fox mem pickup h:ID [--by NAME]
 fox hook session-start|subagent-start|subagent-stop|pre-compact [--harness claude|codex]
 fox drift [doc.md]
 fox pack <doc.md> [--budget TOKENS]
+fox scip import <index.scip> [--project P] [--trust-mtime]
+fox vectors setup [--yes] | build [--project P] | status
 fox ingest sessions [--since-days N] [--claude DIR] [--codex DIR]
 fox daemon status|stop
 foxd [--version]
@@ -303,6 +313,123 @@ Use `~/.foxdb/bin/fox` before grepping: `fox find <q>`, `fox code <sym> --rel ca
   reproducible context a fresh reviewer gets. Citations that no longer resolve are listed as
   `not found:`.
 
+## Precise tier (SCIP)
+
+`fox scip import <index.scip> [--project P]` reads a [SCIP](https://github.com/sourcegraph/scip)
+index that your own build produced and makes the tree-sitter answers it covers precise: a
+reference at the same file, line and name as a SCIP occurrence now points at the definition SCIP
+names (a `guess 1 of N` label disappears, a call guessed to the wrong same-name method moves to
+the right one), and `callers`, `callees`, `refs` and `impact` follow. foxdb never runs your
+build or a language server; it only reads the file. Without an import nothing changes.
+
+Produce the index with the indexer for your language, from the project root (foxdb does not run
+these):
+
+```
+rust-analyzer scip .                                      # Rust: writes index.scip
+scip-java index                                           # Java, Kotlin, Scala (Gradle, Maven, sbt)
+scip-python index . --project-name my-app                 # Python
+scip-typescript index                                     # TypeScript / JavaScript (tsconfig.json)
+scip-go                                                   # Go
+fox scip import index.scip
+```
+
+Freshness is per file and checked by content. A document counts only when the index embedded
+its text and that text is the file as it is now; a file edited later keeps its tree-sitter
+answers, and so do references into it, until you rebuild the index and import again.
+
+Most indexers (rust-analyzer, scip-java, scip-python, scip-typescript, scip-go) leave the text
+out by default, and then nothing proves which version of a file the indexer read: an index
+written after an edit it did not see, or copied or touched later, would point references at the
+wrong definition and call them precise. So documents without text are ignored by default (the
+import reports them as `without text`) and keep their tree-sitter answers. `--trust-mtime` opts
+in to trusting them when the file was last modified before the index file was written; use it
+only for an index you built yourself and did not edit files during, since that is the case it
+cannot tell apart from a wrong one. A re-import replaces the previous one. `fox status` shows the tool, the
+import's age and how many of its files are still fresh. `fox drift` follows a cited symbol by its
+SCIP id: a symbol moved to another file reads as `moved ... from <old file> (SCIP <id>)`
+rather than as an edit. Symbols SCIP defines outside the project (dependencies, the standard
+library) leave the tree-sitter answer alone.
+
+## Big projects: tantivy and the walk record
+
+Two things change only for very big projects; below their thresholds foxdb behaves exactly as
+before (same answers, same store, no extra files or background work).
+
+**A tantivy index** (opt-in; builds with the `tantivy` Cargo feature, which release builds
+include). It is off unless config.toml asks for it, because its ranking trails FTS5's on some
+query sets (on the kubernetes eval sets recall@5 dropped from 1.00 to 0.80 on lexical and from
+0.67 to 0.31 on retrieval queries; see [benchmarks](benchmarks.md#big-projects-milestone-7)).
+With `backend = "auto"`, a project with at least a million rows (a Linux-sized tree; kubernetes
+has about a quarter of that) gets one after its next `fox index`, which then writes every full-text row once to a change log
+in the store. `foxd` builds the index from that log and from then on applies each save within
+about a second. Searches of that project read the index whenever it has applied every logged
+change, and read SQLite FTS5 otherwise, so a save is never missing from an answer: without a
+running `foxd` a project simply keeps using FTS5 after its next save. SQLite stays the system of
+record and FTS5 is kept in full; the index lives in `~/.foxdb/tantivy/<project id>/` and can be
+deleted at any time: FTS5 serves meanwhile, and the next `fox index` fills it again. A missing,
+truncated or damaged segment file is found by its checksum when `foxd` opens the index or `fox
+status` looks at it (searches then use FTS5 until `foxd` has rebuilt it), and a panic inside
+tantivy makes that search use FTS5. Settings are in [Config](#config); for example:
+
+```toml
+[search]
+backend = "auto"            # or "fts5" (the default: never) or "tantivy" (every project)
+tantivy_min_docs = 1000000
+
+[search.projects]
+linux = "tantivy"           # by project name, overrides backend
+```
+
+`fox index rebuild [PATH]` builds (or rebuilds) the index of the project at PATH now;
+`fox index rebuild [PATH] --backend fts5` drops it (`foxd` deletes the files; with
+`backend = "auto"` set the project to `"fts5"` in `[search.projects]` so it stays off).
+`fox status` shows each index: its state, how far it lags the log, segments and documents, and
+whether queries read it (or that it is damaged). The first fill of a Linux-sized project takes a
+few minutes in `fox index` and more in `foxd`, which writes with one thread and `writer_mb` MB
+(64 by default; before this setting it used four threads and peaked at about 1.6 GB), and and leaves free pages in `fox.db` about the size of the project's text,
+which SQLite reuses (run `VACUUM` to return them).
+
+**A walk record.** Finding what changed used to walk the whole tree on every save, which on a
+Linux-sized tree (about 100k files) took most of the save. A tree of at least 50,000 files now
+keeps its last walk in `~/.foxdb/walk/<project id>`, and the next run stats the recorded
+directories and files instead, walking again only directories whose time moved (with the same
+ignore rules). It falls back to the full walk whenever it cannot be sure: a changed `.gitignore`,
+`.ignore`, git exclude or global git config, a changed tier override file, a vanished directory
+or file, or directory times within two seconds of the record.
+
+## Vector arm (opt-in)
+
+A question in words such as "where do artwork downloads get cancelled when the user scrolls
+away" often shares few words with the code that answers it. The vector arm also looks for
+symbols and doc headings whose meaning is close. It is off unless you ask for it three times:
+
+```sh
+cargo build --release --features vectors   # 1. a build that has it (release tarballs do not)
+fox vectors setup                           # 2. names the model, its size and source, then asks
+fox vectors build                           # 3. embed the current project
+```
+
+Then switch it on with `vectors = true` near the top of `~/.foxdb/config.toml` (before any
+`[section]`), or `FOXDB_VECTORS=1` for one command.
+
+`fox vectors setup` fetches model2vec `potion-code-16M` (MIT, 65 MB) from its Hugging Face
+repository at a pinned commit, checks each file's sha256 and puts it in
+`~/.foxdb/models/potion-code-16M/`; it downloads nothing without `--yes` or a yes at the prompt,
+and nothing else in foxdb uses the network. The model is a table of token vectors (no neural
+network runs), so embedding a project is quick on a CPU: about 1 s for a 1,500-file Kotlin app
+and about 9 s for kubernetes.
+
+Once on, every `fox index` and `fox watch` run keeps the project's vectors current
+(`~/.foxdb/vectors/p<id>.fv`, about 280 bytes per symbol): only files whose content changed are
+parsed again, a text seen before is not embedded again, and a run that changed nothing it
+covers only rewrites a small stamp file. Only queries of five words or more use it; identifiers,
+single tokens and short phrases never do. If the index is behind the store (a save made with the
+arm off), damaged, from another model, or the model is missing, the arm is skipped and `find`
+answers exactly as without it. `fox vectors status` shows the setting, the model and each
+project's index; `fox vectors build` rebuilds a damaged one. To stop using it, set
+`vectors = false` (or delete `~/.foxdb/vectors/`).
+
 ## Session transcripts
 
 `fox ingest sessions [--since-days N]` reads Claude Code transcripts
@@ -336,9 +463,12 @@ a test checks the tool list, instructions, briefs, answers and the report schema
 ## Limitations
 
 - Swift symbols need an Xcode index store (a build must have run); unbuilt targets only show `~` tree-sitter rows. On Linux Swift needs `FOXDB_INDEXSTORE_LIB`.
-- Non-Swift callers are name-resolved by tree-sitter, not type-checked. Calls through a receiver whose type is not imported (Go struct fields and interfaces, stdlib methods) are mostly missed, and a common method name can resolve to the wrong same-package type; treat `callers` as a lower bound. A receiver call picked by name among several same-name definitions is marked `guess 1 of N` on its row, and the header counts them (`12 call sites in 4 files, 5 guessed by name`).
+- Non-Swift callers are name-resolved by tree-sitter, not type-checked, unless a fresh SCIP import covers the file (see [Precise tier](#precise-tier-scip)). Calls through a receiver whose type is not imported (Go struct fields and interfaces, stdlib methods) are mostly missed, and a common method name can resolve to the wrong same-package type; treat `callers` as a lower bound. A receiver call picked by name among several same-name definitions is marked `guess 1 of N` on its row, and the header counts them (`12 call sites in 4 files, 5 guessed by name`).
 - Type references (a type used in a signature) are not recorded for most languages, so `refs` of a type mostly lists constructor calls and supertype lists.
 - Search is lexical, trigram, name-prefix and graph based; there is no fuzzy or embedding search.
-- `fox drift` and `fox pack` match citations by name, so an overloaded or renamed symbol can be missed until the SCIP tier lands.
+- A project served by tantivy (opt-in) ranks keyword matches by per-field BM25 rather than FTS5's one weighted score, so its order differs from FTS5's and recall can drop: on the kubernetes eval sets recall@5 fell from 1.00 to 0.80 (lexical) and from 0.67 to 0.31 (retrieval, vague queries hardest hit); see [benchmarks](benchmarks.md#big-projects-milestone-7).
+- Damage to a tantivy segment file that tantivy reads without panicking is caught by checksum only when `foxd` opens the index or `fox status` runs; until then searches may read it.
+- `fox drift` and `fox pack` match citations by name, so an overloaded or renamed symbol can be missed; with a fresh SCIP import, drift follows a moved symbol by its SCIP id, but a renamed one still reads as vanished.
+- The SCIP tier only upgrades references tree-sitter already records; occurrences it does not capture (most type references) are not added.
 - Single machine, single user; the store is not designed to be shared.
 - Milestone parsing assumes Markdown headings with status words; other log formats are indexed as plain doc sections.

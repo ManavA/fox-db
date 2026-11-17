@@ -14,6 +14,10 @@
 //! When no request has arrived for [`IDLE_SECS`], the daemon merges the full-text indexes a
 //! bounded step at a time (writes never merge inline; see `db::fts_merge`), stopping as soon as
 //! a request comes in or nothing is left to merge.
+//!
+//! In builds with the `tantivy` feature it is also the only writer of the derived tantivy
+//! indexes of big projects: once a second it applies their change log (see `tantivy_index`).
+//! A store with no such index has no `tantivy` directory, and that check is all it costs.
 
 use crate::search::Warm;
 use crate::{cli, db};
@@ -143,8 +147,19 @@ const MERGE_PAGES: i64 = 256;
 /// Merge full-text segments while the daemon is idle; once settled, wait for the next write.
 fn idle_merge(stop: &AtomicBool, last: &AtomicI64) {
     let mut settled_at: Option<i64> = None;
+    // Writers of the derived (tantivy) indexes: none, and no work, in a store without any.
+    #[cfg(feature = "tantivy")]
+    let mut writers = crate::tantivy_index::Writers::default();
     while !stop.load(Ordering::SeqCst) {
         std::thread::sleep(Duration::from_secs(1));
+        #[cfg(feature = "tantivy")]
+        if crate::tantivy_index::root().is_dir()
+            && let Ok(c) = db::open_rw()
+            && let Err(e) = writers.drain(&c)
+            && std::env::var_os("FOXDB_TRACE").is_some()
+        {
+            eprintln!("foxd: tantivy: {e:#}");
+        }
         if db::now() - last.load(Ordering::SeqCst) < idle_secs() {
             continue;
         }

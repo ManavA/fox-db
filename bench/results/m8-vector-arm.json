@@ -1,0 +1,367 @@
+{
+ "milestone": 8,
+ "old": "0b0ab9d (milestone 7)",
+ "new": "milestone 8: default build, and the vectors build with the arm off or on",
+ "host": "32 cores, data on tmpfs, shared host at load 8-13 throughout; latencies +-30%",
+ "binaries_bytes": {
+  "old": {
+   "fox": 49285872,
+   "foxd": 47473744
+  },
+  "default": {
+   "fox": 49284656,
+   "foxd": 47472592
+  },
+  "vectors": {
+   "fox": 51641904,
+   "foxd": 47732880
+  }
+ },
+ "below_trigger_unchanged": {
+  "foxdb": {
+   "default": {
+    "old": {
+     "cold_s": 1.059,
+     "save_s": 0.071,
+     "p50_ms": 21.6,
+     "p95_ms": 29.8,
+     "store": 4079616
+    },
+    "new": {
+     "cold_s": 1.12,
+     "save_s": 0.069,
+     "p50_ms": 22.2,
+     "p95_ms": 30.8,
+     "store": 4075520
+    }
+   },
+   "vectors_build_arm_off": {
+    "old": {
+     "cold_s": 1.012,
+     "save_s": 0.071,
+     "p50_ms": 21.7,
+     "p95_ms": 31.3,
+     "store": 4075520
+    },
+    "new": {
+     "cold_s": 1.064,
+     "save_s": 0.066,
+     "p50_ms": 22.7,
+     "p95_ms": 31.5,
+     "store": 4079616
+    }
+   },
+   "outputs_identical": "21 of 21"
+  },
+  "private_kotlin_app_2214_files": {
+   "default": {
+    "old": {
+     "cold_s": 6.63,
+     "save_s": 0.26,
+     "p50_ms": 28.6,
+     "p95_ms": 51.0,
+     "store": 87519232
+    },
+    "new": {
+     "cold_s": 6.693,
+     "save_s": 0.252,
+     "p50_ms": 29.3,
+     "p95_ms": 51.2,
+     "store": 87519232
+    }
+   },
+   "vectors_build_arm_off": {
+    "old": {
+     "cold_s": 6.522,
+     "save_s": 0.257,
+     "p50_ms": 29.0,
+     "p95_ms": 53.6,
+     "store": 87515136
+    },
+    "new": {
+     "cold_s": 6.625,
+     "save_s": 0.232,
+     "p50_ms": 28.3,
+     "p95_ms": 53.7,
+     "store": 87515136
+    }
+   },
+   "outputs_identical": "28 of 28"
+  },
+  "kubernetes": {
+   "vectors_build_arm_off": {
+    "old": {
+     "cold_s": 82.147,
+     "save_s": 0.989,
+     "store": 727240704,
+     "find_p50_p95_ms_two_runs": [
+      [
+       161.7,
+       287.1
+      ],
+      [
+       157.3,
+       270.7
+      ]
+     ]
+    },
+    "new": {
+     "cold_s": 83.616,
+     "save_s": 0.995,
+     "store": 727281664,
+     "find_p50_p95_ms_two_runs": [
+      [
+       161.2,
+       274.1
+      ],
+      [
+       158.9,
+       268.2
+      ]
+     ]
+    }
+   },
+   "outputs_identical": "48 of 48"
+  },
+  "schema_and_home_files_identical": true,
+  "foxd_app_after_20_searches": {
+   "old": {
+    "threads": 2,
+    "rss_kb": 46064
+   },
+   "vectors_build_arm_off": {
+    "threads": 2,
+    "rss_kb": 46004
+   }
+  }
+ },
+ "arm_on": {
+  "model": "minishlab/potion-code-16M@1b0ff71095656b23306542bbad34a09109673720 (MIT, 65.3 MB)",
+  "weight": 0.5,
+  "min_words": 5,
+  "kubernetes_retrieval": {
+   "off": {
+    "vague": [
+     0.429,
+     0.429,
+     0.26
+    ],
+    "keyword": [
+     1.0,
+     1.0,
+     0.607
+    ],
+    "exact": [
+     1.0,
+     1.0,
+     1.0
+    ],
+    "all": [
+     0.667,
+     0.667,
+     0.486
+    ]
+   },
+   "on": {
+    "vague": [
+     0.429,
+     0.464,
+     0.279
+    ],
+    "keyword": [
+     1.0,
+     1.0,
+     0.667
+    ],
+    "exact": [
+     1.0,
+     1.0,
+     1.0
+    ],
+    "all": [
+     0.667,
+     0.688,
+     0.51
+    ]
+   },
+   "columns": "recall@5, hit@10, MRR",
+   "queries_better": 10,
+   "queries_worse": [
+    "v02 1->7",
+    "v05 12->17",
+    "v07 1->2",
+    "v12 2->3",
+    "v22 1->2"
+   ]
+  },
+  "kubernetes_lexical": "identical (two to four words: the arm never runs)",
+  "private_kotlin_app": {
+   "off": {
+    "vague": [
+     0.56,
+     0.72,
+     0.376
+    ],
+    "keyword": [
+     1.0,
+     1.0,
+     0.607
+    ],
+    "exact": [
+     1.0,
+     1.0,
+     1.0
+    ]
+   },
+   "on": {
+    "vague": [
+     0.68,
+     0.76,
+     0.478
+    ],
+    "keyword": [
+     1.0,
+     1.0,
+     0.607
+    ],
+    "exact": [
+     1.0,
+     1.0,
+     1.0
+    ]
+   },
+   "queries_better": 15,
+   "queries_worse": 2
+  },
+  "build": {
+   "kubernetes": {
+    "rows": 240674,
+    "files": 16638,
+    "seconds": [
+     8.95,
+     9.61,
+     9.48
+    ],
+    "file_bytes": 68351583
+   },
+   "private_kotlin_app": {
+    "rows": 30131,
+    "files": 1517,
+    "seconds": 1.1
+   }
+  },
+  "kubernetes_save_s": {
+   "one_file_off": [
+    0.992,
+    0.956
+   ],
+   "one_file_on": [
+    1.963,
+    2.051
+   ],
+   "no_change_off": [
+    0.855,
+    0.806
+   ],
+   "no_change_on": [
+    1.177,
+    1.184
+   ]
+  },
+  "cold_cli_find_ms_p50_p95": {
+   "kubernetes_retrieval_48x3": {
+    "off": [
+     [
+      177.9,
+      286.3
+     ],
+     [
+      172.3,
+      283.3
+     ]
+    ],
+    "on": [
+     [
+      230.6,
+      329.9
+     ],
+     [
+      218.5,
+      301.7
+     ]
+    ]
+   },
+   "private_kotlin_app_36x3": {
+    "off": [
+     [
+      43.6,
+      62.3
+     ],
+     [
+      48.8,
+      72.6
+     ]
+    ],
+    "on": [
+     [
+      101.0,
+      130.3
+     ],
+     [
+      105.0,
+      128.9
+     ]
+    ]
+   }
+  },
+  "warm_foxd_find_ms_p50_p95": {
+   "private_kotlin_app": {
+    "off": [
+     34.1,
+     56.4
+    ],
+    "on": [
+     35.5,
+     53.6
+    ]
+   }
+  },
+  "foxd_rss_kb_arm_on_vs_off": {
+   "private_kotlin_app": [
+    53124,
+    27128
+   ],
+   "kubernetes": [
+    142280,
+    52724
+   ]
+  },
+  "tokenizer_parity": "2305 of 2306 sampled chunks match the Hugging Face tokenizer (the one difference is non-ASCII)",
+  "store": "each result above is from a fresh FOXDB_HOME holding only the project under test",
+  "shared_store_review_rerun": {
+   "store": "one FOXDB_HOME holding foxdb, kubernetes (240,674 rows) and the private Kotlin app (2,214 files); vectors build ff8c035, kubernetes at aaaf121",
+   "columns": "recall@5, hit@10, MRR",
+   "kubernetes_retrieval_vague": {
+    "off": [
+     0.429,
+     0.429,
+     0.278
+    ],
+    "on": [
+     0.429,
+     0.464,
+     0.277
+    ],
+    "note": "v26 fell from rank 1 to 2"
+   },
+   "private_kotlin_app_vague": {
+    "off_recall5": 0.24,
+    "on_recall5": 0.24,
+    "off_mrr": 0.133,
+    "on_mrr": 0.152
+   },
+   "private_kotlin_app_keyword_off_recall5": 0.4,
+   "note": "the arm-off baseline drop also happens with FOXDB_VECTORS=0, so the shared store causes it, not milestone 8; the vague gain holds only for single-project stores"
+  }
+ }
+}

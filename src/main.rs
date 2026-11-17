@@ -48,19 +48,75 @@ fn cmd_index(a: &Args) -> anyhow::Result<String> {
         let tables = db::FTS_TABLES.iter().zip(before.iter().zip(&after)).map(|(t, (b, a))| format!("{t} {b}->{a}")).collect::<Vec<_>>();
         return Ok(format!("optimized ({}) in {} ms", tables.join(", "), t0.elapsed().as_millis()));
     }
+    // `fox index rebuild [PATH] [--backend tantivy|fts5]`: (re)build or drop a tantivy index.
+    if a.pos.get(1).map(String::as_str) == Some("rebuild") && !std::path::Path::new("rebuild").is_dir() {
+        return cmd_rebuild(a);
+    }
     let target = a.pos.get(1).map(PathBuf::from).unwrap_or_else(cwd);
     let mut c = db::open_rw()?;
     let loc = project::locate(&target);
     let p = project::ensure(&c, &loc)?;
-    let res = inventory::index_project(&mut c, &p);
-    let g = if a.no_global { Ok(0) } else { inventory::index_global(&mut c) };
+    let out = index_once(a, &mut c, &p)?;
+    // A project past the size trigger gets a tantivy index, filled by a second pass right away.
+    #[cfg(feature = "tantivy")]
+    if p.kind != "huge"
+        && let Ok(Some(what)) = foxdb::tantivy_index::maintain(&c, p.id, &p.name)
+    {
+        if what == "enabled" {
+            let again = index_once(a, &mut c, &p)?;
+            return Ok(format!("{out}\ntantivy index enabled for {}; filled: {again}", p.name));
+        }
+        return Ok(format!("{out}\ntantivy index {what} for {}", p.name));
+    }
+    // A build without tantivy cannot keep an index current: drop it rather than let its log grow
+    // (a tantivy build makes a new one on its next index run).
+    #[cfg(not(feature = "tantivy"))]
+    if foxdb::outbox::state(&c, p.id).is_some() {
+        foxdb::outbox::disable(&c, p.id)?;
+        return Ok(format!("{out}\ntantivy index dropped for {}: this build has no tantivy backend", p.name));
+    }
+    Ok(out)
+}
+
+/// `fox index rebuild [PATH] [--backend tantivy|fts5]`.
+fn cmd_rebuild(a: &Args) -> anyhow::Result<String> {
+    let target = a.pos.get(2).map(PathBuf::from).unwrap_or_else(cwd);
+    let mut c = db::open_rw()?;
+    let p = project::ensure(&c, &project::locate(&target))?;
+    match a.opt.get("backend").map(String::as_str).unwrap_or("tantivy") {
+        "fts5" => {
+            foxdb::outbox::disable(&c, p.id)?;
+            Ok(format!("{}: tantivy index dropped (foxd deletes its files); FTS5 serves every search", p.name))
+        }
+        "tantivy" => {
+            #[cfg(feature = "tantivy")]
+            {
+                foxdb::tantivy_index::enable(&c, p.id)?;
+                let out = index_once(a, &mut c, &p)?;
+                Ok(format!("{out}\n{}: tantivy index filled; foxd builds it and searches use it once it has caught up", p.name))
+            }
+            #[cfg(not(feature = "tantivy"))]
+            {
+                let _ = &mut c;
+                anyhow::bail!("this build has no tantivy backend (build with --features tantivy)")
+            }
+        }
+        other => anyhow::bail!("unknown backend {other:?}: use tantivy or fts5"),
+    }
+}
+
+/// One index run of `p`: inventory, global notes, Swift index stores, tree-sitter, codanna.
+fn index_once(a: &Args, c: &mut rusqlite::Connection, p: &project::Project) -> anyhow::Result<String> {
+    let res = inventory::index_project(c, p);
+    let delta = res.as_ref().ok().and_then(|s| s.delta.clone());
+    let g = if a.no_global { Ok(0) } else { inventory::index_global(c) };
     let _ = std::fs::remove_file(lock_path(p.id));
     let st = res?;
     let g = g?;
     let sw = if a.no_swift || p.kind == "huge" || swiftimport::discover_stores(&p.root).is_empty() {
         String::new()
     } else {
-        match swiftimport::import_project(&mut c, &p) {
+        match swiftimport::import_project(c, p) {
             Ok(s) => format!(
                 "; swift: {} stores, {}/{} units changed, {} records read, {} symbols, {} occurrences, {} edges, {} stale files, {} ms",
                 s.stores, s.units_changed, s.units_seen, s.records_read, s.symbols, s.occurrences, s.edges, s.stale_files, s.ms
@@ -71,7 +127,7 @@ fn cmd_index(a: &Args) -> anyhow::Result<String> {
     let ts = if p.kind == "huge" {
         String::new()
     } else {
-        match tsindex::index_project(&mut c, &p) {
+        match tsindex::index_project_with(c, p, delta.as_ref()) {
             Ok(s) => format!(
                 "; tree-sitter: {} files, {} parsed, {} unchanged, {} removed, {} symbols, {} refs ({} scored, {} resolved), {} ms",
                 s.files, s.parsed, s.unchanged, s.removed, s.symbols, s.refs, s.rescored, s.resolved, s.ms
@@ -79,10 +135,11 @@ fn cmd_index(a: &Args) -> anyhow::Result<String> {
             Err(e) => format!("; tree-sitter index failed: {e:#}"),
         }
     };
-    let cn = if !config::get().codanna || a.no_codanna || p.kind == "huge" || !codanna::available() || !codanna::needed(&c, &p) {
+    let vx = vectors_after_index(c, p);
+    let cn = if !config::get().codanna || a.no_codanna || p.kind == "huge" || !codanna::available() || !codanna::needed(c, p) {
         String::new()
     } else {
-        match codanna::sync(&c, &p) {
+        match codanna::sync(c, p) {
             Ok(s) => format!("; codanna mirror: {} files, {} copied, {} removed, {} ms", s.files, s.copied, s.removed, s.ms),
             Err(e) => format!("; codanna sync failed: {e:#}"),
         }
@@ -99,7 +156,21 @@ fn cmd_index(a: &Args) -> anyhow::Result<String> {
         if st.truncated { " (TRUNCATED)" } else { "" },
         st.ms,
         g
-    ))
+    ) + &vx)
+}
+
+/// Refresh the vector index after an index run, only while the arm is on and set up.
+#[allow(unused_variables)]
+fn vectors_after_index(c: &rusqlite::Connection, p: &project::Project) -> String {
+    #[cfg(feature = "vectors")]
+    if config::vectors_on() && p.kind != "huge" && foxdb::vectors::model_present() {
+        return match foxdb::vectors::refresh(c, p, false) {
+            Ok(s) if s.current => String::new(),
+            Ok(s) => format!("; vectors: {} rows, {} files parsed, {} embedded, {} ms", s.rows, s.parsed, s.embedded, s.ms),
+            Err(e) => format!("; vector index failed: {e:#}"),
+        };
+    }
+    String::new()
 }
 
 fn cmd_find(a: &Args) -> anyhow::Result<String> {
@@ -258,6 +329,8 @@ fn main() -> ExitCode {
         Some("code") => cmd_code(&a),
         Some("mem") if matches!(a.pos.get(1).map(String::as_str), Some("post" | "read" | "pickup")) => cli::board(&a, &cwd()),
         Some("drift" | "pack") => cli::docref(&a, &cwd()),
+        Some("scip") => cli::scip(&a, &cwd()),
+        Some("vectors") => cli::vectors(&a, &cwd()),
         Some("ingest") if a.pos.get(1).map(String::as_str) == Some("sessions") => cli::ingest(&a),
         Some("mcp") => foxdb::mcp::serve().map(|_| String::new()),
         Some("daemon") => match a.pos.get(1).map(String::as_str) {

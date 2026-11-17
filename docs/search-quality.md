@@ -74,8 +74,9 @@ pub trait Embedder { fn dims(&self) -> usize; fn embed(&self, texts: &[&str]) ->
 
 A backend gets normalized terms and a logical scope, never FTS5 syntax or SQL. The SQLite
 backend (`Sqlite`) renders the scope itself (`Filter::render`: kinds, projects, path prefix, and
-the id ranges of a minority project in a shared store). `NoVectors` is the vector arm until one
-exists. The exact and graph arms, fusion and re-ranking stay outside the seam, so a tantivy
+the id ranges of a minority project in a shared store). `NoVectors` is the empty vector arm;
+with the `vectors` feature, `vectors::Index` and `vectors::Model` implement the two vector
+traits (milestone 8, opt-in: see [architecture.md](architecture.md#vector-arm-opt-in)). The exact and graph arms, fusion and re-ranking stay outside the seam, so a tantivy
 backend changes none of them. Results are node ids; display always comes from SQLite, which stays
 the system of record.
 
@@ -152,11 +153,11 @@ measure of agent success; the agent A/B runner (`bench/ab.py`) is that.
 
 ## Later
 
-- **Tantivy (milestone 7 at the earliest):** opt-in per project, when a project holds about 1M
-  rows or its `find` p95 is over 300 ms on a quiet host with a real disk. SQLite stays the master
-  copy; writes append to a change log in the same transaction, `foxd` replays it into tantivy
-  (`IndexSink`), and a project falls back to FTS5 whenever tantivy lags. Re-run the bench with the
-  body arm in place first: it made `fts_body` the biggest table.
+- **Tantivy (done in milestone 7, opt-in):** with `backend = "auto"` a project of about 1M rows
+  or more gets a tantivy index (off by default: recall trails FTS5 on the kubernetes sets)
+  kept by `foxd` from a change log written in the same transaction; it falls back to FTS5
+  whenever the index lags. See [architecture.md](architecture.md#derived-tantivy-index-for-big-projects)
+  and [benchmarks.md](benchmarks.md#big-projects-milestone-7).
 - **Vectors:** a trial with usearch and a code embedding model in native Rust, for questions only
   (an identifier never reaches it), and only if an agent-task eval shows fewer turns or more
   first-try finds. If it does not, the feature is removed, not tuned.

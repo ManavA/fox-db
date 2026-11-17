@@ -1,7 +1,7 @@
 [package]
 license = "AGPL-3.0-or-later"
 name = "foxdb"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2024"
 
 [dependencies]
@@ -16,8 +16,11 @@ rusqlite = { version = "0.40.2", features = ["bundled"] }
 ruzstd = "0.8"
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.154"
+sha2 = { version = "0.10.9", optional = true }
 streaming-iterator = "0.1.9"
+tantivy = { version = "0.27.0", default-features = false, features = ["mmap"], optional = true }
 toml = "1.1.8"
+unicode-normalization = { version = "0.1.24", optional = true }
 tree-sitter = "0.27"
 tree-sitter-bash = "0.25.1"
 tree-sitter-c = "0.24.2"
@@ -37,6 +40,18 @@ tree-sitter-rust = "0.24.2"
 tree-sitter-scala = "0.26.13"
 tree-sitter-swift = "0.7.4"
 tree-sitter-typescript = "0.23.2"
+ureq = { version = "3.5.2", default-features = false, features = ["rustls"], optional = true }
+
+[features]
+# A tantivy index for big projects (docs/architecture.md). Small projects never use it; in the
+# default build it costs about 2-3 MB per binary and a tenth more build time.
+# `--no-default-features` builds without it.
+default = ["tantivy"]
+tantivy = ["dep:tantivy"]
+# An opt-in vector arm for questions in words (docs/architecture.md#vector-arm): static
+# model2vec embeddings, a flat in-process index, `fox vectors setup` to fetch the model.
+# Not in the default build.
+vectors = ["dep:unicode-normalization", "dep:ureq", "dep:sha2"]
 
 [dev-dependencies]
 tempfile = "3.27.0"
@@ -61,5 +76,7 @@ path = "bench/main.rs"
 opt-level = 3
 lto = "thin"
 codegen-units = 1
-panic = "abort"
+# Unwind, not abort: a damaged tantivy file can make tantivy panic, and the search must then
+# fall back to FTS5 (tantivy_index::guard) instead of killing `fox` or `foxd`.
+panic = "unwind"
 strip = true

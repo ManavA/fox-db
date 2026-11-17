@@ -1,5 +1,61 @@
 # Changelog
 
+## 0.2.0 (2026-11-17)
+
+Highlights: an opt-in precise tier from SCIP indexes, an opt-in tantivy backend for Linux-sized
+projects, a faster change detector for trees of 50,000+ files, and an opt-in vector arm. With
+none of them switched on, answers, speed and store size match 0.1.0 (checked side by side on
+small and medium repos). The README now leads with agent-driven install.
+
+- An opt-in vector arm (milestone 8), not in the default build. Built with
+  `--features vectors`, switched on with `vectors = true` in config.toml, and fed by
+  `fox vectors setup`, which names the model (model2vec `potion-code-16M`, MIT, 65 MB from its
+  Hugging Face repository at a pinned commit, sha256-checked) before downloading anything. Static
+  embeddings computed in Rust (no ONNX, no GPU, no server) over every tree-sitter symbol's body
+  text and every doc heading, kept in one flat int8 file per project under
+  `~/.foxdb/vectors/`, refreshed after each index run (only changed files are parsed again;
+  a run that changes nothing only moves a small stamp file). Only sentences of five words or
+  more read it, never identifiers, tokens or short phrases; it is fused after the other arms. A
+  stale, damaged or missing index, a missing model or any error leaves the arm empty, so the
+  answer is the one without it. In a store holding only that project, a private Kotlin app's
+  vague recall@5 rose from 0.56 to 0.68 (MRR 0.38 to 0.48) and kubernetes gained a little (vague
+  MRR 0.26 to 0.28, recall@5 unchanged); exact and lexical sets are unchanged. In one store
+  holding several projects, as a real `~/.foxdb` does, the gain is small or none (kubernetes
+  vague MRR 0.278 to 0.277, the Kotlin app's vague recall@5 unchanged). `fox vectors build` and `fox vectors status`
+  manage it. Without the feature or the setting nothing changes: same answers, no files, no
+  work.
+- Big projects (milestone 7), opt-in. With `[search] backend = "auto"` a project of about a
+  million rows or more (a Linux-sized tree; `[search] tantivy_min_docs`) gets a tantivy index,
+  kept by `foxd` from a change log written in the same SQLite transaction as the full-text rows;
+  `backend = "tantivy"` or `[search.projects]` gives one to a named project. The default is
+  `fts5` (no tantivy anywhere) because tantivy's recall trails FTS5 on the kubernetes eval sets.
+  Searches read an index only when it has applied every logged change and use FTS5 otherwise, so
+  a save is never missing from an answer; FTS5 stays in full. Crash recovery replays the log; an
+  index ahead of SQLite, unreadable, or with a missing or damaged segment file is rebuilt; a
+  deleted index directory is refilled; a panic in tantivy falls back to FTS5 (release builds now
+  unwind instead of aborting). `foxd` writes with one thread and `writer_mb` MB, fills included.
+  `fox index rebuild [--backend tantivy|fts5]` builds or drops one, and `fox status` shows its
+  lag and whether it is damaged. On Linux `find` p95 fell from about 450 to about 155 ms. The
+  `tantivy` Cargo feature is in the default build (about 2-3 MB per binary);
+  `--no-default-features` leaves it out.
+- A cheaper change detector for trees of 50,000 files or more: the last walk is kept in
+  `~/.foxdb/walk/` and a save stats the recorded directories and files instead of walking the
+  tree, re-walking only directories that changed and falling back to the full walk whenever it
+  cannot be sure. A one-file save on Linux went from 1.8 to 0.67 s. `.git` counts by its presence
+  only, so git commands (which touch it) do not force the full walk.
+- Smaller projects (anything below both thresholds, kubernetes included) are unchanged: same
+  answers, same store, no new files or background work.
+- Precise tier from SCIP (milestone 6): `fox scip import <index.scip> [--project P]` reads an
+  index your own build produced (scip-java, rust-analyzer `scip`, scip-python, scip-typescript,
+  scip-go) and makes the tree-sitter references it covers precise, `guess 1 of N` labels
+  included. Per-file freshness by content: a document is trusted only when the index embedded
+  its text and that text is the current file, with fallback to tree-sitter for changed files.
+  Documents without text (the default for most indexers) are ignored unless the import is given
+  `--trust-mtime`, which is opt-in because a modification time cannot prove what the indexer read;
+  a re-import replaces the previous one. `fox status` shows the SCIP tier and its freshness;
+  `fox drift` reports a symbol moved to another file by its SCIP id. No new dependency, and
+  nothing changes for a project without an import.
+
 ## 0.1.0 (2026-11-16)
 
 First release. Linux x86_64 binary tarball (`fox`, `foxd`, skill, README, AGENTS-SETUP, CHANGELOG,

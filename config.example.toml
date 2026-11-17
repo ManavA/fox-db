@@ -3,6 +3,10 @@
 # Use an external codanna binary (~/.foxdb/bin/codanna) instead of the built-in tree-sitter index.
 codanna = false
 
+# The vector arm for questions in words (builds with --features vectors; run `fox vectors setup`
+# first, which downloads the model only after naming it). Off unless true.
+vectors = false
+
 # Swift/Xcode module (target) name -> platform tag appended to symbol hits as " [tag]".
 [module_tags]
 MyAppTV = "tvOS"
@@ -12,3 +16,15 @@ MyAppMobile = "iOS"
 # the default, which keeps zero-context ("goldfish") reviewers zero-context.
 [hooks]
 skip_agents = ["egm-*", "*goldfish*", "*reviewer*"]
+
+# Full-text engine per project. "fts5" (default) never uses tantivy. "auto" (opt-in) gives a
+# project of at least tantivy_min_docs rows a tantivy index kept by foxd (builds with the tantivy
+# feature); smaller projects keep SQLite FTS5 only. "tantivy" gives every project one.
+# [search.projects] overrides it by project name. tantivy is faster on very big projects but its
+# recall trails FTS5 on some query sets (docs/benchmarks.md).
+[search]
+backend = "fts5"
+tantivy_min_docs = 1000000
+
+[search.projects]
+# linux = "tantivy"
