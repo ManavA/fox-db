@@ -1,7 +1,7 @@
 # foxdb
 
-foxdb is a local code graph and index for coding agents. One SQLite file
-(`~/.foxdb/fox.db`) holds every project you work in: files, directories, Markdown doc
+foxdb is a local code graph and index for coding agents. One SQLite db 
+holds every project you work in: files, directories, Markdown doc
 sections, milestone logs, Claude Code memory notes, code symbols and their call graph
 (Swift from Xcode's index store, 18 more languages through built-in tree-sitter). Agents
 reach it through a small CLI (`fox`), an optional daemon (`foxd`) and an MCP server with four
