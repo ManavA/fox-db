@@ -336,3 +336,21 @@ fn the_cut_marker_call_returns_the_cut_lines() {
     let more: Vec<&str> = full.lines().filter(|l| !l.contains("cut short") && !kept.contains(l)).collect();
     assert!(!more.is_empty() && !full.contains("cut short"), "the marker's call did not give back the cut lines:\n{full}");
 }
+
+/// The brief names the MCP tools an agent can call (it may have no shell for the `fox` CLI), and
+/// that pointer survives a brief that was cut short for its budget.
+#[test]
+fn brief_names_the_mcp_tools_even_when_cut() {
+    let _g = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    let (_home, repo) = setup();
+    indexed_long(repo.path());
+    for h in [hook::Harness::Claude, hook::Harness::Codex] {
+        let input = serde_json::json!({"hook_event_name": "SessionStart", "source": "startup", "cwd": repo.path()}).to_string();
+        let v: serde_json::Value = serde_json::from_str(&hook::run("session-start", &input, h)).unwrap();
+        let s = v["hookSpecificOutput"]["additionalContext"].as_str().unwrap().to_string();
+        assert!(s.contains("cut short"), "the fixture must overflow the budget: {s}");
+        for tool in ["fox_find", "fox_graph", "fox_read", "fox_memory"] {
+            assert!(s.contains(tool), "{h:?} brief does not name {tool}:\n{s}");
+        }
+    }
+}

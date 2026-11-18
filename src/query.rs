@@ -288,6 +288,9 @@ pub fn brief(c: &Connection, p: &Project, branch: Option<&str>, budget: usize) -
     if p.kind == "huge" {
         out.line("home/root directory: name-only inventory, nothing parsed.");
     }
+    // Second line, so a brief cut for its budget still says how to call foxdb. MCP tools first:
+    // an agent may have no shell for the CLI.
+    out.line("before grepping: fox_find q=… (symbols, files, docs, milestones, memory) · fox_graph target=… rel=callers|impact · fox_read target=… · fox_memory op=recall; CLI: fox find|code|mem");
 
     // Current gate: pinned milestone-log section, first 3 meaningful lines.
     let gate: Option<(i64, String, i64, i64)> = c
@@ -380,9 +383,7 @@ pub fn brief(c: &Connection, p: &Project, branch: Option<&str>, budget: usize) -
             |r| r.get(0),
         )
         .unwrap_or(0);
-    out.line(&format!(
-        "fox find <q> [--kind file|doc|milestone|dir|memory] searches this project + {mem} global memory notes; fox status."
-    ));
+    out.line(&format!("fox_find also covers {mem} global memory notes (kind=memory); fox status lists indexed projects."));
     // Volatile part last, so a change here only invalidates the cache from this line on.
     if let Some(l) = crate::savings::brief_line(c) {
         out.line(&l);
