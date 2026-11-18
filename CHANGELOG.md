@@ -1,5 +1,37 @@
 # Changelog
 
+## 0.2.2 (unreleased)
+
+`impact` finds much more of what a change breaks and says when it may have missed something; the
+session brief names the MCP tools.
+
+- The SessionStart and SubagentStart brief names the `fox_find`, `fox_graph`, `fox_read` and
+  `fox_memory` MCP tools on its second line, with the `fox` CLI as the fallback, so an agent with
+  no shell can still use foxdb. The line stays when a long brief is cut for its budget.
+- `impact` keeps uses at a file's top level (a C command table, a Python module-level call, a
+  test registered inside an anonymous callback). The file is listed as `  :line (top)` at the
+  depth it first appears, counted in the totals and not followed further.
+- A function passed as a value is a reference: C and C++ initializer list elements and call
+  arguments, Go identifier arguments, Python arguments, keyword values and base classes, and
+  JS/TS arguments. A parameter or local of the same name is not. A value read through a receiver
+  (`f(res.status)`) resolves to a member in another file only through an import or the exact
+  type name.
+- Dispatch: a method's `impact` also lists callers of the interface or base methods it
+  implements or overrides (` via Router.add`), and an interface method's `impact` lists its
+  implementations (` implements Router.add`) and their callers. Supertypes come from TS
+  `implements`/`extends`, Python base classes and Kotlin; a Go type implements an interface when
+  it has all of its method names.
+- Go package calls (`stats.Register()`) prefer the package named by the full import path over
+  other packages whose last directory has the same name.
+- `impact` adds lines starting `partial at dN:` when the walk stopped (5000 dependents, or past
+  depth 4) or when a call named like a dependent was guessed to another same-name definition in
+  a file the answer does not list. The existing "also appears in N other files" check now covers
+  every file the answer lists at any depth.
+- A paged `fox code` or board answer ends `+N more (answer cut) · cursor=K`. Search footers and
+  the MCP tool definitions are unchanged.
+- The store moves to schema 16: on the next index run, C, C++, Go, Python, TypeScript and
+  JavaScript files parse again once, and every project re-scores its references.
+
 ## 0.2.1 (2026-11-17)
 
 Caller and impact answers no longer look complete when they are not, and more calls resolve.

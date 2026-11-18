@@ -211,7 +211,7 @@ Example exchange:
 
 ```
 → {"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"fox_find","arguments":{"q":"config","budget":150}}}
-← {"id":2,"jsonrpc":"2.0","result":{"content":[{"text":"~c:1af struct Config  src/config.rs:9  refs:0\n~c:366 module config  src/lib.rs:7  refs:0\nd:4d § Config  docs/usage.md:47\n~c:522 function config  tests/retrieval.rs:70  refs:0\nf:ac config.example.toml:1  [text 572B]\n+27 more (answer cut) · cursor=5\n","type":"text"}],"isError":false}}
+← {"id":2,"jsonrpc":"2.0","result":{"content":[{"text":"~c:1af struct Config  src/config.rs:9  refs:0\n~c:366 module config  src/lib.rs:7  refs:0\nd:4d § Config  docs/usage.md:47\n~c:522 function config  tests/retrieval.rs:70  refs:0\nf:ac config.example.toml:1  [text 572B]\n+27 more · cursor=5\n","type":"text"}],"isError":false}}
 ```
 
 `fox_memory {"op":"note","text":"Decided to keep the WAL store"}` replies `saved g:… (29 chars)`;
