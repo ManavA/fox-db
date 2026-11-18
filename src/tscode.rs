@@ -108,7 +108,8 @@ fn sites(c: &Connection, targets: &[i64], calls_only: bool, lines: &mut Vec<Stri
     let ids = targets.iter().map(i64::to_string).collect::<Vec<_>>().join(",");
     let kind = if calls_only { "AND r.kind = 'call'" } else { "" };
     let sql = format!(
-        "SELECT r.path, r.line, r.src, s.name, json_extract(s.meta,'$.parent'), r.amb, r.recv, r.via, json_extract(d.meta,'$.parent')
+        "SELECT r.path, r.line, r.src, s.name, json_extract(s.meta,'$.parent'), r.amb, r.recv, r.via, json_extract(d.meta,'$.parent'),
+                d.path, r.project_id
          FROM ts_ref r LEFT JOIN node s ON s.id = r.src LEFT JOIN node d ON d.id = r.dst
          WHERE r.dst != 0 AND r.dst IN ({ids}) {kind} ORDER BY r.path, r.line"
     );
@@ -118,7 +119,8 @@ fn sites(c: &Connection, targets: &[i64], calls_only: bool, lines: &mut Vec<Stri
     let mut by: BTreeMap<String, Vec<Who>> = BTreeMap::new();
     let mut seen = HashSet::new();
     let (mut n, mut guessed, mut weak) = (0, 0, 0);
-    for (path, line, src, sname, sparent, amb, recv, via, dparent) in q
+    let mut imports = FileImportNames::default();
+    for (path, line, src, sname, sparent, amb, recv, via, dparent, dpath, pid) in q
         .query_map([], |r| {
             Ok((
                 r.get::<_, String>(0)?,
@@ -130,6 +132,8 @@ fn sites(c: &Connection, targets: &[i64], calls_only: bool, lines: &mut Vec<Stri
                 r.get::<_, bool>(6)?,
                 r.get::<_, Option<String>>(7)?,
                 r.get::<_, Option<String>>(8)?,
+                r.get::<_, Option<String>>(9)?,
+                r.get::<_, i64>(10)?,
             ))
         })?
         .flatten()
@@ -137,7 +141,9 @@ fn sites(c: &Connection, targets: &[i64], calls_only: bool, lines: &mut Vec<Stri
         if !seen.insert((path.clone(), line, src)) {
             continue;
         }
-        if is_weak(amb, recv, via.as_deref(), dparent.as_deref()) {
+        if is_weak(amb, recv, via.as_deref(), dparent.as_deref())
+            && !imports.reach(c, pid, &path, dpath.as_deref().unwrap_or(""), dparent.as_deref())?
+        {
             weak += 1;
             continue;
         }
@@ -179,6 +185,39 @@ fn sites(c: &Connection, targets: &[i64], calls_only: bool, lines: &mut Vec<Stri
 /// A guess among more same-name definitions than this says nothing about which one is meant
 /// (`response.close()` with dozens of `close` methods): counted, not listed.
 const WEAK_GUESS: i64 = 8;
+
+/// Each calling file's imports, read once per file: a guess whose target's type or module the
+/// caller imports by name (`from scrapy.extensions.memdebug import MemoryDebugger`, then
+/// `ext.spider_closed()`) is no weak guess. A shared module stem (`conn`) says nothing.
+#[derive(Default)]
+struct FileImportNames(HashMap<String, (HashSet<String>, Vec<String>)>);
+
+impl FileImportNames {
+    fn reach(&mut self, c: &Connection, pid: i64, from: &str, target_path: &str, target_parent: Option<&str>) -> Result<bool> {
+        if !self.0.contains_key(from) {
+            let mut q = c.prepare_cached("SELECT name, via FROM ts_ref WHERE project_id = ?1 AND path = ?2 AND kind = 'import'")?;
+            let (mut names, mut modules) = (HashSet::new(), vec![]);
+            for (name, via) in q.query_map(params![pid, from], |r| Ok((r.get::<_, String>(0)?, r.get::<_, Option<String>>(1)?)))?.flatten()
+            {
+                for n in std::iter::once(name).chain(via) {
+                    let n = n.trim_matches('"');
+                    names.extend(n.rsplit(['.', '/', ':']).next().map(str::to_string));
+                    // A module of two or more parts (`scrapy.extensions.memdebug`, `pkg/b/stats`).
+                    let m = n.trim_start_matches('.').replace('.', "/");
+                    if m.contains('/') {
+                        modules.push(m);
+                    }
+                }
+            }
+            self.0.insert(from.to_string(), (names, modules));
+        }
+        let (names, modules) = &self.0[from];
+        let ty = target_parent.map(|p| p.rsplit('.').next().unwrap_or(p)).unwrap_or("");
+        let stem = target_path.rsplit_once('.').map_or(target_path, |x| x.0);
+        let ends = |a: &str, b: &str| a == b || a.ends_with(b) && a[..a.len() - b.len()].ends_with('/');
+        Ok(!ty.is_empty() && names.contains(ty) || modules.iter().any(|m| ends(stem, m)))
+    }
+}
 
 /// A guess among more than [`WEAK_GUESS`] candidates with no receiver named like the target's
 /// type (`router.match()` for `Router.match` is informative; `response.close()` is not).
@@ -472,7 +511,8 @@ fn impact(c: &Connection, pid: i64, top: &TSym, depth: usize, lines: &mut Vec<St
     let mut leaf: HashMap<i64, bool> = HashMap::new();
     // Dependents (or top-level files) whose only link so far is a weak guess.
     let mut weak: HashSet<(i64, String, usize)> = HashSet::new();
-    let mut parents: HashMap<i64, Option<String>> = HashMap::new();
+    let mut parents: HashMap<i64, (String, Option<String>)> = HashMap::new();
+    let mut imports = FileImportNames::default();
     let mut disp: HashMap<i64, Disp> = HashMap::new();
     let mut disp_top: HashMap<String, Disp> = HashMap::new();
     for m in &dsp.up {
@@ -520,8 +560,9 @@ fn impact(c: &Connection, pid: i64, top: &TSym, depth: usize, lines: &mut Vec<St
             .flatten()
         {
             if amb > WEAK_GUESS && {
-                let parent = parents.entry(dst).or_insert_with(|| by_id(c, dst).and_then(|t| t.parent));
-                is_weak(amb, recv, rvia.as_deref(), parent.as_deref())
+                let (dpath, parent) =
+                    parents.entry(dst).or_insert_with(|| by_id(c, dst).map(|t| (t.path, t.parent)).unwrap_or_default()).clone();
+                is_weak(amb, recv, rvia.as_deref(), parent.as_deref()) && !imports.reach(c, pid, &path, &dpath, parent.as_deref())?
             } {
                 if src == 0 || !guess.contains_key(&src) {
                     weak.insert((src, path.clone(), d));

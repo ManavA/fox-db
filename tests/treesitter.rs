@@ -1047,7 +1047,7 @@ fn weak_guesses_are_counted_not_listed() {
     let _g = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
     let mut files: Vec<(String, String)> =
         (0..12).map(|i| (format!("m{i}/conn.py"), format!("class Conn{i}:\n    def close(self):\n        pass\n"))).collect();
-    files.push(("t/test_resp.py".into(), "import m0.conn\n\n\ndef test_close(response):\n    response.close()\n".into()));
+    files.push(("t/test_resp.py".into(), "from shared import conn\n\n\ndef test_close(response):\n    response.close()\n".into()));
     let refs: Vec<(&str, &str)> = files.iter().map(|(a, b)| (a.as_str(), b.as_str())).collect();
     let (_h, _r, p) = inline_project(&refs);
     let c = db::open_ro().unwrap();
