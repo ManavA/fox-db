@@ -72,11 +72,11 @@ pub fn tiered(rows: &[Row], offset: usize, budget_tokens: usize, max_rows: usize
     match (tier, hidden) {
         (Tier::Full, 0) => {}
         (Tier::Full, n) => {
-            let _ = writeln!(out, "+{n} more (answer cut) \u{b7} cursor={next}");
+            let _ = writeln!(out, "+{n} more \u{b7} cursor={next}");
         }
         (t, n) => {
             let what = if t == Tier::Skeleton { "skeleton rows" } else { "ids only" };
-            let more = if n > 0 { format!("+{n} more (answer cut) \u{b7} cursor={next} \u{b7} ") } else { String::new() };
+            let more = if n > 0 { format!("+{n} more \u{b7} cursor={next} \u{b7} ") } else { String::new() };
             let _ = writeln!(out, "{more}{what} to fit the budget; fox_read <handle> expands one, or raise budget");
         }
     }
@@ -173,7 +173,7 @@ mod tests {
         let (out, t) = tiered(&r, 0, 190, 20);
         assert_eq!(t, Tier::Full, "{out}");
         assert_eq!(shown(&out), r.iter().take(TOP_ROWS).map(|x| x.full.as_str()).collect::<Vec<_>>(), "{out}");
-        assert!(out.ends_with(&format!("+15 more (answer cut) \u{b7} cursor={TOP_ROWS}\n")), "{out}");
+        assert!(out.ends_with(&format!("+15 more \u{b7} cursor={TOP_ROWS}\n")), "{out}");
         // The cursor continues where the page stopped.
         let (next, _) = tiered(&r, TOP_ROWS, 190, 20);
         assert_eq!(shown(&next)[0], r[TOP_ROWS].full, "{next}");

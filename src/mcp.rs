@@ -1,6 +1,6 @@
 //! `fox mcp`: MCP stdio server (newline-delimited JSON-RPC) exposing four tools.
 //! Output is compact line text under a token budget (bytes = 4 x tokens), with short handles and
-//! `+N more (answer cut) · cursor=K` footers. Fail-open: a tool error is a one-line `isError` result, never a crash.
+//! `+N more · cursor=K` footers. Fail-open: a tool error is a one-line `isError` result, never a crash.
 
 use crate::{bg, codanna, code, db, project, query, redact};
 use anyhow::{Result, bail};

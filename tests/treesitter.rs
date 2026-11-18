@@ -608,8 +608,8 @@ fn impact_follows_interface_dispatch() {
         ),
         ("src/router/use.ts", "import { LinearRouter } from './linear'\n\nexport function build() {\n  new LinearRouter().add('/')\n}\n"),
         (
-            "src/hono.ts",
-            "import { Router } from './router'\n\nexport class Hono {\n  router: Router\n  route(p: string) {\n    this.router.add(p)\n  }\n}\n",
+            "src/server.ts",
+            "import { Router } from './router'\n\nexport class Server {\n  router: Router\n  route(p: string) {\n    this.router.add(p)\n  }\n}\n",
         ),
         (
             "pkg/cfg/flags.go",
@@ -625,12 +625,12 @@ fn impact_follows_interface_dispatch() {
     ]);
     // An implementation: the interface's callers.
     let out = fox_code(&p, "LinearRouter.add", "impact", 2000);
-    assert!(out.contains(":5 Hono.route c:") && out.contains(" via Router.add"), "{out}");
+    assert!(out.contains(":5 Server.route c:") && out.contains(" via Router.add"), "{out}");
     assert!(out.contains(":3 build c:"), "{out}");
     // The interface method: its implementations, then their callers.
     let out = fox_code(&p, "Router.add", "impact", 2000);
     assert!(out.contains(":4 LinearRouter.add c:") && out.contains(" implements Router.add"), "{out}");
-    assert!(out.contains(":5 Hono.route c:") && out.contains(":3 build c:"), "{out}");
+    assert!(out.contains(":5 Server.route c:") && out.contains(":3 build c:"), "{out}");
     // Go: Flags has every method of Getter, Partial does not.
     let out = fox_code(&p, "Flags.ToConfig", "impact", 2000);
     assert!(out.contains(":5 Run c:") && out.contains(" via Getter.ToConfig"), "{out}");

@@ -328,7 +328,7 @@ note, `x:` session digest, `h:` handoff. Pass a handle to `fox_read` or `fox_gra
 re-searching. `~` marks a result that is not compiler-resolved; treat `callers` as a lower bound.
 
 **Budgets.** `budget` is in tokens (default 500, max 4000). Under a tight budget rows shrink
-(full, then skeleton, then ids) before any are dropped. `+N more (answer cut) · cursor=K` means the answer is cut: call again
+(full, then skeleton, then ids) before any are dropped. `+N more · cursor=K` or `+N more (answer cut) · cursor=K` means the answer is cut: call again
 with `cursor=K`; narrow the query before raising the budget. A repeated `fox_read` returns
 `= already sent …`; pass `fresh=true` only if that text has left your context.
 

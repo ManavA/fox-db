@@ -26,7 +26,7 @@ Every session starts with a `foxdb · <project> ...` brief (SessionStart hook). 
 
 Conventions
 - Rows start with a handle (`s:`/`c:` symbol, `f:` file, `d:` doc, `m:` milestone, `a:` dir, `g:` memory, `x:` session, `h:` handoff) and end in `path:line`.
-- Every tool takes `budget` (tokens, default 500). Under a tight budget rows shrink (full, then skeleton, then ids) before any are dropped; `fox_read <handle>` expands one. `+N more (answer cut) · cursor=K` means the answer is cut; pass `cursor=K` for the rest.
+- Every tool takes `budget` (tokens, default 500). Under a tight budget rows shrink (full, then skeleton, then ids) before any are dropped; `fox_read <handle>` expands one. `+N more · cursor=K` or `+N more (answer cut) · cursor=K` means the answer is cut; pass `cursor=K` for the rest.
 - `~` = not compiler-resolved (tree-sitter, or a Swift file changed since the last build). Treat `callers` as a lower bound for non-Swift code.
 - A repeated `fox_read` returns `= already sent ...`; pass `fresh=true` if that text is no longer in your context.
 - Secrets are never read or indexed; notes, handoffs and session digests are redacted. If a `fox` call errors or is missing, continue without it.
