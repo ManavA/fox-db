@@ -18,13 +18,18 @@ session brief names the MCP tools.
   and `catch` parameters; Go `select` and type-switch variables), nor is an all-caps C constant
   or macro (`elog(ERROR, ...)`). A parameter hides the name only in its own function, lambda or
   comprehension; a name taken from `require(...)` or a module-level rebinding of a definition
-  (`main = click.command(main)`) hides nothing. A value read through a receiver (`f(request.id)`) resolves to a
+  (`main = click.command(main)`) hides nothing. A call of a parameter or local
+  (`def load(parse): parse(s)`, a Go closure) calls no definition. A definition inside a function
+  is visible only inside that function, where it shadows same-name definitions outside (a nested
+  `to_str` no longer claims the rest of its file's `to_str()` calls). A value read through a receiver (`f(request.id)`) resolves to a
   member only through `self`/`this`, an import or the exact type name, in its own file too.
 - Python and JS: a bare name never resolves to a method, and a call through another object's
   receiver (`self.connection.close()`) is no longer certain to reach a same-file method. A name
   imported from a module (`import { X } from "./m"`, `from pkg.core import X`, including a
-  package that re-exports it) resolves to that module's definition; one imported from outside the
-  project resolves to none of the project's.
+  package that re-exports it, and `from m import x as y`) resolves to that module's definition;
+  one imported from a module the project does not hold (`from json import loads as parse`, a JS
+  package) resolves to none of the project's. A Python name imported from a project module that
+  only re-exports it under another name is left unresolved.
 - A call guessed among more than eight same-name definitions through a receiver named unlike the
   target's type (`response.close()` with dozens of `close` methods) is no longer listed as a
   caller or dependent; the header counts it (`, 3 weak guesses left out`) and a `partial` or
@@ -38,7 +43,8 @@ session brief names the MCP tools.
   type implements an interface when it has every method of it, embedded interfaces included (an
   interface embedding one outside the project is skipped), and the link has evidence: both in one
   directory, or a file of the type's package that imports the interface's package (by its full
-  path: a standard library `log` is not the project's `internal/log`) and names the interface. A caller of the interface method found only by a name guess is listed but not
+  path: a standard library `log` is not the project's `internal/log`) and names the interface.
+  A Go qualifier is the name the file uses for an import (its alias, else its last segment). A caller of the interface method found only by a name guess is listed but not
   followed further, and in Python and JS only counts through `self`/`this` or a receiver named
   like the base type. A capped candidate list adds a `partial at d1:` line.
 - Go package-qualified calls (`stats.Register()`) prefer the package named by the full import
@@ -55,7 +61,10 @@ session brief names the MCP tools.
   every file the answer lists at any depth.
 - A paged `fox code` or board answer ends `+N more (answer cut) · cursor=K`. Search footers and
   the MCP tool definitions are unchanged.
-- The store moves to schema 18: on the next index run every code file parses again once, and
+- Known gaps: a C++ method call (`s.compute()`) can resolve to a same-name free function, a
+  TypeScript default import used under another name is not followed, and a call through a Go
+  parameter typed as an embedded interface does not dispatch.
+- The store moves to schema 19: on the next index run every code file parses again once, and
   every project re-scores its references.
 
 ## 0.2.1 (2026-11-17)

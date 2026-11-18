@@ -221,7 +221,9 @@ fn walk_tree<'t>(root: tree_sitter::Node<'t>, src: &[u8]) -> Walk<'t> {
             }
             if let Some(p) = anc.last()
                 && (VALUE_SLOTS.contains(&p.kind())
-                    || RECEIVER_PARENTS.contains(&p.kind()) && p.named_child(0).is_some_and(|f| f.id() == n.id()))
+                    || RECEIVER_PARENTS.contains(&p.kind()) && p.named_child(0).is_some_and(|f| f.id() == n.id())
+                    || matches!(p.kind(), "call" | "call_expression")
+                        && p.child_by_field_name("function").is_some_and(|f| f.id() == n.id()))
             {
                 uses.push((n.start_byte(), scope, name.to_string()));
             }
@@ -434,9 +436,12 @@ pub fn extract(l: &Lang, src: &[u8]) -> Parsed {
             // A value in an argument list, keyed literal or initializer (`f(name)`, `Name: name`,
             // `.size = size`) that names a parameter or local is no function reference; nor is a
             // C constant or macro (`elog(ERROR, ...)`).
-            if ref_kind(k) == "ref"
-                && (walk.locals.contains(&nn.start_byte())
-                    || c_family && name.chars().any(|ch| ch.is_ascii_uppercase()) && !name.chars().any(|ch| ch.is_lowercase()))
+            // A call of a parameter or local (`def load(parse): parse(s)`) calls no definition.
+            if matches!(ref_kind(k), "ref" | "call") && walk.locals.contains(&nn.start_byte())
+                || ref_kind(k) == "ref"
+                    && c_family
+                    && name.chars().any(|ch| ch.is_ascii_uppercase())
+                    && !name.chars().any(|ch| ch.is_lowercase())
             {
                 continue;
             }
@@ -463,7 +468,7 @@ pub fn extract(l: &Lang, src: &[u8]) -> Parsed {
     if !walk.file_locals.is_empty() {
         let defined: HashSet<&str> = out.defs.iter().map(|d| d.name.as_str()).collect();
         let hidden: HashSet<usize> = walk.file_locals.iter().filter(|(_, n)| !defined.contains(n.as_str())).map(|(pos, _)| *pos).collect();
-        out.refs.retain(|r| r.kind != "ref" || !hidden.contains(&r.pos));
+        out.refs.retain(|r| !matches!(r.kind, "ref" | "call") || !hidden.contains(&r.pos));
     }
     nest(&mut out);
     out
@@ -481,6 +486,8 @@ fn import_source(n: tree_sitter::Node, parents: &HashMap<usize, tree_sitter::Nod
                 return Some(s.trim_matches(['"', '\'', '`']).to_string());
             }
             "import_from_statement" => return p.child_by_field_name("module_name")?.utf8_text(src).ok().map(str::to_string),
+            // Go: the alias (`ilog "example.com/m/internal/log"`).
+            "import_spec" => return p.child_by_field_name("name")?.utf8_text(src).ok().map(str::to_string),
             _ => cur = p,
         }
     }
@@ -1122,6 +1129,8 @@ struct RefRow {
     amb: i64,
     /// Container of the calling definition (-1 when unknown).
     caller_parent: i64,
+    /// The calling definition and the definitions enclosing it, innermost first.
+    enclosing: Vec<i64>,
     /// Last name of the receiver (`Evaluator` in `pl.Evaluator.Preempt()`).
     via: Option<String>,
     line: i64,
@@ -1135,6 +1144,14 @@ pub(crate) fn go_import_names_dir(imp: &str, dir: &str) -> bool {
     let ends = |a: &str, b: &str| a == b || a.ends_with(b) && a[..a.len() - b.len()].ends_with('/');
     let domain = imp.split('/').next().is_some_and(|f| f.contains('.'));
     imp.contains('/') && ends(imp, dir) || domain && ends(dir, imp)
+}
+
+/// Go: is import `m` the package in `dir`? Its full path names the directory, or a
+/// domain-qualified path (`example.com/m/models`) ends in the directory's last name. A standard
+/// library path (`log`) is never a project package (`internal/log`).
+fn go_import_is_dir(m: &Import, dir: &str) -> bool {
+    let domain = m.raw.contains('/') && m.raw.split('/').next().is_some_and(|f| f.contains('.'));
+    go_import_names_dir(&m.raw, dir) || domain && m.last == dir.rsplit('/').next().unwrap_or("")
 }
 
 /// `a/./b/../c` -> `a/c`.
@@ -1159,13 +1176,20 @@ struct Import {
     pkg: String,
     /// The import as written (`example.com/m/internal/log`).
     raw: String,
+    /// Go: the name the package is used by in the file (its alias, else its last segment).
+    qual: String,
 }
 
 impl Import {
     fn parse(name: &str) -> Import {
         let n = name.trim().trim_end_matches(';');
         let (pkg, last) = n.rsplit_once(['.', '/', ':', '\\']).unwrap_or(("", n));
-        Import { last: last.to_string(), pkg: pkg.trim_end_matches(':').replace(['.', ':'], "/"), raw: n.to_string() }
+        Import {
+            last: last.to_string(),
+            pkg: pkg.trim_end_matches(':').replace(['.', ':'], "/"),
+            raw: n.to_string(),
+            qual: last.to_string(),
+        }
     }
 }
 
@@ -1191,9 +1215,17 @@ enum Source {
 }
 
 impl FileImports {
-    fn push(&mut self, name: &str, source: Option<&str>) {
-        let i = Import::parse(name);
-        if let Some(src) = source.filter(|x| !x.is_empty() && *x != name) {
+    fn push(&mut self, name: &str, source: Option<&str>, go: bool) {
+        let mut i = Import::parse(name);
+        if go {
+            // Go: `source` is the import's alias (`ilog "example.com/m/internal/log"`).
+            if let Some(alias) = source.filter(|a| !a.is_empty() && *a != "_" && *a != ".") {
+                i.qual = alias.to_string();
+                self.lasts.insert(alias.to_string());
+                self.all.push(i);
+                return;
+            }
+        } else if let Some(src) = source.filter(|x| !x.is_empty() && *x != name) {
             self.sources.insert(name.to_string(), src.to_string());
         }
         self.lasts.insert(i.last.clone());
@@ -1236,7 +1268,15 @@ impl FileImports {
                 "python" => inside,
                 _ => stem.ends_with("/index") && ends(dir_of(stem), &module),
             };
-        Some(if hit { Source::Match } else { Source::Other })
+        // Python: a name imported from a module names that module's definition and no other;
+        // a module the project does not hold (`json`) names none of the project's.
+        Some(if hit {
+            Source::Match
+        } else if fam == "python" {
+            Source::External
+        } else {
+            Source::Other
+        })
     }
     fn hits(&self, fam: &str, name: &str, s: &Cand) -> bool {
         let dir = dir_of(&s.path);
@@ -1255,13 +1295,11 @@ impl FileImports {
     /// import path (`example.com/m/models`, with a domain) ends in the directory's last name. A
     /// standard library path (`log`) never imports a project package (`internal/log`).
     fn imports_package(&self, dir: &str) -> bool {
-        let last = dir.rsplit('/').next().unwrap_or("");
-        self.lasts.contains(last)
-            && (self.names_dir(dir)
-                || self
-                    .all
-                    .iter()
-                    .any(|m| m.last == last && m.raw.contains('/') && m.raw.split('/').next().is_some_and(|f| f.contains('.'))))
+        self.all.iter().any(|m| go_import_is_dir(m, dir))
+    }
+    /// Go: `qual.Name` reaches a package in `dir`: the import used by that name is that package.
+    fn qualifier_names_dir(&self, qual: &str, dir: &str) -> bool {
+        self.all.iter().any(|m| m.qual == qual && go_import_is_dir(m, dir))
     }
     /// Go: an import path names directory `dir` itself (`example.com/pkg/b/stats` and
     /// `pkg/b/stats`, either one ending with the other), not only a package with its last name.
@@ -1360,7 +1398,7 @@ fn score(r: &RefRow, cands: &[Cand], imp: Option<&FileImports>) -> (i64, i64) {
         if via_hit && s.path == r.path && via.is_some_and(|v| via_match(v, &s.parent) < 20) {
             continue;
         }
-        if pkg_qualified && via.is_some_and(|v| dir_of(&s.path).rsplit('/').next() != Some(v)) {
+        if pkg_qualified && via.is_some_and(|v| !imp.is_some_and(|i| i.qualifier_names_dir(v, dir_of(&s.path)))) {
             continue;
         }
         let member = s.pid != 0 || !s.parent.is_empty();
@@ -1382,8 +1420,9 @@ fn score(r: &RefRow, cands: &[Cand], imp: Option<&FileImports>) -> (i64, i64) {
         let own_receiver = via.is_some_and(|v| SELF_NAMES.contains(&v) || via_match(v, &s.parent) == 20)
             || !call && s.pid != 0 && s.pid == r.caller_parent;
         let same_file = s.path == r.path && !(r.recv && member && (dynamic || !call) && !own_receiver);
-        // Local declarations (inside a function) and C `static` ones are only visible in their own file.
-        if s.path != r.path && (s.local || s.file_local) || has_def && s.decl {
+        // A definition inside a function is visible only inside that function; C `static` ones
+        // only in their own file.
+        if s.local && (s.path != r.path || !r.enclosing.contains(&s.pid)) || s.path != r.path && s.file_local || has_def && s.decl {
             continue;
         }
         // A value read through a receiver (`f(res.status)`) is mostly a field: it names a member
@@ -1413,6 +1452,10 @@ fn score(r: &RefRow, cands: &[Cand], imp: Option<&FileImports>) -> (i64, i64) {
         };
         if s.pid != 0 && s.pid == r.caller_parent {
             score += 15;
+        }
+        // A definition in an enclosing function (only those reach this far) shadows one outside.
+        if s.local {
+            score += 30;
         }
         // The receiver is named like the candidate's type (`inputs.render()` -> `Inputs`,
         // `pl.Evaluator.Preempt()` -> `Evaluator`, an embedded field), or like its last word
@@ -1496,6 +1539,7 @@ fn map_ref(r: &rusqlite::Row) -> rusqlite::Result<RefRow> {
         recv_local: r.get::<_, i64>(6)? == 2,
         amb: r.get(7)?,
         caller_parent: -1,
+        enclosing: vec![],
         line: r.get(8)?,
         via: r.get(9)?,
     })
@@ -1534,7 +1578,8 @@ pub fn resolve_scoped(tx: &Connection, pid: i64, scope: Option<(&HashSet<String>
             let mut q = tx.prepare(&format!("SELECT {REF_COLS} FROM ts_ref NOT INDEXED WHERE project_id = ?1"))?;
             for r in q.query_map([pid], map_ref)?.flatten() {
                 if r.kind == "import" {
-                    imports.entry(r.path.clone()).or_default().push(&r.name, r.via.as_deref());
+                    let go = lang::for_path(&r.path).is_some_and(|l| l.family == "go");
+                    imports.entry(r.path.clone()).or_default().push(&r.name, r.via.as_deref(), go);
                 } else {
                     refs.push(r);
                 }
@@ -1558,9 +1603,10 @@ pub fn resolve_scoped(tx: &Connection, pid: i64, scope: Option<(&HashSet<String>
             let files: HashSet<&str> = refs.iter().map(|r| r.path.as_str()).collect();
             let mut q = tx.prepare_cached("SELECT name, via FROM ts_ref WHERE project_id = ?1 AND path = ?2 AND kind = 'import'")?;
             for f in files {
+                let go = lang::for_path(f).is_some_and(|l| l.family == "go");
                 let e = imports.entry(f.to_string()).or_default();
                 for (n, v) in q.query_map(params![pid, f], |r| Ok((r.get::<_, String>(0)?, r.get::<_, Option<String>>(1)?)))?.flatten() {
-                    e.push(&n, v.as_deref());
+                    e.push(&n, v.as_deref(), go);
                 }
             }
         }
@@ -1598,10 +1644,24 @@ pub fn resolve_scoped(tx: &Connection, pid: i64, scope: Option<(&HashSet<String>
                 refs.iter().map(|r| r.src).chain(cands.values().flatten().map(|c| c.pid)).filter(|&i| i != 0).collect();
             want.sort_unstable();
             want.dedup();
-            for id in want {
-                if let Ok((p, k)) = one.query_row([id], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?))) {
-                    parent_of.insert(id, (p, is_callable_kind(&k)));
+            // Up the chain of each calling definition too (a call in a nested function).
+            for _ in 0..8 {
+                let mut next = vec![];
+                for id in want {
+                    if parent_of.contains_key(&id) {
+                        continue;
+                    }
+                    if let Ok((p, k)) = one.query_row([id], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?))) {
+                        parent_of.insert(id, (p, is_callable_kind(&k)));
+                        if p != 0 {
+                            next.push(p);
+                        }
+                    }
                 }
+                if next.is_empty() {
+                    break;
+                }
+                want = next;
             }
         }
     }
@@ -1612,6 +1672,11 @@ pub fn resolve_scoped(tx: &Connection, pid: i64, scope: Option<(&HashSet<String>
     }
     for r in refs.iter_mut() {
         r.caller_parent = parent_of.get(&r.src).map(|p| p.0).unwrap_or(-1);
+        let mut cur = r.src;
+        while cur != 0 && r.enclosing.len() < 16 {
+            r.enclosing.push(cur);
+            cur = parent_of.get(&cur).map_or(0, |p| p.0);
+        }
     }
     trace("resolve: candidates loaded", t0);
     // 3. Score in parallel; write only what changed.
@@ -1734,6 +1799,7 @@ mod via_tests {
             recv_local: false,
             amb: 0,
             caller_parent: -1,
+            enclosing: vec![],
             via: Some(via.into()),
             line: 9,
         }
@@ -1745,16 +1811,16 @@ mod via_tests {
     #[test]
     fn import_path_preference_is_for_package_qualified_calls() {
         let mut imp = FileImports::default();
-        imp.push("example.com/pkg/other", None);
-        imp.push("example.com/pkg/rest", None);
-        imp.push("example.com/pkg/b/stats", None);
+        imp.push("example.com/pkg/other", None, true);
+        imp.push("example.com/pkg/rest", None, true);
+        imp.push("example.com/pkg/b/stats", None, true);
         let cands = [cand(1, "pkg/other/thing.go", "method", "Thing"), cand(2, "pkg/rest/client.go", "method", "RESTClient")];
         assert_ne!(score(&call("Get", "Header"), &cands, Some(&imp)).0, 2);
         let cands = [cand(1, "pkg/a/stats/s.go", "function", ""), cand(2, "pkg/b/stats/s.go", "function", "")];
         assert_eq!(score(&call("Compute", "stats"), &cands, Some(&imp)).0, 2);
         // A standard library import names no project package of the same last name.
         let mut std_log = FileImports::default();
-        std_log.push("log", None);
+        std_log.push("log", None, true);
         let cands = [cand(1, "internal/log/log.go", "function", "")];
         assert_eq!(score(&call("Printf", "log"), &cands, Some(&std_log)).0, 0);
     }

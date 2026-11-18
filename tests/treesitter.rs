@@ -1061,3 +1061,64 @@ fn weak_guesses_are_counted_not_listed() {
     assert!(!out.contains("test_close") && out.contains("1 weak guess left out"), "{out}");
     assert!(out.contains("\npartial at d1: 1 call guessed among many same-name definitions was left out"), "{out}");
 }
+
+/// A definition inside a function is visible only inside it, a parameter or local of the same
+/// name shadows a call too, and a name imported from a module outside the project (`json`)
+/// names none of the project's definitions.
+#[test]
+fn nested_definitions_locals_and_outside_imports_do_not_claim_calls() {
+    let _g = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    let (_h, _r, p) = inline_project(&[
+        (
+            "py4/m.py",
+            "def parse(s):\n    return s\n\ndef load2(parse):\n    return parse(\"y\")\n\ndef load3():\n    parse = make()\n    return parse(\"z\")\n\ndef load4():\n    return [parse(x) for parse in []]\n\ndef make():\n    return None\n\ndef real(s):\n    return parse(s)\n",
+        ),
+        ("py4/n.py", "from json import loads as parse\ndef load(s):\n    return parse(s)\n"),
+        ("py4/o.py", "from json import parse\ndef loadx(s):\n    return parse(s)\n"),
+        (
+            "py3/svc.py",
+            "from json import loads as parse\n\ndef helper():\n    def parse(s):\n        return s.strip()\n    return parse(\" x \")\n\ndef load(s):\n    return parse(s)\n",
+        ),
+        (
+            "feed/gen.py",
+            "class Feed:\n    def __init__(self):\n        def to_str(s):\n            return s\n        self.t = to_str(1)\n\n    def add_item(self):\n        def to_str(s):\n            return str(s)\n        return to_str(2)\n",
+        ),
+        (
+            "js/app/use.js",
+            "function parseIt(x) { return x; }\nfunction u4() { const parseIt = (z) => z; return parseIt(4); }\nfunction u5() { try { } catch (parseIt) { return parseIt(5); } }\nfunction u6() { return parseIt(6); }\n",
+        ),
+    ]);
+    let out = fox_code(&p, "py4/m.py", "outline", 800);
+    let id = |out: &str, line: &str| -> String {
+        out.lines().find(|l| l.starts_with(line)).unwrap().split_whitespace().last().unwrap().to_string()
+    };
+    let parse = id(&out, "1 function parse");
+    let out = fox_code(&p, &parse, "callers", 800);
+    assert!(out.contains("1 call sites in 1 files") && out.contains(":18 real c:"), "{out}");
+    let out = fox_code(&p, "helper.parse", "callers", 800);
+    assert!(out.contains("1 call sites") && out.contains(":6 helper c:"), "{out}");
+    let out = fox_code(&p, "Feed.__init__.to_str", "callers", 800);
+    assert!(out.contains("1 call sites") && out.contains(":5 Feed.__init__"), "{out}");
+    let out = fox_code(&p, "js/app/use.js", "outline", 800);
+    let parse_it = id(&out, "1 function parseIt");
+    let out = fox_code(&p, &parse_it, "callers", 800);
+    assert!(out.contains("1 call sites") && out.contains(":4 u6 c:"), "{out}");
+}
+
+/// Go: a qualifier is the name the file uses for an import (its alias, else its last
+/// segment): the standard library `log.Printf` is not `internal/log.Printf` even when the file
+/// imports that package under another name; a local closure shadows a bare call.
+#[test]
+fn go_qualifiers_follow_import_aliases() {
+    let _g = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    let (_h, _r, p) = inline_project(&[
+        ("go.mod", "module example.com/p2\n\ngo 1.21\n"),
+        ("internal/log/log.go", "package log\n\nfunc Printf(f string) {}\n"),
+        (
+            "cmd/x/main.go",
+            "package main\n\nimport (\n\t\"log\"\n\tilog \"example.com/p2/internal/log\"\n)\n\nfunc stdonly() { log.Printf(\"x\") }\nfunc proj() { ilog.Printf(\"z\") }\nfunc local() {\n\tPrintf := func(s string) {}\n\tPrintf(\"y\")\n}\n",
+        ),
+    ]);
+    let out = fox_code(&p, "Printf", "callers", 800);
+    assert!(out.contains("1 call sites in 1 files") && out.contains(":9 proj c:"), "{out}");
+}
