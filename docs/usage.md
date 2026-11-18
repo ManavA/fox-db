@@ -143,7 +143,7 @@ $ fox code src/tiers.rs --rel outline --budget 70     # a path outlines the whol
  170 method hit c:342
 175 function build c:343
 189 function classify_dir c:344
-+6 more · cursor=10
++6 more (answer cut) · cursor=10
 
 $ fox code c:345 --rel callees
 callees of ~c:345 function classify_file  src/tiers.rs:212
@@ -156,7 +156,7 @@ src/
   :41 function map c:330 @220
 ~ tree-sitter, name-resolved
 
-$ fox code is_secret_name --rel impact   # transitive callers, grouped by depth and file
+$ fox code is_secret_name --rel impact   # transitive dependents, grouped by depth and file
 impact of ~c:33d function is_secret_name  src/tiers.rs:90: 2 symbols; per depth 2/0
 d1
  src/tiers.rs
@@ -211,7 +211,7 @@ Example exchange:
 
 ```
 → {"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"fox_find","arguments":{"q":"config","budget":150}}}
-← {"id":2,"jsonrpc":"2.0","result":{"content":[{"text":"~c:1af struct Config  src/config.rs:9  refs:0\n~c:366 module config  src/lib.rs:7  refs:0\nd:4d § Config  docs/usage.md:47\n~c:522 function config  tests/retrieval.rs:70  refs:0\nf:ac config.example.toml:1  [text 572B]\n+27 more · cursor=5\n","type":"text"}],"isError":false}}
+← {"id":2,"jsonrpc":"2.0","result":{"content":[{"text":"~c:1af struct Config  src/config.rs:9  refs:0\n~c:366 module config  src/lib.rs:7  refs:0\nd:4d § Config  docs/usage.md:47\n~c:522 function config  tests/retrieval.rs:70  refs:0\nf:ac config.example.toml:1  [text 572B]\n+27 more (answer cut) · cursor=5\n","type":"text"}],"isError":false}}
 ```
 
 `fox_memory {"op":"note","text":"Decided to keep the WAL store"}` replies `saved g:… (29 chars)`;
@@ -222,7 +222,7 @@ Example exchange:
 - Every row starts with a handle: `s:` symbol (index store), `c:` tree-sitter symbol, `f:` file, `d:` doc section, `m:` milestone, `a:` summarized dir, `g:` memory, `x:` session, `h:` handoff. Every row ends in an exact `path:line`. Pass a handle (or a `Type.member` name) to `fox_graph` / `fox_read` / `fox code`.
 - `budget` is in tokens (default 500, max 4000). Search answers shrink gracefully: a page that fits as full rows is sent whole; otherwise the top five rows are sent in the richest form they fit (full, else skeleton: handle, kind, name, `path:line`, else ids: handle, `path:line`), with a `cursor` for the rest. A shorter form says so in the footer, and `fox_read <handle>` expands a row. A tight budget never trades the best rows' detail for a long tail of ids.
 - A large `fox_read` answer this session already received comes back as one line, `= already sent in this session: <handle> ...`; `fresh=true` resends it. The CLI does the same for `fox code --rel src|outline` when `FOXDB_SESSION` is set (`--fresh` resends); through `foxd` the client sends its own session with each request. This covers foxdb's own answers only. Rows are terse: relative paths, each directory and file printed once as a header, line numbers instead of code (ask `src` for code).
-- A footer `+N more · cursor=K` means: call again with `cursor=K` for the next page. Narrow the query before raising the budget.
+- A footer `+N more (answer cut) · cursor=K` means the answer is incomplete as shown: call again with `cursor=K` for the next page. Narrow the query before raising the budget.
 - `~` on a row means not compiler-resolved: a tree-sitter result, or a Swift symbol whose file changed since the last build (lines may have drifted; `src` relocates by name).
 
 ## Claude Code setup
@@ -464,6 +464,7 @@ a test checks the tool list, instructions, briefs, answers and the report schema
 
 - Swift symbols need an Xcode index store (a build must have run); unbuilt targets only show `~` tree-sitter rows. On Linux Swift needs `FOXDB_INDEXSTORE_LIB`.
 - Non-Swift callers are name-resolved by tree-sitter, not type-checked, unless a fresh SCIP import covers the file (see [Precise tier](#precise-tier-scip)); treat `callers` and `impact` as a lower bound. A call through a receiver resolves by its last name: certainly when the receiver is named like the type (`inputs.render()` reaches `Inputs.render`), as a guess when the name has several words and at most three members share it, and not at all for one-word names (`push`, `get`) with no scope signal, so calls on interfaces, generics and library types are often missed. C free functions resolve across the project, but calls through function pointers and macros are not seen. Guessed rows are marked `guess 1 of N` (or `guess by name` for a lone candidate) and counted in the header (`12 call sites in 4 files, 5 guessed by name`).
+- `impact` lists, level by level, the definitions that call or name the symbol (a function passed as an argument or named in an initializer table counts), and files that use it at their top level (a C command table, a Python module-level call, a test registered inside an anonymous callback) as `  :line (top)`; such a file is counted but not followed further. Through dispatch it also lists the callers of the interface or base methods the symbol implements or overrides (` via Router.add`) and, for an interface method, its implementations (` implements Router.add`) and their callers; Go types match interfaces by their method names. Lines starting `partial at dN:` say where the answer may be missing something: the name occurs in files the first level does not list, some dependents were found only through name guesses, or the walk stopped (5000 dependents, or past depth 4).
 - When the name occurs in more files than an answer lists, `callers` and `refs` add `may be incomplete: ... confirm with: rg -nw name` and `impact` adds `partial at d1: ...`. The count comes from the index alone (references of that name not resolved elsewhere, and every code file holding the name as a whole word, case as typed, anywhere in the file), so it also counts comments, strings, same-name locals and fields, and other same-name definitions' callers, and leaves out files that define a same-name symbol; it is a prompt to check, not a ground truth.
 - Type references (a type used in a signature) are not recorded for most languages, so `refs` of a type mostly lists constructor calls and supertype lists.
 - Search is lexical, trigram, name-prefix and graph based; there is no fuzzy or embedding search.

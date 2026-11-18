@@ -386,8 +386,9 @@ fn callers_say_when_the_name_occurs_in_unlisted_files() {
         ),
         "{out}"
     );
+    // The callbacks are references: impact lists their users, and nothing is missing.
     let out = fox_code(&p, "wake_task", "impact", 800);
-    assert!(out.contains("\npartial at d1: `wake_task` also appears in 2 other files"), "{out}");
+    assert!(out.contains(":2 use_a c:") && out.contains(":1 use_b c:") && !out.contains("partial"), "{out}");
     let out = fox_code(&p, "run", "callers", 800);
     assert!(!out.contains("may be incomplete"), "{out}");
 }
@@ -434,9 +435,11 @@ fn completeness_counts_one_word_names_and_uses_outside_symbols() {
         ("lib/fs.c", "int simple_open(void) { return 0; }\n"),
         ("drivers/x.c", "#define FOPS(n) static const struct fops n = { .open = simple_open }\n"),
     ]);
-    for (rel, lead) in [("callers", "may be incomplete"), ("refs", "may be incomplete"), ("impact", "partial at d1")] {
+    // The argument in src/arg.c is a resolved reference: listed by `refs` and `impact`, still
+    // unknown to `callers` (what `apply` calls through it is not followed).
+    for (rel, lead, n) in [("callers", "may be incomplete", 4), ("refs", "may be incomplete", 3), ("impact", "partial at d1", 3)] {
         let out = fox_code(&p, "helper", rel, 800);
-        assert!(out.contains(&format!("{lead}: `helper` also appears in 4 other files")), "{rel}: {out}");
+        assert!(out.contains(&format!("{lead}: `helper` also appears in {n} other files")), "{rel}: {out}");
     }
     let out = fox_code(&p, "simple_open", "refs", 800);
     assert!(out.contains("may be incomplete: `simple_open` also appears in 1 other file;"), "{out}");
@@ -522,4 +525,162 @@ fn local_values_in_initializers_are_not_function_references() {
     }
     assert!(fox_code(&p, "runIt", "refs", 800).contains("1 refs in 1 files"));
     assert!(fox_code(&p, "open_dev", "refs", 800).contains("1 refs in 1 files"));
+}
+
+/// A use at file top level (a C command table, a Python module-level call, a test registered
+/// inside an anonymous callback) makes its file a dependent: the file is listed with its lines
+/// as `(top)` and counted, and the walk stops there (no symbol to expand).
+#[test]
+fn impact_lists_top_level_uses_as_file_dependents() {
+    let _g = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    let (_h, _r, p) = inline_project(&[
+        ("lib/run.c", "int run_one(int a) { return a; }\n"),
+        ("builtin/add.c", "int cmd_add(int a) { return run_one(a); }\n"),
+        ("git.c", "struct cmd { const char *n; int (*f)(int); };\nstatic struct cmd commands[] = {\n\t{ \"add\", cmd_add },\n};\n"),
+        ("tools/fmt.py", "def fmt(x):\n    return x\n"),
+        ("tools/main.py", "from tools.fmt import fmt\n\nprint(fmt(1))\n"),
+        ("src/utils/color.ts", "export function getColor(): boolean {\n  return true\n}\n"),
+        (
+            "src/utils/color.test.ts",
+            "import { getColor } from './color'\n\ndescribe('color', () => {\n  it('works', () => {\n    expect(getColor()).toBe(true)\n  })\n})\n",
+        ),
+    ]);
+    let out = fox_code(&p, "run_one", "impact", 2000);
+    assert!(out.contains("d1\n builtin/add.c\n  :1 cmd_add c:"), "{out}");
+    assert!(out.contains("d2\n git.c\n  :3 (top)\n"), "{out}");
+    assert!(out.contains(": 1 symbols, 1 files at top level; per depth 1/1"), "{out}");
+    assert!(!out.contains("partial"), "a complete answer carries no warning: {out}");
+    let out = fox_code(&p, "fmt", "impact", 2000);
+    assert!(out.contains(" tools/main.py\n  :3 (top)\n"), "{out}");
+    let out = fox_code(&p, "getColor", "impact", 2000);
+    assert!(out.contains(" src/utils/color.test.ts\n  :5 (top)\n"), "{out}");
+}
+
+/// A function passed as an argument (a C callback, a Go function value, a Python bound method
+/// or keyword callback, a JS handler) is a reference, so its user is a dependent; a parameter
+/// or local of the same name passed along is not.
+#[test]
+fn functions_passed_as_arguments_are_dependents() {
+    let _g = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    let (_h, _r, p) = inline_project(&[
+        (
+            "revision.c",
+            "static int handle_one(const char *r, void *cb) { return 0; }\nint each_ref(int (*fn)(const char *, void *), void *cb);\nint add_all(void *cb) { return each_ref(handle_one, cb); }\nint pass_on(void *handle_one) { return each_ref(0, handle_one); }\n",
+        ),
+        ("pkg/a/a.go", "package a\n\nfunc worker() {}\n\nfunc Until(f func()) {}\n\nfunc Run() { Until(worker) }\n\nfunc Other(worker func()) { Until(worker) }\n"),
+        (
+            "ext/logcount.py",
+            "class LogCount:\n    @classmethod\n    def from_crawler(cls, crawler):\n        o = cls()\n        crawler.signals.connect(o.spider_opened, signal=1)\n        crawler.engine.schedule(callback=o.spider_closed)\n        return o\n\n    def spider_opened(self, spider):\n        pass\n\n    def spider_closed(self, spider):\n        pass\n",
+        ),
+        ("src/handler.ts", "export function onError(e: Error) {\n  return e\n}\n"),
+        (
+            "src/app.ts",
+            "import { onError } from './handler'\n\nexport function setup(app: any) {\n  app.onError(onError)\n}\n\nexport function relay(onError: any) {\n  return [onError]\n}\n",
+        ),
+    ]);
+    let out = fox_code(&p, "handle_one", "impact", 2000);
+    assert!(out.contains(":3 add_all c:") && !out.contains("pass_on"), "{out}");
+    let out = fox_code(&p, "worker", "impact", 2000);
+    assert!(out.contains(":7 Run c:") && !out.contains("Other"), "{out}");
+    let out = fox_code(&p, "spider_opened", "impact", 2000);
+    assert!(out.contains(":3 LogCount.from_crawler c:"), "{out}");
+    let out = fox_code(&p, "spider_closed", "impact", 2000);
+    assert!(out.contains(":3 LogCount.from_crawler c:"), "{out}");
+    let out = fox_code(&p, "onError", "impact", 2000);
+    assert!(out.contains(":3 setup c:") && !out.contains("relay"), "{out}");
+}
+
+/// Dispatch: a call through an interface (or base) method may reach each implementation, so
+/// impact of an implementation lists the interface's callers, and impact of an interface method
+/// lists its implementations and their callers. Go types implement interfaces by their method
+/// sets; TypeScript and Python name their supertypes.
+#[test]
+fn impact_follows_interface_dispatch() {
+    let _g = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    let (_h, _r, p) = inline_project(&[
+        ("src/router.ts", "export interface Router {\n  add(path: string): void\n  match(path: string): string\n}\n"),
+        (
+            "src/router/linear.ts",
+            "import { Router } from '../router'\n\nexport class LinearRouter implements Router {\n  add(path: string) {}\n  match(path: string) { return path }\n}\n",
+        ),
+        ("src/router/use.ts", "import { LinearRouter } from './linear'\n\nexport function build() {\n  new LinearRouter().add('/')\n}\n"),
+        (
+            "src/hono.ts",
+            "import { Router } from './router'\n\nexport class Hono {\n  router: Router\n  route(p: string) {\n    this.router.add(p)\n  }\n}\n",
+        ),
+        (
+            "pkg/cfg/flags.go",
+            "package cfg\n\ntype Getter interface {\n\tToConfig() int\n\tToMapper() int\n}\n\ntype Flags struct{}\n\nfunc (f *Flags) ToConfig() int { return 1 }\n\nfunc (f *Flags) ToMapper() int { return 2 }\n\ntype Partial struct{}\n\nfunc (p *Partial) ToConfig() int { return 3 }\n",
+        ),
+        ("pkg/cmd/run.go", "package cmd\n\nimport \"example.com/pkg/cfg\"\n\nfunc Run(g cfg.Getter) int { return g.ToConfig() }\n"),
+        ("ext/base.py", "class Base:\n    def close(self):\n        pass\n"),
+        ("ext/disk.py", "from ext.base import Base\n\n\nclass Disk(Base):\n    def close(self):\n        pass\n"),
+        ("ext/use.py", "from ext.base import Base\n\n\ndef shutdown(b: Base):\n    Base.close(b)\n"),
+    ]);
+    // An implementation: the interface's callers.
+    let out = fox_code(&p, "LinearRouter.add", "impact", 2000);
+    assert!(out.contains(":5 Hono.route c:") && out.contains(" via Router.add"), "{out}");
+    assert!(out.contains(":3 build c:"), "{out}");
+    // The interface method: its implementations, then their callers.
+    let out = fox_code(&p, "Router.add", "impact", 2000);
+    assert!(out.contains(":4 LinearRouter.add c:") && out.contains(" implements Router.add"), "{out}");
+    assert!(out.contains(":5 Hono.route c:") && out.contains(":3 build c:"), "{out}");
+    // Go: Flags has every method of Getter, Partial does not.
+    let out = fox_code(&p, "Flags.ToConfig", "impact", 2000);
+    assert!(out.contains(":5 Run c:") && out.contains(" via Getter.ToConfig"), "{out}");
+    let out = fox_code(&p, "Partial.ToConfig", "impact", 2000);
+    assert!(!out.contains("Run"), "{out}");
+    let out = fox_code(&p, "Getter.ToConfig", "impact", 2000);
+    assert!(out.contains("Flags.ToConfig") && !out.contains("Partial.ToConfig"), "{out}");
+    // Python: a subclass override is reached through calls to the base method.
+    let out = fox_code(&p, "Disk.close", "impact", 2000);
+    assert!(out.contains(":4 shutdown c:") && out.contains(" via Base.close"), "{out}");
+}
+
+/// The walk says when it stopped early: past the deepest level it walks while dependents
+/// remain, or through name guesses. A walk that ends on its own says nothing.
+#[test]
+fn impact_says_when_the_walk_was_cut_or_guessed() {
+    let _g = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    let (_h, _r, p) = inline_project(&[
+        ("chain.c", "int f0(void) { return 0; }\nint f1(void) { return f0(); }\nint f2(void) { return f1(); }\nint f3(void) { return f2(); }\nint f4(void) { return f3(); }\nint f5(void) { return f4(); }\n"),
+        ("x/a.c", "int pick_one(void) { return 0; }\n"),
+        ("y/b.c", "int pick_one(void) { return 1; }\n"),
+        ("z/use.c", "int user(void) { return pick_one(); }\n"),
+    ]);
+    let c = db::open_ro().unwrap();
+    let run = |sym: &str, depth: usize| code::run(&c, &p, sym, &code::CodeOpts { rel: "impact", depth, budget: 2000, cursor: 0, fallback: false }).unwrap();
+    let out = run("f0", 6);
+    assert!(out.contains("\npartial at d4: dependents continue past depth 4"), "{out}");
+    let out = run("f0", 4);
+    assert!(!out.contains("partial"), "the depth asked for is no cut: {out}");
+    let out = run("f3", 4);
+    assert!(!out.contains("partial"), "{out}");
+    // `pick_one` has two definitions and no scope signal: the call is a guess.
+    let dst: i64 = c.query_row("SELECT dst FROM ts_ref WHERE path = 'z/use.c' AND name = 'pick_one'", [], |r| r.get(0)).unwrap();
+    let out = run(&format!("c:{dst:x}"), 2);
+    assert!(out.contains("\npartial at d1: 1 dependent found only through name guesses"), "{out}");
+}
+
+/// Go: a call through a package name reaches the package its import path names, not a
+/// same-name function in another package with the same last directory.
+#[test]
+fn go_package_calls_follow_the_full_import_path() {
+    let _g = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    let (_h, _r, p) = inline_project(&[
+        ("pkg/a/stats/stats.go", "package stats\n\nfunc Register() {}\n"),
+        ("pkg/b/stats/stats.go", "package stats\n\nfunc Register() {}\n"),
+        ("pkg/c/stats/stats.go", "package stats\n\nfunc Register() {}\n"),
+        ("pkg/b/ctl.go", "package b\n\nimport \"example.com/pkg/b/stats\"\n\nfunc NewController() { stats.Register() }\n"),
+    ]);
+    let c = db::open_ro().unwrap();
+    let id = |dir: &str| -> i64 {
+        c.query_row("SELECT id FROM node WHERE name = 'Register' AND path = ?1", [format!("pkg/{dir}/stats/stats.go")], |r| r.get(0)).unwrap()
+    };
+    let out = fox_code(&p, &format!("c:{:x}", id("b")), "callers", 800);
+    assert!(out.contains("1 call sites in 1 files") && out.contains("NewController"), "{out}");
+    for other in ["a", "c"] {
+        let out = fox_code(&p, &format!("c:{:x}", id(other)), "callers", 800);
+        assert!(out.contains("0 call sites"), "{other}: {out}");
+    }
 }

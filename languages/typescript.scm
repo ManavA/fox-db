@@ -19,3 +19,7 @@
 (type_annotation
   (type_identifier) @name) @reference.type
 
+; Named supertypes (`implements Router`, `extends Base`, `interface A extends B`): a reference from the type.
+(implements_clause [(type_identifier) @name (generic_type name: (type_identifier) @name)]) @reference.implementation
+(extends_clause value: [(identifier) @name (member_expression property: (property_identifier) @name)]) @reference.implementation
+(extends_type_clause type: [(type_identifier) @name (generic_type name: (type_identifier) @name)]) @reference.implementation

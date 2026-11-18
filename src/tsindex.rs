@@ -131,30 +131,61 @@ fn receiver_name(n: tree_sitter::Node, src: &[u8]) -> Option<String> {
 }
 
 /// Function-like nodes whose parameters and locals can shadow a function name.
-const FN_KINDS: &[&str] = &["function_declaration", "method_declaration", "func_literal", "function_definition", "lambda_expression"];
+const FN_KINDS: &[&str] = &[
+    "function_declaration",
+    "method_declaration",
+    "func_literal",
+    "function_definition",
+    "lambda_expression",
+    "lambda",
+    "arrow_function",
+    "method_definition",
+    "function_expression",
+    "function",
+    "generator_function_declaration",
+];
 
-/// Is the identifier `n` declared as a parameter or local of the outermost function enclosing it
-/// (Go `name := ...`, `var name`, `func f(name string)`; C `int size`, `void f(int size)`)?
-fn is_local(n: tree_sitter::Node, src: &[u8]) -> bool {
-    let Ok(name) = n.utf8_text(src) else { return false };
-    let mut f = None;
-    let mut cur = n.parent();
-    while let Some(x) = cur {
-        if FN_KINDS.contains(&x.kind()) {
-            f = Some(x);
+/// Parents of a value slot whose identifier may name a function (an argument, an initializer
+/// element, a keyed value), or just a parameter or local of the enclosing function.
+const VALUE_SLOTS: &[&str] =
+    &["literal_element", "initializer_pair", "initializer_list", "argument_list", "arguments", "keyword_argument"];
+
+/// The names declared as parameters or locals in each outermost function, computed once per
+/// function (a file passes many identifiers as arguments).
+#[derive(Default)]
+struct Locals(HashMap<usize, HashSet<String>>);
+
+impl Locals {
+    /// Is the identifier `n` declared as a parameter or local of the outermost function enclosing
+    /// it (Go `name := ...`, `var name`, `func f(name string)`; C `int size`; Python and JS
+    /// parameters and assignments)?
+    fn is_local(&mut self, n: tree_sitter::Node, src: &[u8]) -> bool {
+        let Ok(name) = n.utf8_text(src) else { return false };
+        let mut f = None;
+        let mut cur = n.parent();
+        while let Some(x) = cur {
+            if FN_KINDS.contains(&x.kind()) {
+                f = Some(x);
+            }
+            cur = x.parent();
         }
-        cur = x.parent();
+        let Some(f) = f else { return false };
+        self.0
+            .entry(f.id())
+            .or_insert_with(|| {
+                let mut names = HashSet::new();
+                let mut stack = vec![f];
+                while let Some(x) = stack.pop() {
+                    if x.kind() == "identifier" && declares(x) {
+                        names.extend(x.utf8_text(src).ok().map(str::to_string));
+                    }
+                    let mut w = x.walk();
+                    stack.extend(x.named_children(&mut w));
+                }
+                names
+            })
+            .contains(name)
     }
-    let Some(f) = f else { return false };
-    let mut stack = vec![f];
-    while let Some(x) = stack.pop() {
-        if x.kind() == "identifier" && x.id() != n.id() && x.utf8_text(src).is_ok_and(|t| t == name) && declares(x) {
-            return true;
-        }
-        let mut w = x.walk();
-        stack.extend(x.named_children(&mut w));
-    }
-    false
 }
 
 /// Is identifier `x` in a declaring position: a parameter or variable name, not a use?
@@ -163,6 +194,15 @@ fn declares(x: tree_sitter::Node) -> bool {
     let mut c = x;
     while let Some(p) = c.parent() {
         match p.kind() {
+            // Python and JS parameters, Python assignments and loop targets, JS declarators.
+            "parameters" | "lambda_parameters" | "formal_parameters" => return true,
+            "default_parameter" | "typed_default_parameter" => return is_field(p, "name", c),
+            "typed_parameter" => return !is_field(p, "type", c),
+            "assignment" | "for_statement" | "for_in_statement" | "assignment_pattern" => return is_field(p, "left", c),
+            "variable_declarator" => return is_field(p, "name", c),
+            "required_parameter" | "optional_parameter" => return is_field(p, "pattern", c),
+            "arrow_function" => return is_field(p, "parameter", c),
+            "pattern_list" | "tuple_pattern" | "array_pattern" | "object_pattern" | "shorthand_property_identifier_pattern" => c = p,
             // Go: `name := ...` and `for name := range ...` (the left-hand list).
             "expression_list" => {
                 return p.parent().is_some_and(|g| matches!(g.kind(), "short_var_declaration" | "range_clause") && is_field(g, "left", p));
@@ -201,6 +241,7 @@ pub fn extract(l: &Lang, src: &[u8]) -> Parsed {
     let mut cur = QueryCursor::new();
     let mut it = cur.matches(q, tree.root_node(), src);
     let text = |n: tree_sitter::Node| n.utf8_text(src).unwrap_or("").to_string();
+    let mut locals = Locals::default();
     while let Some(m) = it.next() {
         let mut name_node = None;
         let mut outer: Option<(tree_sitter::Node, &str)> = None;
@@ -264,8 +305,8 @@ pub fn extract(l: &Lang, src: &[u8]) -> Parsed {
             // A value in a keyed literal or designated initializer (`Name: name`, `.size = size`)
             // that names a parameter or local of the enclosing function is no function reference.
             if ref_kind(k) == "ref"
-                && nn.parent().is_some_and(|p| matches!(p.kind(), "literal_element" | "initializer_pair"))
-                && is_local(nn, src)
+                && nn.parent().is_some_and(|p| VALUE_SLOTS.contains(&p.kind()))
+                && locals.is_local(nn, src)
             {
                 continue;
             }
@@ -954,6 +995,18 @@ impl FileImports {
             || self.lasts.contains(stem_of(&s.path))
             || fam == "go" && self.lasts.contains(dir.rsplit('/').next().unwrap_or(""))
     }
+    /// Go: an import path names directory `dir` itself (`example.com/pkg/b/stats` and
+    /// `pkg/b/stats`, either one ending with the other), not only a package with its last name.
+    fn names_dir(&self, dir: &str) -> bool {
+        // Import paths keep their dots as slashes (see `Import::parse`); so does `dir` here.
+        let dir = dir.replace('.', "/");
+        !dir.is_empty()
+            && self.all.iter().any(|m| {
+                let full = if m.pkg.is_empty() { m.last.clone() } else { format!("{}/{}", m.pkg, m.last) };
+                let ends = |a: &str, b: &str| a == b || a.ends_with(b) && a[..a.len() - b.len()].ends_with('/');
+                ends(&full, &dir) || ends(&dir, &full)
+            })
+    }
 }
 
 const UNIQUE_FALLBACK: &[&str] = &["c", "bash", "lua", "ruby", "php", "dart", "dotnet", "swift"];
@@ -1043,11 +1096,21 @@ fn score(r: &RefRow, cands: &[Cand], imp: Option<&FileImports>) -> (i64, i64) {
         if !same_file && (s.local || s.file_local) || has_def && s.decl {
             continue;
         }
+        // A value read through a receiver (`f(res.status)`) is mostly a field: it names another
+        // file's member only through an import or a receiver named like the member's type.
+        if !call
+            && r.recv
+            && !same_file
+            && !imp.is_some_and(|v| v.hits(fam, &r.name, s))
+            && via.is_none_or(|v| s.parent.is_empty() || via_match(v, &s.parent) == 0)
+        {
+            continue;
+        }
         eligible += 1;
         let mut score = if same_file {
             100
         } else if imp.is_some_and(|v| v.hits(fam, &r.name, s)) {
-            60
+            if fam == "go" && imp.is_some_and(|v| v.names_dir(dir_of(&s.path))) { 65 } else { 60 }
         } else if dir_of(&s.path) == dir_of(&r.path) {
             40
         } else {

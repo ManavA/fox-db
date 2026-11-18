@@ -10,3 +10,7 @@
 (call_expression function: (field_expression field: (field_identifier) @name)) @reference.call
 ; A function named as a value in a designated initializer (`.open = foo_open`): a reference.
 (initializer_pair value: (identifier) @name) @reference.ref
+; A function named in a positional initializer (`{ "add", cmd_add }`) or passed as an argument
+; (`walk(handle_one, &cb)`): a reference. Parameters and locals are dropped at extraction.
+(initializer_list (identifier) @name) @reference.ref
+(argument_list (identifier) @name) @reference.ref

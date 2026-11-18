@@ -12,3 +12,6 @@
 (call_expression function: (member_expression property: (property_identifier) @name) arguments: (_) @reference.call)
 (new_expression constructor: (identifier) @name) @reference.class
 (import_specifier name: (identifier) @name) @reference.import
+; A function or method passed as an argument (`app.onError(onError)`, `on(this.handle)`): a reference.
+; Parameters and locals are dropped.
+(arguments [(identifier) @name (member_expression property: (property_identifier) @name)]) @reference.ref

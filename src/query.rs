@@ -70,7 +70,7 @@ pub fn page_n(lines: &[String], offset: usize, budget_tokens: usize, max_rows: u
         shown += 1;
     }
     if shown < lines.len() {
-        let _ = writeln!(out, "+{} more \u{b7} cursor={shown}", lines.len() - shown);
+        let _ = writeln!(out, "+{} more (answer cut) \u{b7} cursor={shown}", lines.len() - shown);
     }
     out
 }

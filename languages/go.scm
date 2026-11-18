@@ -10,3 +10,5 @@
 (import_spec path: (interpreted_string_literal) @name) @reference.import
 ; A function value in a keyed composite literal (`RunE: runCmd`).
 (keyed_element value: (literal_element (identifier) @name)) @reference.ref
+; A function passed as an argument (`wait.Until(worker)`): a reference. Parameters and locals are dropped.
+(argument_list (identifier) @name) @reference.ref

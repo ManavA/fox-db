@@ -357,6 +357,18 @@ pub(crate) fn migrate(c: &Connection) -> Result<()> {
             Ok(())
         })?;
     }
+    if v < 16 {
+        // 0.2.2: functions passed as arguments or named in positional initializers, Python base
+        // classes, TypeScript `implements` / `extends`, and stricter scoring of values read
+        // through a receiver. Files of the changed grammars parse again on the next index run,
+        // and every project with references re-scores them all once.
+        c.execute_batch(
+            "UPDATE ts_file SET hash = '', size = -1 WHERE lang IN ('c', 'cpp', 'go', 'python', 'typescript', 'tsx', 'javascript');
+             INSERT OR REPLACE INTO meta(k, v)
+               SELECT 'rescore:' || p.id, 1 FROM project p WHERE EXISTS (SELECT 1 FROM ts_ref r WHERE r.project_id = p.id);
+             PRAGMA user_version = 16;",
+        )?;
+    }
     // Cheap when already set: the setting lives in each table's own config.
     for t in MERGE_TABLES {
         defer_merges(c, t)?;
@@ -658,7 +670,7 @@ pub fn minority(c: &Connection, ranges: &[(i64, i64)]) -> bool {
 }
 
 /// The schema version this build writes.
-pub const LATEST: i64 = 15;
+pub const LATEST: i64 = 16;
 
 /// Read-only connection for the hot paths. None if the store does not exist yet.
 pub fn open_ro() -> Option<Connection> {

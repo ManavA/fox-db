@@ -256,7 +256,7 @@ fn src_outline_and_paging() {
     // Paging: tiny budget truncates with a cursor, and the cursor continues.
     let o = code::CodeOpts { rel: "callers", depth: 1, budget: 32, cursor: 0, fallback: false };
     let first = code::run(&e.c, &e.p, "Circle.area", &o).unwrap();
-    assert!(first.contains("more \u{b7} cursor="), "{first}");
+    assert!(first.contains("more (answer cut) \u{b7} cursor="), "{first}");
     let cur: usize = first.rsplit("cursor=").next().unwrap().trim().parse().unwrap();
     let o2 = code::CodeOpts { cursor: cur, ..o };
     let second = code::run(&e.c, &e.p, "Circle.area", &o2).unwrap();

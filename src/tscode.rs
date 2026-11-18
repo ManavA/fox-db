@@ -171,26 +171,31 @@ fn sites(c: &Connection, targets: &[i64], calls_only: bool, lines: &mut Vec<Stri
 /// own file: `{lead}: `name` also appears in N other files; confirm with: rg -nw name`. None when
 /// the counts agree. Read from the index only (no file is opened): files with a reference of
 /// that name not resolved with certainty to another symbol, and files holding it as a whole word.
-fn completeness(c: &Connection, pid: i64, top: &TSym, listed: &HashSet<String>, lead: &str) -> Result<Option<String>> {
-    let n = unlisted_files(c, pid, top, listed)?;
+/// With `calls_only`, a file that only names `top` as a value (a callback) still counts: what
+/// it calls through that value is unknown.
+fn completeness(c: &Connection, pid: i64, top: &TSym, listed: &HashSet<String>, calls_only: bool, lead: &str) -> Result<Option<String>> {
+    let n = unlisted_files(c, pid, top, listed, calls_only)?;
     let name = &top.name;
     Ok((n > 0)
         .then(|| format!("{lead}: `{name}` also appears in {n} other file{}; confirm with: rg -nw {name}", if n == 1 { "" } else { "s" })))
 }
 
-fn unlisted_files(c: &Connection, pid: i64, top: &TSym, listed: &HashSet<String>) -> Result<usize> {
+fn unlisted_files(c: &Connection, pid: i64, top: &TSym, listed: &HashSet<String>, calls_only: bool) -> Result<usize> {
     let name = top.name.as_str();
     let mut skip: HashSet<String> = listed.clone();
     skip.insert(top.path.clone());
     // Files with an occurrence that may be ours, and files whose references all go elsewhere.
     let (mut open, mut closed): (HashSet<String>, HashSet<String>) = Default::default();
-    let mut q = c.prepare_cached("SELECT path, dst, amb FROM ts_ref WHERE project_id = ?1 AND name = ?2 AND kind != 'import'")?;
-    for (path, dst, amb) in
-        q.query_map(params![pid, name], |r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?, r.get::<_, i64>(2)?)))?.flatten()
+    let mut q = c.prepare_cached("SELECT path, dst, amb, kind FROM ts_ref WHERE project_id = ?1 AND name = ?2 AND kind != 'import'")?;
+    for (path, dst, amb, kind) in q
+        .query_map(params![pid, name], |r| {
+            Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?, r.get::<_, i64>(2)?, r.get::<_, String>(3)?))
+        })?
+        .flatten()
     {
-        if dst == top.id {
+        if dst == top.id && (!calls_only || kind == "call") {
             skip.insert(path);
-        } else if dst != 0 && amb <= 0 {
+        } else if dst != 0 && dst != top.id && amb <= 0 {
             closed.insert(path);
         } else {
             open.insert(path);
@@ -291,7 +296,7 @@ pub fn run(c: &Connection, p: &Project, sym: &str, rel: &str, depth: usize, curs
             let (n, files, guessed) = sites(c, &[top.id], calls, &mut lines)?;
             let g = if guessed > 0 { format!(", {guessed} guessed by name") } else { String::new() };
             lines.insert(at, format!("{n} {} in {} files{g}", if calls { "call sites" } else { "refs" }, files.len()));
-            if let Some(l) = completeness(c, p.id, top, &files, "may be incomplete")? {
+            if let Some(l) = completeness(c, p.id, top, &files, calls, "may be incomplete")? {
                 lines.insert(at + 1, l);
             }
         }
@@ -348,71 +353,7 @@ pub fn run(c: &Connection, p: &Project, sym: &str, rel: &str, depth: usize, curs
                 lines.push(format!("{}\t{}", i + 1, clip(l, 220)));
             }
         }
-        "impact" => {
-            // Per dependent: None when some chain of certain edges reaches it, else the most
-            // same-name candidates among the guessed edges (0: only through a guessed dependent).
-            let mut guess: HashMap<i64, Option<i64>> = HashMap::from([(top.id, None)]);
-            let mut frontier = vec![top.id];
-            let mut levels: Vec<Vec<i64>> = vec![];
-            for _ in 0..depth.clamp(1, 4) {
-                if frontier.is_empty() || guess.len() > 5000 {
-                    break;
-                }
-                let ids = frontier.iter().map(i64::to_string).collect::<Vec<_>>().join(",");
-                let mut q = c.prepare(&format!("SELECT src, dst, amb FROM ts_ref WHERE dst != 0 AND dst IN ({ids}) AND src != 0"))?;
-                let mut next: Vec<i64> = vec![];
-                let mut found: HashMap<i64, Option<i64>> = HashMap::new();
-                for (src, dst, amb) in q.query_map([], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)?, r.get::<_, i64>(2)?)))?.flatten() {
-                    if guess.contains_key(&src) {
-                        continue;
-                    }
-                    let via = if amb > 0 { Some(amb) } else { guess.get(&dst).copied().flatten().map(|_| 0) };
-                    let e = found.entry(src).or_insert_with(|| {
-                        next.push(src);
-                        via
-                    });
-                    *e = match (*e, via) {
-                        (None, _) | (_, None) => None,
-                        (Some(a), Some(b)) => Some(a.max(b)),
-                    };
-                }
-                guess.extend(found);
-                levels.push(next.clone());
-                frontier = next;
-            }
-            let direct: HashSet<String> = {
-                let mut q = c.prepare_cached("SELECT DISTINCT path FROM ts_ref WHERE dst = ?1 AND dst != 0")?;
-                q.query_map([top.id], |r| r.get::<_, String>(0))?.flatten().collect()
-            };
-            let partial = completeness(c, p.id, top, &direct, "partial at d1")?;
-            let total: usize = levels.iter().map(Vec::len).sum();
-            let guessed = levels.iter().flatten().filter(|i| guess.get(i).is_some_and(Option::is_some)).count();
-            let g = if guessed > 0 { format!(", {guessed} through name guesses") } else { String::new() };
-            lines.push(format!(
-                "impact of {}: {total} symbols; per depth {}{g}",
-                top.row(),
-                levels.iter().map(|l| l.len().to_string()).collect::<Vec<_>>().join("/")
-            ));
-            lines.extend(partial);
-            for (d, lvl) in levels.iter().enumerate() {
-                let mut v: Vec<TSym> = lvl.iter().filter_map(|i| by_id(c, *i)).collect();
-                v.sort_by(|a, b| (&a.path, a.line).cmp(&(&b.path, b.line)));
-                lines.push(format!("d{}", d + 1));
-                let mut last = String::new();
-                for s in v {
-                    if s.path != last {
-                        lines.push(format!(" {}", s.path));
-                        last = s.path.clone();
-                    }
-                    let mark = match guess.get(&s.id).copied().flatten() {
-                        Some(0) => " guess (via a guessed caller)".to_string(),
-                        Some(n) => guess_note(n),
-                        None => String::new(),
-                    };
-                    lines.push(format!("  :{} {} {}{mark}", s.line, s.qname(), s.h()));
-                }
-            }
-        }
+        "impact" => impact(c, p.id, top, depth, &mut lines)?,
         "conforms" | "subtypes" | "extensions" | "overrides" => {
             // Supertype references (`reference.implementation` / `reference.class`) resolved to this type.
             lines.push(format!("{rel} of {}", top.row()));
@@ -427,6 +368,346 @@ pub fn run(c: &Connection, p: &Project, sym: &str, rel: &str, depth: usize, curs
     }
     lines.push("~ tree-sitter, name-resolved".into());
     Ok(Some(page(&lines, cursor, budget)))
+}
+
+/// Most dependents the impact walk collects before it stops.
+const IMPACT_CAP: usize = 5000;
+/// Deepest level the impact walk goes to, whatever depth is asked for.
+const IMPACT_MAX_DEPTH: usize = 4;
+
+/// Per dependent: None when some chain of certain edges reaches it, else the most same-name
+/// candidates among the guessed edges (0: only through a guessed dependent).
+type Guess = Option<i64>;
+
+fn merge_guess(a: Guess, b: Guess) -> Guess {
+    match (a, b) {
+        (None, _) | (_, None) => None,
+        (Some(a), Some(b)) => Some(a.max(b)),
+    }
+}
+
+fn guess_mark(g: Guess) -> String {
+    match g {
+        Some(0) => " guess (via a guessed caller)".to_string(),
+        Some(n) => guess_note(n),
+        None => String::new(),
+    }
+}
+
+/// One level of the impact walk: dependent symbols, and files using the level above at their
+/// top level (lines, guess).
+#[derive(Default)]
+struct Level {
+    syms: Vec<i64>,
+    tops: BTreeMap<String, (Vec<i64>, Guess)>,
+}
+
+/// How a first-level dependent reached `top` through dispatch: a call to the interface or base
+/// method (` via I.m`), or an implementation (` implements I.m`). None: directly.
+type Disp = Option<String>;
+
+fn merge_disp(a: &mut Disp, b: Disp) {
+    if b.is_none() {
+        *a = None;
+    }
+}
+
+/// `impact`: what depends on `top`, level by level. A use outside any definition (file top level)
+/// makes its file a dependent; it has no symbol to expand further. Lines starting `partial` say
+/// where the answer may be missing something: names used in files it does not list, dependents
+/// found only through name guesses, or a walk that stopped early.
+fn impact(c: &Connection, pid: i64, top: &TSym, depth: usize, lines: &mut Vec<String>) -> Result<()> {
+    let mut guess: HashMap<i64, Guess> = HashMap::from([(top.id, None)]);
+    let mut top_seen: HashSet<String> = HashSet::new();
+    let mut frontier = vec![top.id];
+    let mut levels: Vec<Level> = vec![];
+    // Dispatch: calls to the methods `top` implements count as calls to it; implementations of
+    // `top` are first-level dependents.
+    let dsp = dispatch(c, pid, top)?;
+    let up: HashMap<i64, String> = dsp.up.iter().map(|m| (m.id, format!(" via {}", m.qname()))).collect();
+    let mut disp: HashMap<i64, Disp> = HashMap::new();
+    let mut disp_top: HashMap<String, Disp> = HashMap::new();
+    for m in &dsp.up {
+        guess.insert(m.id, None);
+        frontier.push(m.id);
+    }
+    let mut first = Level::default();
+    for m in &dsp.down {
+        if guess.insert(m.id, None).is_none() {
+            first.syms.push(m.id);
+            disp.insert(m.id, Some(format!(" implements {}", top.qname())));
+        }
+    }
+    let mut d1_paths: HashSet<String> = dsp.down.iter().map(|m| m.path.clone()).collect();
+    let max = depth.clamp(1, IMPACT_MAX_DEPTH);
+    let mut cut = None;
+    for d in 0..max {
+        if frontier.is_empty() {
+            break;
+        }
+        if guess.len() > IMPACT_CAP {
+            cut = Some(format!("partial at d{}: stopped after {IMPACT_CAP} dependents", d + 1));
+            break;
+        }
+        let ids = frontier.iter().map(i64::to_string).collect::<Vec<_>>().join(",");
+        let mut q = c.prepare(&format!(
+            "SELECT src, dst, amb, path, line FROM ts_ref WHERE dst != 0 AND dst IN ({ids}) AND (src != 0 OR kind != 'import') ORDER BY path, line"
+        ))?;
+        let mut lvl = if d == 0 { std::mem::take(&mut first) } else { Level::default() };
+        let mut found: HashMap<i64, Guess> = HashMap::new();
+        let mut tops: BTreeMap<String, (Vec<i64>, Guess)> = BTreeMap::new();
+        for (src, dst, amb, path, line) in q
+            .query_map([], |r| {
+                Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)?, r.get::<_, i64>(2)?, r.get::<_, String>(3)?, r.get::<_, i64>(4)?))
+            })?
+            .flatten()
+        {
+            let via = if amb > 0 { Some(amb) } else { guess.get(&dst).copied().flatten().map(|_| 0) };
+            let dl: Disp = if d == 0 { up.get(&dst).cloned() } else { None };
+            if d == 0 {
+                d1_paths.insert(path.clone());
+            }
+            if src == 0 {
+                if top_seen.contains(&path) {
+                    continue;
+                }
+                if d == 0 {
+                    match disp_top.get_mut(&path) {
+                        Some(x) => merge_disp(x, dl),
+                        None => {
+                            disp_top.insert(path.clone(), dl);
+                        }
+                    }
+                }
+                let e = tops.entry(path).or_insert_with(|| (vec![], via));
+                if e.0.last() != Some(&line) {
+                    e.0.push(line);
+                }
+                e.1 = merge_guess(e.1, via);
+                continue;
+            }
+            if guess.contains_key(&src) {
+                continue;
+            }
+            if d == 0 {
+                match disp.get_mut(&src) {
+                    Some(x) => merge_disp(x, dl),
+                    None => {
+                        disp.insert(src, dl);
+                    }
+                }
+            }
+            let e = found.entry(src).or_insert_with(|| {
+                lvl.syms.push(src);
+                via
+            });
+            *e = merge_guess(*e, via);
+        }
+        top_seen.extend(tops.keys().cloned());
+        lvl.tops = tops;
+        guess.extend(found);
+        frontier = lvl.syms.clone();
+        levels.push(lvl);
+    }
+    if cut.is_none() && depth > max && !frontier.is_empty() && has_dependents(c, &frontier, &guess)? {
+        cut = Some(format!("partial at d{max}: dependents continue past depth {max}, the deepest walked"));
+    }
+    let nsyms: usize = levels.iter().map(|l| l.syms.len()).sum();
+    let nfiles: usize = levels.iter().map(|l| l.tops.len()).sum();
+    let guessed = levels
+        .iter()
+        .map(|l| {
+            l.syms.iter().filter(|i| guess.get(i).is_some_and(Option::is_some)).count()
+                + l.tops.values().filter(|t| t.1.is_some()).count()
+        })
+        .sum::<usize>();
+    let g = if guessed > 0 { format!(", {guessed} through name guesses") } else { String::new() };
+    let f = if nfiles > 0 { format!(", {nfiles} files at top level") } else { String::new() };
+    lines.push(format!(
+        "impact of {}: {nsyms} symbols{f}; per depth {}{g}",
+        top.row(),
+        levels.iter().map(|l| (l.syms.len() + l.tops.len()).to_string()).collect::<Vec<_>>().join("/")
+    ));
+    lines.extend(completeness(c, pid, top, &d1_paths, false, "partial at d1")?);
+    if guessed > 0 {
+        let at = levels
+            .iter()
+            .position(|l| l.syms.iter().any(|i| guess.get(i).is_some_and(Option::is_some)) || l.tops.values().any(|t| t.1.is_some()))
+            .unwrap_or(0);
+        lines.push(format!(
+            "partial at d{}: {guessed} dependent{} found only through name guesses (rows marked guess); the real targets may differ",
+            at + 1,
+            if guessed == 1 { "" } else { "s" }
+        ));
+    }
+    lines.extend(cut);
+    for (d, lvl) in levels.iter().enumerate() {
+        lines.push(format!("d{}", d + 1));
+        let mut by: BTreeMap<String, Vec<(i64, String)>> = BTreeMap::new();
+        for s in lvl.syms.iter().filter_map(|i| by_id(c, *i)) {
+            let mark = guess_mark(guess.get(&s.id).copied().flatten()) + disp.get(&s.id).cloned().flatten().as_deref().unwrap_or("");
+            by.entry(s.path.clone()).or_default().push((s.line, format!("  :{} {} {}{mark}", s.line, s.qname(), s.h())));
+        }
+        for (path, (ls, g)) in &lvl.tops {
+            let at = ls.iter().map(i64::to_string).collect::<Vec<_>>().join(",");
+            let dm = if d == 0 { disp_top.get(path).cloned().flatten().unwrap_or_default() } else { String::new() };
+            by.entry(path.clone()).or_default().push((i64::MAX, format!("  :{at} (top){}{dm}", guess_mark(*g))));
+        }
+        for (path, mut rows) in by {
+            rows.sort_by_key(|r| r.0);
+            lines.push(format!(" {path}"));
+            lines.extend(rows.into_iter().map(|r| r.1));
+        }
+    }
+    Ok(())
+}
+
+/// Same-name methods `top` is dispatched with: `up`, the interface or base methods it implements
+/// or overrides (a call to one may reach `top`), and `down`, when `top` is declared in an
+/// interface, the methods implementing it. Named supertypes (`implements`, `extends`, base
+/// classes) are followed both ways; a Go type implements an interface whose methods it all has.
+struct Dispatch {
+    up: Vec<TSym>,
+    down: Vec<TSym>,
+}
+
+const SYM_PID: &str = "COALESCE(json_extract(n.meta, '$.pid'), 0)";
+
+fn dispatch(c: &Connection, pid: i64, top: &TSym) -> Result<Dispatch> {
+    let mut d = Dispatch { up: vec![], down: vec![] };
+    if !is_callable_kind(&top.kind) || top.parent.as_deref().is_none_or(str::is_empty) {
+        return Ok(d);
+    }
+    // Same-name symbols with their containers.
+    let mut q = c.prepare_cached(&format!(
+        "SELECT {COLS}, {SYM_PID} FROM node n INDEXED BY node_sym_name
+         WHERE n.project_id = ?1 AND n.kind = 'symbol' AND n.source = 'treesitter' AND n.name = ?2 LIMIT 2000"
+    ))?;
+    let same: Vec<(TSym, i64)> =
+        q.query_map(params![pid, top.name], |r| Ok((map(r)?, r.get::<_, i64>(7)?)))?.flatten().filter(|(s, _)| s.name == top.name).collect();
+    let fam = |p: &str| crate::lang::for_path(p).map(|l| l.family).unwrap_or("");
+    let same: Vec<(TSym, i64)> = same.into_iter().filter(|(s, _)| s.id != top.id && fam(&s.path) == fam(&top.path)).collect();
+    if same.is_empty() {
+        return Ok(d);
+    }
+    let Some(owner) = owner_type(c, pid, top)? else { return Ok(d) };
+    let ups = related_types(c, owner.id, true)?;
+    let downs = if matches!(owner.kind.as_str(), "interface" | "trait" | "protocol") {
+        related_types(c, owner.id, false)?
+    } else {
+        HashSet::new()
+    };
+    for (s, spid) in &same {
+        let spid = if *spid != 0 { Some(*spid) } else { owner_type(c, pid, s)?.map(|t| t.id) };
+        match spid {
+            Some(t) if ups.contains(&t) => d.up.push(s.clone()),
+            Some(t) if downs.contains(&t) => d.down.push(s.clone()),
+            _ => {}
+        }
+    }
+    // Go: implicit interfaces, by method set (names only), within a bounded candidate list.
+    if fam(&top.path) == "go" {
+        let mut sets: HashMap<i64, HashSet<String>> = HashMap::new();
+        let owner_set = method_set(c, pid, &owner, &mut sets)?;
+        for (s, _) in same.iter().take(200) {
+            if d.up.iter().chain(&d.down).any(|x| x.id == s.id) {
+                continue;
+            }
+            let Some(t) = owner_type(c, pid, s)? else { continue };
+            let t_set = method_set(c, pid, &t, &mut sets)?;
+            if t.kind == "interface" && owner.kind != "interface" && !t_set.is_empty() && t_set.is_subset(&owner_set) {
+                d.up.push(s.clone());
+            } else if owner.kind == "interface" && t.kind != "interface" && !owner_set.is_empty() && owner_set.is_subset(&t_set) {
+                d.down.push(s.clone());
+            }
+        }
+    }
+    Ok(d)
+}
+
+/// The type declaring method `m`: its container, or (Go methods sit outside their type) the
+/// type of that name in the same directory.
+fn owner_type(c: &Connection, pid: i64, m: &TSym) -> Result<Option<TSym>> {
+    let spid: i64 = c.query_row(&format!("SELECT {SYM_PID} FROM node n WHERE n.id = ?1"), [m.id], |r| r.get(0)).unwrap_or(0);
+    if spid != 0 {
+        return Ok(by_id(c, spid).filter(|t| is_type_kind(&t.kind)));
+    }
+    let Some(parent) = m.parent.as_deref().map(|p| p.rsplit('.').next().unwrap_or(p)) else { return Ok(None) };
+    let dir = m.path.rsplit_once('/').map(|x| x.0).unwrap_or("");
+    let mut q = c.prepare_cached(&format!(
+        "SELECT {COLS} FROM node n INDEXED BY node_sym_name
+         WHERE n.project_id = ?1 AND n.kind = 'symbol' AND n.source = 'treesitter' AND n.name = ?2 LIMIT 500"
+    ))?;
+    Ok(q.query_map(params![pid, parent], map)?
+        .flatten()
+        .find(|t| t.name == parent && is_type_kind(&t.kind) && t.path.rsplit_once('/').map(|x| x.0).unwrap_or("") == dir))
+}
+
+/// Types reachable from `t` by named supertype references, upward (`up`) or downward, three
+/// steps at most.
+fn related_types(c: &Connection, t: i64, up: bool) -> Result<HashSet<i64>> {
+    let sql = if up {
+        "SELECT DISTINCT r.dst FROM ts_ref r JOIN node n ON n.id = r.dst WHERE r.src = ?1 AND r.src != 0 AND r.dst != 0 AND r.kind = 'ref'
+           AND json_extract(n.meta,'$.k') IN ('class','interface','object','struct','enum','trait','protocol')"
+    } else {
+        "SELECT DISTINCT r.src FROM ts_ref r JOIN node n ON n.id = r.src WHERE r.dst = ?1 AND r.dst != 0 AND r.kind = 'ref'
+           AND json_extract(n.meta,'$.k') IN ('class','interface','object','struct','enum','trait','protocol')"
+    };
+    let mut q = c.prepare_cached(sql)?;
+    let mut seen: HashSet<i64> = HashSet::new();
+    let mut frontier = vec![t];
+    for _ in 0..3 {
+        let mut next = vec![];
+        for x in frontier {
+            for y in q.query_map([x], |r| r.get::<_, i64>(0))?.flatten() {
+                if y != t && seen.insert(y) {
+                    next.push(y);
+                }
+            }
+        }
+        frontier = next;
+    }
+    Ok(seen)
+}
+
+/// Method names of type `t`: its members, or (Go) the methods named with it as receiver in its
+/// directory.
+fn method_set(c: &Connection, pid: i64, t: &TSym, cache: &mut HashMap<i64, HashSet<String>>) -> Result<HashSet<String>> {
+    if let Some(s) = cache.get(&t.id) {
+        return Ok(s.clone());
+    }
+    let mut set: HashSet<String> = {
+        let mut q = c.prepare_cached(
+            "SELECT name FROM node WHERE kind = 'symbol' AND json_extract(meta, '$.pid') = ?1 AND json_extract(meta,'$.k') = 'method'",
+        )?;
+        q.query_map([t.id], |r| r.get::<_, String>(0))?.flatten().collect()
+    };
+    if t.kind != "interface" {
+        let dir = t.path.rsplit_once('/').map(|x| x.0).unwrap_or("");
+        let lo = if dir.is_empty() { String::new() } else { format!("{dir}/") };
+        let hi = if dir.is_empty() { "\u{10ffff}".to_string() } else { format!("{dir}0") };
+        let mut q = c.prepare_cached(
+            "SELECT name, path FROM node WHERE project_id = ?1 AND path >= ?2 AND path < ?3 AND kind = 'symbol'
+               AND json_extract(meta,'$.k') = 'method' AND json_extract(meta,'$.parent') = ?4",
+        )?;
+        for (name, path) in
+            q.query_map(params![pid, lo, hi, t.name], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))?.flatten()
+        {
+            if !path[lo.len()..].contains('/') {
+                set.insert(name);
+            }
+        }
+    }
+    cache.insert(t.id, set.clone());
+    Ok(set)
+}
+
+/// Does anything not yet walked depend on `ids`?
+fn has_dependents(c: &Connection, ids: &[i64], seen: &HashMap<i64, Guess>) -> Result<bool> {
+    let list = ids.iter().map(i64::to_string).collect::<Vec<_>>().join(",");
+    let mut q = c.prepare(&format!("SELECT src FROM ts_ref WHERE dst != 0 AND dst IN ({list}) AND kind != 'import'"))?;
+    let srcs: Vec<i64> = q.query_map([], |r| r.get::<_, i64>(0))?.flatten().collect();
+    Ok(srcs.iter().any(|s| *s == 0 || !seen.contains_key(s)))
 }
 
 fn outline_file(c: &Connection, p: &Project, rel: &str, cursor: usize, budget: usize) -> Result<Option<String>> {
