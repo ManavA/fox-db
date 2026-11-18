@@ -900,3 +900,121 @@ fn c_all_caps_arguments_are_not_stored() {
         c.query_row("SELECT COUNT(*) FROM ts_ref WHERE project_id = ?1 AND name IN ('ERROR', 'LOG_LEVEL')", [p.id], |r| r.get(0)).unwrap();
     assert_eq!(n, 0);
 }
+
+/// A name declared at file level hides an argument only when it is a plain variable: a name
+/// destructured from `require(...)` is an import, and a module-level rebinding of a definition
+/// (`main = click.command(main)`) is still that definition.
+#[test]
+fn file_level_imports_and_rebindings_are_not_locals() {
+    let _g = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    let (_h, _r, p) = inline_project(&[
+        ("js2/errors.js", "function onError(err) {\n  console.error(err);\n}\nmodule.exports = { onError };\n"),
+        (
+            "js2/server.js",
+            "const express = require(\"express\");\nconst { onError } = require(\"./errors\");\n\nconst app = express();\napp.use(onError);\n\nfunction start() {\n  app.use(onError);\n}\nmodule.exports = { start };\n",
+        ),
+        (
+            "py3/cli.py",
+            "import click\n\n\ndef main(path):\n    return path\n\n\nmain = click.command(main)\n\n\ndef run():\n    dispatch(main)\n\n\ndef dispatch(f):\n    return f\n",
+        ),
+    ]);
+    let out = fox_code(&p, "onError", "impact", 2000);
+    assert!(out.contains(":7 start c:") && out.contains(":5 (top)"), "{out}");
+    let c = db::open_ro().unwrap();
+    let id: i64 = c.query_row("SELECT id FROM node WHERE name = 'main' AND path = 'py3/cli.py' AND line = 4", [], |r| r.get(0)).unwrap();
+    let out = fox_code(&p, &format!("c:{id:x}"), "impact", 2000);
+    assert!(out.contains(":11 run c:"), "{out}");
+}
+
+/// A parameter hides a name only inside its own function, lambda or comprehension, not in the
+/// rest of the enclosing function.
+#[test]
+fn nested_parameters_hide_names_only_in_their_own_scope() {
+    let _g = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    let (_h, _r, p) = inline_project(&[
+        (
+            "py1/app.py",
+            "def handler(event):\n    return event\n\n\ndef register(cb):\n    return cb\n\n\ndef setup(items):\n    register(handler)\n    return sorted(items, key=lambda handler: handler.priority)\n",
+        ),
+        ("js1/errors.js", "function onError(err) {\n  console.error(err);\n}\nmodule.exports = { onError };\n"),
+        (
+            "js1/server.test.js",
+            "import { onError } from \"./errors\";\n\ndescribe(\"server\", () => {\n  it(\"logs failures\", (done) => {\n    app.use(onError);\n    done();\n  });\n\n  it(\"wraps\", () => {\n    wrap((onError) => onError);\n  });\n});\n",
+        ),
+        (
+            "go2/main.go",
+            "package main\n\nfunc worker() {}\n\nfunc until(f func()) { f() }\n\nfunc main() {\n\tuntil(worker)\n\teach(func(worker func()) { worker() })\n}\n\nfunc each(f func(func())) { f(nil) }\n",
+        ),
+    ]);
+    let out = fox_code(&p, "handler", "impact", 2000);
+    assert!(out.contains(":9 setup c:"), "{out}");
+    let out = fox_code(&p, "onError", "impact", 2000);
+    assert!(out.contains(" js1/server.test.js\n  :5 (top)"), "{out}");
+    let out = fox_code(&p, "worker", "impact", 2000);
+    assert!(out.contains(":7 main c:"), "{out}");
+}
+
+/// A supertype is followed for dispatch only when its link is certain: a base class imported
+/// from a package that re-exports it names that package's class, and a type imported from a
+/// module outside the project is not a same-name project interface.
+#[test]
+fn supertypes_follow_explicit_imports() {
+    let _g = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    let (_h, _r, p) = inline_project(&[
+        ("py5/pkg/__init__.py", ""),
+        ("py5/pkg/core/__init__.py", "from pkg.core.base import Base\n"),
+        ("py5/pkg/core/base.py", "class Base:\n    def run(self):\n        return 2\n\n    def go(self):\n        return self.run()\n"),
+        ("py5/pkg/legacy/__init__.py", ""),
+        (
+            "py5/pkg/legacy/base.py",
+            "class Base:\n    def run(self):\n        return 1\n\n    def start(self):\n        return self.run()\n",
+        ),
+        ("py5/pkg/legacy/child.py", "from pkg.core import Base\n\n\nclass Child(Base):\n    def run(self):\n        return 3\n"),
+        (
+            "ts1/src/ext.ts",
+            "import { Handler } from \"some-external-lib\";\n\nexport class ExtHandler implements Handler {\n  handle(req: string): void {\n    console.log(req);\n  }\n}\n",
+        ),
+        (
+            "ts1/src/local.ts",
+            "export interface Handler {\n  handle(req: string): void;\n}\n\nexport function useLocal(h: Handler) {\n  h.handle(\"x\");\n}\n",
+        ),
+    ]);
+    let out = fox_code(&p, "Child.run", "impact", 2000);
+    assert!(!out.contains("Base.start"), "{out}");
+    let out = fox_code(&p, "ExtHandler.handle", "impact", 2000);
+    assert!(!out.contains("useLocal"), "{out}");
+}
+
+/// Go: a standard library import (`"log"`) is no evidence for, nor a call into, a project
+/// package with the same last directory (`internal/log`); a local variable named like an
+/// imported package (`user := ...; user.Save()`) is no package qualifier.
+#[test]
+fn go_stdlib_imports_and_local_receivers_are_not_project_packages() {
+    let _g = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    let (_h, _r, p) = inline_project(&[
+        (
+            "go3/internal/log/log.go",
+            "package log\n\ntype Logger interface {\n\tPrintf(format string, args ...any)\n}\n\nfunc Use(l Logger) {\n\tl.Printf(\"hello\")\n}\n",
+        ),
+        (
+            "go3/app/app.go",
+            "package app\n\nimport \"log\"\n\nvar std *log.Logger\n\ntype quiet struct{}\n\nfunc (q quiet) Printf(format string, args ...any) {}\n",
+        ),
+        (
+            "go1/handler.go",
+            "package main\n\nimport (\n\t\"example.com/m/models\"\n\t\"example.com/m/user\"\n)\n\nfunc touch() error {\n\treturn user.Save()\n}\n\nfunc update(name string) error {\n\tuser := &models.User{Name: name}\n\treturn user.Save()\n}\n",
+        ),
+        ("go1/models/user.go", "package models\n\ntype User struct{ Name string }\n\nfunc (u *User) Save() error {\n\treturn nil\n}\n"),
+        ("go1/user/user.go", "package user\n\nfunc Save() error {\n\treturn nil\n}\n"),
+    ]);
+    let out = fox_code(&p, "Logger.Printf", "impact", 2000);
+    assert!(!out.contains("quiet.Printf"), "{out}");
+    let out = fox_code(&p, "quiet.Printf", "impact", 2000);
+    assert!(!out.contains("Use"), "{out}");
+    let out = fox_code(&p, "User.Save", "impact", 2000);
+    assert!(out.contains("update"), "{out}");
+    let c = db::open_ro().unwrap();
+    let id: i64 = c.query_row("SELECT id FROM node WHERE name = 'Save' AND path = 'go1/user/user.go'", [], |r| r.get(0)).unwrap();
+    let out = fox_code(&p, &format!("c:{id:x}"), "callers", 800);
+    assert!(out.contains("touch") && !out.contains("update"), "{out}");
+}

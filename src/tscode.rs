@@ -759,12 +759,11 @@ fn go_evidence(c: &Connection, pid: i64, iface: &TSym, tdir: &str, ev: &mut Evid
         }
         e.insert(by);
     }
-    let ends = |a: &str, b: &str| a == b || a.ends_with(b) && a[..a.len() - b.len()].ends_with('/');
     let mut imports = c.prepare_cached("SELECT name FROM ts_ref WHERE project_id = ?1 AND path = ?2 AND kind = 'import'")?;
     let mut found = false;
     for f in ev.named.get(&iface.id).and_then(|by| by.get(tdir)).into_iter().flatten() {
         let mut rows = imports.query_map(params![pid, f], |r| r.get::<_, String>(0))?.flatten();
-        if rows.any(|i| ends(i.trim_matches('"'), idir) || ends(idir, i.trim_matches('"'))) {
+        if rows.any(|i| crate::tsindex::go_import_names_dir(i.trim_matches('"'), idir)) {
             found = true;
             break;
         }
@@ -810,11 +809,11 @@ fn owner_type(c: &Connection, pid: i64, m: &TSym, cache: &mut Owners) -> Result<
 fn related_types(c: &Connection, t: i64, up: bool) -> Result<HashSet<i64>> {
     let sql = if up {
         "SELECT DISTINCT r.dst FROM ts_ref r JOIN node n ON n.id = r.dst JOIN node s ON s.id = r.src
-         WHERE r.src = ?1 AND r.src != 0 AND r.dst != 0 AND (r.kind = 'impl' OR r.kind = 'ref' AND r.line = s.line)
+         WHERE r.src = ?1 AND r.src != 0 AND r.dst != 0 AND r.amb = 0 AND (r.kind = 'impl' OR r.kind = 'ref' AND r.line = s.line)
            AND json_extract(n.meta,'$.k') IN ('class','interface','object','struct','enum','trait','protocol')"
     } else {
         "SELECT DISTINCT r.src FROM ts_ref r JOIN node n ON n.id = r.src
-         WHERE r.dst = ?1 AND r.dst != 0 AND (r.kind = 'impl' OR r.kind = 'ref' AND r.line = n.line)
+         WHERE r.dst = ?1 AND r.dst != 0 AND r.amb = 0 AND (r.kind = 'impl' OR r.kind = 'ref' AND r.line = n.line)
            AND json_extract(n.meta,'$.k') IN ('class','interface','object','struct','enum','trait','protocol')"
     };
     let mut q = c.prepare_cached(sql)?;

@@ -48,8 +48,11 @@ pub struct Ref {
     pub caller: Option<usize>,
     /// Called through a receiver (`x.f()`), not bare (`f()`).
     pub recv: bool,
-    /// The receiver's last name (`a.inputs.f()` -> `inputs`), when it is a plain name.
+    /// The receiver's last name (`a.inputs.f()` -> `inputs`), when it is a plain name; for an
+    /// import, the module it names (`./errors`, `pkg.core`).
     pub via: Option<String>,
+    /// The receiver is a parameter or local (`user := ...; user.Save()`), not a package.
+    pub recv_local: bool,
     pos: usize,
 }
 
@@ -111,7 +114,7 @@ fn has_receiver(n: tree_sitter::Node, p: Option<tree_sitter::Node>) -> bool {
 
 /// The last name of the receiver a call goes through: `x` in `x.f()`, `Evaluator` in
 /// `pl.Evaluator.Preempt()`. None for calls, indexing or literals as receivers.
-fn receiver_name(n: tree_sitter::Node, p: Option<tree_sitter::Node>, src: &[u8]) -> Option<String> {
+fn receiver_name(n: tree_sitter::Node, p: Option<tree_sitter::Node>, src: &[u8]) -> Option<(String, usize)> {
     let p = p?;
     let mut r = p.child_by_field_name("object").or_else(|| p.child_by_field_name("operand")).or_else(|| p.child_by_field_name("argument"));
     if r.is_none() {
@@ -130,7 +133,7 @@ fn receiver_name(n: tree_sitter::Node, p: Option<tree_sitter::Node>, src: &[u8])
     }
     let t = r.utf8_text(src).ok()?;
     (r.named_child_count() == 0 && !t.is_empty() && t.len() <= 80 && t.chars().all(|c| c.is_alphanumeric() || c == '_'))
-        .then(|| t.to_string())
+        .then(|| (t.to_string(), r.start_byte()))
 }
 
 /// Function-like nodes whose parameters and locals can shadow a function name.
@@ -161,12 +164,24 @@ fn is_ident(k: &str) -> bool {
     matches!(k, "identifier" | "shorthand_property_identifier_pattern")
 }
 
+/// Nodes that open a scope for parameters and locals: functions (any depth, so a lambda's
+/// parameter hides a name only inside that lambda) and Python comprehensions.
+fn is_scope(k: &str) -> bool {
+    FN_KINDS.contains(&k) || matches!(k, "list_comprehension" | "set_comprehension" | "dictionary_comprehension" | "generator_expression")
+}
+
+/// Parents of an identifier used as a receiver (`user.Save()`, `obj.f`).
+const RECEIVER_PARENTS: &[&str] = &["selector_expression", "member_expression", "attribute", "field_expression"];
+
 /// What one top-down pass over a file's tree finds.
 struct Walk<'t> {
-    /// Start bytes of identifiers in value slots that name a parameter or local of their
-    /// outermost function, or a name declared at file level (a Python module-level loop
-    /// variable, a C global).
+    /// Start bytes of identifiers in value slots or receiver positions that name a parameter or
+    /// local of an enclosing function or comprehension.
     locals: HashSet<usize>,
+    /// The same for names declared only at file level (a Python module-level loop variable, a
+    /// JS `const`, a C global), with the name: one that is also a definition of the file is no
+    /// local.
+    file_locals: HashMap<usize, String>,
     /// The parent of every named leaf (by node id): a reference's name node looks up its
     /// receiver here.
     parents: HashMap<usize, tree_sitter::Node<'t>>,
@@ -177,36 +192,38 @@ struct Walk<'t> {
 /// and made deeply nested functions (a long `else if` chain) quadratic.
 fn walk_tree<'t>(root: tree_sitter::Node<'t>, src: &[u8]) -> Walk<'t> {
     let mut parents: HashMap<usize, tree_sitter::Node<'t>> = HashMap::new();
-    let mut funcs: Vec<HashSet<String>> = vec![];
-    let mut file: HashSet<String> = HashSet::new();
-    // (start byte, outermost function, name) of identifiers in value slots.
-    let mut slots: Vec<(usize, Option<usize>, String)> = vec![];
+    // Scope 0 is the file. (parent scope, declared names)
+    let mut scopes: Vec<(usize, HashSet<String>)> = vec![(0, HashSet::new())];
+    // Open scopes: (depth of the scope node, scope index).
+    let mut open: Vec<(usize, usize)> = vec![];
+    // (start byte, innermost scope, name) of identifiers in value slots and receiver positions.
+    let mut uses: Vec<(usize, usize, String)> = vec![];
     let mut anc: Vec<tree_sitter::Node> = vec![];
-    // The outermost function being walked: (its depth, its index in `funcs`).
-    let mut in_fn: Option<(usize, usize)> = None;
     let mut cur = root.walk();
     'walk: loop {
         let n = cur.node();
-        if in_fn.is_none() && FN_KINDS.contains(&n.kind()) {
-            funcs.push(HashSet::new());
-            in_fn = Some((anc.len(), funcs.len() - 1));
+        if is_scope(n.kind()) {
+            let parent = open.last().map_or(0, |o| o.1);
+            scopes.push((parent, HashSet::new()));
+            open.push((anc.len(), scopes.len() - 1));
         }
+        let scope = open.last().map_or(0, |o| o.1);
         if is_ident(n.kind())
             && let Ok(name) = n.utf8_text(src)
         {
-            if declares(n, &anc) {
-                match in_fn {
-                    Some((_, i)) => {
-                        funcs[i].insert(name.to_string());
-                    }
-                    None if !anc.iter().any(|a| PARAM_LISTS.contains(&a.kind())) => {
-                        file.insert(name.to_string());
-                    }
-                    None => {}
-                }
+            // At file level: not a prototype's parameter, nor a Python module-level assignment
+            // (that is a definition).
+            let file_ok = scope != 0
+                || !anc.iter().any(|a| PARAM_LISTS.contains(&a.kind()))
+                    && !anc.last().is_some_and(|p| p.kind() == "assignment" && anc.iter().any(|a| a.kind() == "module"));
+            if file_ok && declares(n, &anc, src) {
+                scopes[scope].1.insert(name.to_string());
             }
-            if anc.last().is_some_and(|p| VALUE_SLOTS.contains(&p.kind())) {
-                slots.push((n.start_byte(), in_fn.map(|f| f.1), name.to_string()));
+            if let Some(p) = anc.last()
+                && (VALUE_SLOTS.contains(&p.kind())
+                    || RECEIVER_PARENTS.contains(&p.kind()) && p.named_child(0).is_some_and(|f| f.id() == n.id()))
+            {
+                uses.push((n.start_byte(), scope, name.to_string()));
             }
         }
         if cur.goto_first_child() {
@@ -220,8 +237,8 @@ fn walk_tree<'t>(root: tree_sitter::Node<'t>, src: &[u8]) -> Walk<'t> {
         }
         loop {
             // Leaving the node at depth `anc.len()`.
-            if in_fn.is_some_and(|(d, _)| d == anc.len()) {
-                in_fn = None;
+            if open.last().is_some_and(|o| o.0 == anc.len()) {
+                open.pop();
             }
             if cur.goto_next_sibling() {
                 continue 'walk;
@@ -232,17 +249,29 @@ fn walk_tree<'t>(root: tree_sitter::Node<'t>, src: &[u8]) -> Walk<'t> {
             anc.pop();
         }
     }
-    let locals = slots
-        .into_iter()
-        .filter(|(_, f, name)| file.contains(name) || f.is_some_and(|i| funcs[i].contains(name)))
-        .map(|(pos, ..)| pos)
-        .collect();
-    Walk { locals, parents }
+    let (mut locals, mut file_locals) = (HashSet::new(), HashMap::new());
+    for (pos, mut sc, name) in uses {
+        loop {
+            if scopes[sc].1.contains(&name) {
+                if sc == 0 {
+                    file_locals.insert(pos, name);
+                } else {
+                    locals.insert(pos);
+                }
+                break;
+            }
+            if sc == 0 {
+                break;
+            }
+            sc = scopes[sc].0;
+        }
+    }
+    Walk { locals, file_locals, parents }
 }
 
 /// Is identifier `x` in a declaring position (a parameter or variable name, not a use)?
 /// `anc` holds its ancestors, the parent last.
-fn declares(x: tree_sitter::Node, anc: &[tree_sitter::Node]) -> bool {
+fn declares(x: tree_sitter::Node, anc: &[tree_sitter::Node], src: &[u8]) -> bool {
     let is_field = |p: tree_sitter::Node, field: &str, c: tree_sitter::Node| p.child_by_field_name(field).is_some_and(|y| y.id() == c.id());
     let mut c = x;
     // Passed through a C function declarator: a function pointer parameter, or a prototype.
@@ -262,11 +291,16 @@ fn declares(x: tree_sitter::Node, anc: &[tree_sitter::Node]) -> bool {
             "except_clause" => return p.named_child(0).is_some_and(|f| f.id() != c.id()),
             "named_expression" => return is_field(p, "name", c),
             // JS declarators, except a name bound to a function (that is a definition).
+            // JS declarators, except a name bound to a function (a definition) or one taken from
+            // `require(...)` (an import).
             "variable_declarator" => {
-                let fn_value = p
-                    .child_by_field_name("value")
-                    .is_some_and(|v| matches!(v.kind(), "arrow_function" | "function_expression" | "function" | "class"));
-                return is_field(p, "name", c) && !fn_value;
+                let value = p.child_by_field_name("value");
+                let fn_value = value.is_some_and(|v| matches!(v.kind(), "arrow_function" | "function_expression" | "function" | "class"));
+                let required = value.is_some_and(|v| {
+                    v.kind() == "call_expression"
+                        && v.child_by_field_name("function").is_some_and(|f| f.utf8_text(src).is_ok_and(|t| t == "require"))
+                });
+                return is_field(p, "name", c) && !fn_value && !required;
             }
             "required_parameter" | "optional_parameter" => return is_field(p, "pattern", c),
             "arrow_function" => return is_field(p, "parameter", c),
@@ -407,19 +441,50 @@ pub fn extract(l: &Lang, src: &[u8]) -> Parsed {
                 continue;
             }
             let parent = walk.parents.get(&nn.id()).copied().or_else(|| nn.parent());
+            let kind = ref_kind(k);
+            let recv = kind != "import" && has_receiver(nn, parent);
+            let rv = if recv { receiver_name(nn, parent, src) } else { None };
+            let recv_local = rv.as_ref().is_some_and(|(_, at)| walk.locals.contains(at));
+            let via = if kind == "import" { import_source(nn, &walk.parents, src) } else { rv.map(|x| x.0) };
             out.refs.push(Ref {
-                kind: ref_kind(k),
+                kind,
                 name,
                 line: nn.start_position().row as u32 + 1,
                 caller: None,
-                recv: has_receiver(nn, parent),
-                via: if has_receiver(nn, parent) { receiver_name(nn, parent, src) } else { None },
+                recv,
+                via,
+                recv_local,
                 pos: nn.start_byte(),
             });
         }
     }
+    // A file-level local hides an argument only when the file defines nothing of that name
+    // (`main = click.command(main)` rebinds a definition).
+    if !walk.file_locals.is_empty() {
+        let defined: HashSet<&str> = out.defs.iter().map(|d| d.name.as_str()).collect();
+        let hidden: HashSet<usize> = walk.file_locals.iter().filter(|(_, n)| !defined.contains(n.as_str())).map(|(pos, _)| *pos).collect();
+        out.refs.retain(|r| r.kind != "ref" || !hidden.contains(&r.pos));
+    }
     nest(&mut out);
     out
+}
+
+/// The module an imported name comes from: JS `import { X } from "./m"` -> `./m`, Python
+/// `from pkg.core import X` -> `pkg.core`. None for other import forms.
+fn import_source(n: tree_sitter::Node, parents: &HashMap<usize, tree_sitter::Node>, src: &[u8]) -> Option<String> {
+    let mut cur = n;
+    for _ in 0..5 {
+        let p = parents.get(&cur.id()).copied().or_else(|| cur.parent())?;
+        match p.kind() {
+            "import_statement" => {
+                let s = p.child_by_field_name("source")?.utf8_text(src).ok()?;
+                return Some(s.trim_matches(['"', '\'', '`']).to_string());
+            }
+            "import_from_statement" => return p.child_by_field_name("module_name")?.utf8_text(src).ok().map(str::to_string),
+            _ => cur = p,
+        }
+    }
+    None
 }
 
 /// Dedupe definitions, link each to its innermost enclosing definition, and refs to theirs.
@@ -963,7 +1028,9 @@ fn store_file(
         .prepare_cached("INSERT INTO ts_ref(project_id, path, src, name, line, kind, recv, dst, via) VALUES (?1,?2,?3,?4,?5,?6,?7,0,?8)")?;
     for x in &p.refs {
         let src = x.caller.map(|i| ids[i]).unwrap_or(0);
-        r.execute(params![pid, path, src, x.name, x.line, x.kind, x.recv, x.via])?;
+        // `recv` 2: through a receiver that is a parameter or local.
+        let recv = if x.recv_local { 2 } else { x.recv as i64 };
+        r.execute(params![pid, path, src, x.name, x.line, x.kind, recv, x.via])?;
     }
     Ok(())
 }
@@ -1050,6 +1117,8 @@ struct RefRow {
     kind: String,
     dst: i64,
     recv: bool,
+    /// Through a receiver that is a parameter or local.
+    recv_local: bool,
     amb: i64,
     /// Container of the calling definition (-1 when unknown).
     caller_parent: i64,
@@ -1058,18 +1127,45 @@ struct RefRow {
     line: i64,
 }
 
+/// Go: does import path `imp` name project directory `dir`? The import path ends with the
+/// directory (`example.com/m/internal/log` and `internal/log`), or a domain-qualified import
+/// path is a suffix of a deeper directory (`k8s.io/api/core/v1` under `staging/src/`). A
+/// standard library path (`log`, `encoding/json`) never names a project directory.
+pub(crate) fn go_import_names_dir(imp: &str, dir: &str) -> bool {
+    let ends = |a: &str, b: &str| a == b || a.ends_with(b) && a[..a.len() - b.len()].ends_with('/');
+    let domain = imp.split('/').next().is_some_and(|f| f.contains('.'));
+    imp.contains('/') && ends(imp, dir) || domain && ends(dir, imp)
+}
+
+/// `a/./b/../c` -> `a/c`.
+fn normalize(p: &str) -> String {
+    let mut out: Vec<&str> = vec![];
+    for seg in p.split('/') {
+        match seg {
+            "" | "." => {}
+            ".." => {
+                out.pop();
+            }
+            x => out.push(x),
+        }
+    }
+    out.join("/")
+}
+
 /// One import: its last segment (imported name, module or `*`) and, for dotted JVM imports, the
 /// package as a directory path (`a.b.C` -> `a/b`), which must match the candidate's directory.
 struct Import {
     last: String,
     pkg: String,
+    /// The import as written (`example.com/m/internal/log`).
+    raw: String,
 }
 
 impl Import {
     fn parse(name: &str) -> Import {
         let n = name.trim().trim_end_matches(';');
         let (pkg, last) = n.rsplit_once(['.', '/', ':', '\\']).unwrap_or(("", n));
-        Import { last: last.to_string(), pkg: pkg.trim_end_matches(':').replace(['.', ':'], "/") }
+        Import { last: last.to_string(), pkg: pkg.trim_end_matches(':').replace(['.', ':'], "/"), raw: n.to_string() }
     }
 }
 
@@ -1079,13 +1175,62 @@ impl Import {
 struct FileImports {
     all: Vec<Import>,
     lasts: HashSet<String>,
+    /// JS and Python: the module each imported name comes from (`./errors`, `pkg.core`).
+    sources: HashMap<String, String>,
+}
+
+/// Where an explicitly imported name's module puts a candidate.
+#[derive(PartialEq)]
+enum Source {
+    /// The module is the candidate's file or package.
+    Match,
+    /// Another project module.
+    Other,
+    /// A module outside the project (`some-lib`): no project candidate.
+    External,
 }
 
 impl FileImports {
-    fn push(&mut self, name: &str) {
+    fn push(&mut self, name: &str, source: Option<&str>) {
         let i = Import::parse(name);
+        if let Some(src) = source.filter(|x| !x.is_empty() && *x != name) {
+            self.sources.insert(name.to_string(), src.to_string());
+        }
         self.lasts.insert(i.last.clone());
         self.all.push(i);
+    }
+    /// JS and Python: where the module `name` was imported from puts candidate `s`. None when the
+    /// name was not imported by name with a known module.
+    fn source(&self, fam: &str, name: &str, from: &str, s: &Cand) -> Option<Source> {
+        let src = self.sources.get(name)?;
+        let stem = s.path.rsplit_once('.').map_or(s.path.as_str(), |x| x.0);
+        let module = match fam {
+            "js" => {
+                if !src.starts_with('.') {
+                    return Some(Source::External);
+                }
+                normalize(&format!("{}/{src}", dir_of(from)))
+            }
+            "python" => {
+                let dots = src.chars().take_while(|c| *c == '.').count();
+                let rest = src[dots..].replace('.', "/");
+                if dots == 0 {
+                    rest
+                } else {
+                    let mut base = dir_of(from).to_string();
+                    for _ in 1..dots {
+                        base = dir_of(&base).to_string();
+                    }
+                    normalize(&format!("{base}/{rest}"))
+                }
+            }
+            _ => return None,
+        };
+        // The module's file, its package (`pkg/core/__init__`, `dir/index`), or a module inside
+        // that package (a re-export).
+        let ends = |a: &str, b: &str| a == b || a.ends_with(b) && a[..a.len() - b.len()].ends_with('/');
+        let hit = ends(stem, &module) || ends(dir_of(stem), &module) || dir_of(stem).ends_with(&format!("/{module}"));
+        Some(if hit { Source::Match } else { Source::Other })
     }
     fn hits(&self, fam: &str, name: &str, s: &Cand) -> bool {
         let dir = dir_of(&s.path);
@@ -1098,19 +1243,12 @@ impl FileImports {
         self.lasts.contains(name)
             || self.lasts.contains(&s.parent)
             || self.lasts.contains(stem_of(&s.path))
-            || fam == "go" && self.lasts.contains(dir.rsplit('/').next().unwrap_or(""))
+            || fam == "go" && self.lasts.contains(dir.rsplit('/').next().unwrap_or("")) && self.names_dir(dir)
     }
     /// Go: an import path names directory `dir` itself (`example.com/pkg/b/stats` and
     /// `pkg/b/stats`, either one ending with the other), not only a package with its last name.
     fn names_dir(&self, dir: &str) -> bool {
-        // Import paths keep their dots as slashes (see `Import::parse`); so does `dir` here.
-        let dir = dir.replace('.', "/");
-        !dir.is_empty()
-            && self.all.iter().any(|m| {
-                let full = if m.pkg.is_empty() { m.last.clone() } else { format!("{}/{}", m.pkg, m.last) };
-                let ends = |a: &str, b: &str| a == b || a.ends_with(b) && a[..a.len() - b.len()].ends_with('/');
-                ends(&full, &dir) || ends(&dir, &full)
-            })
+        !dir.is_empty() && self.all.iter().any(|m| go_import_names_dir(&m.raw, dir))
     }
 }
 
@@ -1193,7 +1331,7 @@ fn score(r: &RefRow, cands: &[Cand], imp: Option<&FileImports>) -> (i64, i64) {
     let via_hit = via.is_some_and(|v| cands.iter().any(|s| s.family == fam && via_match(v, &s.parent) == 20));
     // Go: `pkg.Name` through an imported package's name reaches only a package of that name
     // (`io.Reader` is not this package's `Reader`).
-    let pkg_qualified = fam == "go" && via.is_some_and(|v| imp.is_some_and(|i| i.lasts.contains(v)));
+    let pkg_qualified = fam == "go" && !r.recv_local && via.is_some_and(|v| imp.is_some_and(|i| i.lasts.contains(v)));
     // (score, id, candidates at that score, same file, member, score without the receiver match)
     let mut best = (0i32, 0i64, 0usize, false, false, 0i32);
     let mut eligible = 0i64;
@@ -1208,6 +1346,12 @@ fn score(r: &RefRow, cands: &[Cand], imp: Option<&FileImports>) -> (i64, i64) {
             continue;
         }
         let member = s.pid != 0 || !s.parent.is_empty();
+        // JS and Python: a name imported from a module names that module's definition; one from
+        // outside the project names none of the project's.
+        let source = imp.and_then(|i| i.source(fam, via.unwrap_or(&r.name), &r.path, s));
+        if source == Some(Source::External) && s.path != r.path {
+            continue;
+        }
         // Python and JS: a bare name (`f()`, `g(x)`) never reaches a method; that takes a receiver.
         if dynamic && !r.recv && s.kind == "method" {
             continue;
@@ -1230,7 +1374,7 @@ fn score(r: &RefRow, cands: &[Cand], imp: Option<&FileImports>) -> (i64, i64) {
             && r.recv
             && !same_file
             && !own_receiver
-            && (s.path == r.path || !imp.is_some_and(|v| v.hits(fam, &r.name, s)))
+            && (s.path == r.path || source.as_ref().map_or(!imp.is_some_and(|v| v.hits(fam, &r.name, s)), |x| *x != Source::Match))
             && via.is_none_or(|v| v != s.parent)
         {
             continue;
@@ -1238,7 +1382,9 @@ fn score(r: &RefRow, cands: &[Cand], imp: Option<&FileImports>) -> (i64, i64) {
         eligible += 1;
         let mut score = if same_file {
             100
-        } else if imp.is_some_and(|v| v.hits(fam, &r.name, s)) {
+        } else if source == Some(Source::Match) {
+            70
+        } else if source.is_none() && imp.is_some_and(|v| v.hits(fam, &r.name, s)) {
             // Go: a package-qualified call (`stats.Register()`) prefers the package its full
             // import path names; a method call on a value (`req.Header.Get()`) does not.
             if pkg_qualified && !member && imp.is_some_and(|v| v.names_dir(dir_of(&s.path))) { 65 } else { 60 }
@@ -1328,7 +1474,8 @@ fn map_ref(r: &rusqlite::Row) -> rusqlite::Result<RefRow> {
         name: r.get(3)?,
         kind: r.get(4)?,
         dst: r.get(5)?,
-        recv: r.get(6)?,
+        recv: r.get::<_, i64>(6)? != 0,
+        recv_local: r.get::<_, i64>(6)? == 2,
         amb: r.get(7)?,
         caller_parent: -1,
         line: r.get(8)?,
@@ -1369,7 +1516,7 @@ pub fn resolve_scoped(tx: &Connection, pid: i64, scope: Option<(&HashSet<String>
             let mut q = tx.prepare(&format!("SELECT {REF_COLS} FROM ts_ref NOT INDEXED WHERE project_id = ?1"))?;
             for r in q.query_map([pid], map_ref)?.flatten() {
                 if r.kind == "import" {
-                    imports.entry(r.path.clone()).or_default().push(&r.name);
+                    imports.entry(r.path.clone()).or_default().push(&r.name, r.via.as_deref());
                 } else {
                     refs.push(r);
                 }
@@ -1391,11 +1538,11 @@ pub fn resolve_scoped(tx: &Connection, pid: i64, scope: Option<(&HashSet<String>
             }
             refs.retain(|r| r.kind != "import");
             let files: HashSet<&str> = refs.iter().map(|r| r.path.as_str()).collect();
-            let mut q = tx.prepare_cached("SELECT name FROM ts_ref WHERE project_id = ?1 AND path = ?2 AND kind = 'import'")?;
+            let mut q = tx.prepare_cached("SELECT name, via FROM ts_ref WHERE project_id = ?1 AND path = ?2 AND kind = 'import'")?;
             for f in files {
                 let e = imports.entry(f.to_string()).or_default();
-                for n in q.query_map(params![pid, f], |r| r.get::<_, String>(0))?.flatten() {
-                    e.push(&n);
+                for (n, v) in q.query_map(params![pid, f], |r| Ok((r.get::<_, String>(0)?, r.get::<_, Option<String>>(1)?)))?.flatten() {
+                    e.push(&n, v.as_deref());
                 }
             }
         }
@@ -1566,6 +1713,7 @@ mod via_tests {
             kind: "call".into(),
             dst: 0,
             recv: true,
+            recv_local: false,
             amb: 0,
             caller_parent: -1,
             via: Some(via.into()),

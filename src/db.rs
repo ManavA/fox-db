@@ -381,6 +381,17 @@ pub(crate) fn migrate(c: &Connection) -> Result<()> {
              PRAGMA user_version = 17;",
         )?;
     }
+    if v < 18 {
+        // 0.2.2: locals per scope (a lambda's parameter no longer hides its name in the whole
+        // function), the module each JS/Python import names, and receivers that are locals.
+        // Every code file parses again once, and references re-score.
+        c.execute_batch(
+            "UPDATE ts_file SET hash = '', size = -1;
+             INSERT OR REPLACE INTO meta(k, v)
+               SELECT 'rescore:' || p.id, 1 FROM project p WHERE EXISTS (SELECT 1 FROM ts_ref r WHERE r.project_id = p.id);
+             PRAGMA user_version = 18;",
+        )?;
+    }
     // Cheap when already set: the setting lives in each table's own config.
     for t in MERGE_TABLES {
         defer_merges(c, t)?;
@@ -682,7 +693,7 @@ pub fn minority(c: &Connection, ranges: &[(i64, i64)]) -> bool {
 }
 
 /// The schema version this build writes.
-pub const LATEST: i64 = 17;
+pub const LATEST: i64 = 18;
 
 /// Read-only connection for the hot paths. None if the store does not exist yet.
 pub fn open_ro() -> Option<Connection> {
