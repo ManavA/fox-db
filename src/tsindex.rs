@@ -1248,7 +1248,7 @@ impl FileImports {
         }
         self.lasts.contains(name)
             || self.lasts.contains(&s.parent)
-            || self.lasts.contains(stem_of(&s.path))
+            || fam != "go" && self.lasts.contains(stem_of(&s.path))
             || fam == "go" && self.lasts.contains(dir.rsplit('/').next().unwrap_or("")) && self.names_dir(dir)
     }
     /// Go: an import path names directory `dir` itself (`example.com/pkg/b/stats` and
@@ -1733,13 +1733,18 @@ mod via_tests {
     #[test]
     fn import_path_preference_is_for_package_qualified_calls() {
         let mut imp = FileImports::default();
-        imp.push("github.com/ext/other");
-        imp.push("example.com/pkg/rest");
-        imp.push("example.com/pkg/b/stats");
+        imp.push("example.com/pkg/other", None);
+        imp.push("example.com/pkg/rest", None);
+        imp.push("example.com/pkg/b/stats", None);
         let cands = [cand(1, "pkg/other/thing.go", "method", "Thing"), cand(2, "pkg/rest/client.go", "method", "RESTClient")];
         assert_ne!(score(&call("Get", "Header"), &cands, Some(&imp)).0, 2);
         let cands = [cand(1, "pkg/a/stats/s.go", "function", ""), cand(2, "pkg/b/stats/s.go", "function", "")];
         assert_eq!(score(&call("Compute", "stats"), &cands, Some(&imp)).0, 2);
+        // A standard library import names no project package of the same last name.
+        let mut std_log = FileImports::default();
+        std_log.push("log", None);
+        let cands = [cand(1, "internal/log/log.go", "function", "")];
+        assert_eq!(score(&call("Printf", "log"), &cands, Some(&std_log)).0, 0);
     }
 
     #[test]
