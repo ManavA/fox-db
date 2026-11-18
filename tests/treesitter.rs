@@ -1059,4 +1059,5 @@ fn weak_guesses_are_counted_not_listed() {
     assert!(!out.contains("test_close") && out.contains("1 weak guess left out"), "{out}");
     let out = fox_code(&p, &format!("c:{dst:x}"), "impact", 800);
     assert!(!out.contains("test_close") && out.contains("1 weak guess left out"), "{out}");
+    assert!(out.contains("\npartial at d1: 1 call guessed among many same-name definitions was left out"), "{out}");
 }

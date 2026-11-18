@@ -190,6 +190,12 @@ fn is_weak(amb: i64, recv: bool, via: Option<&str>, target_parent: Option<&str>)
     !(recv && via.is_some_and(|v| crate::tsindex::SELF_NAMES.contains(&v) || !ty.is_empty() && crate::tsindex::via_match(v, ty) > 0))
 }
 
+/// The warning for weak guesses left out: they may be real.
+fn weak_left_out(n: usize) -> String {
+    let (calls, were) = if n == 1 { ("1 call", "was") } else { (&*format!("{n} calls"), "were") };
+    format!("{calls} guessed among many same-name definitions {were} left out; confirm the ones that matter")
+}
+
 /// `, N weak guesses left out` for a header, or nothing.
 fn weak_note(weak: usize) -> String {
     match weak {
@@ -328,6 +334,8 @@ pub fn run(c: &Connection, p: &Project, sym: &str, rel: &str, depth: usize, curs
             lines.insert(at, format!("{n} {} in {} files{g}", if calls { "call sites" } else { "refs" }, files.len()));
             if let Some(l) = completeness(c, p.id, top, &files, calls, "may be incomplete")? {
                 lines.insert(at + 1, l);
+            } else if weak > 0 {
+                lines.insert(at + 1, format!("may be incomplete: {}", weak_left_out(weak)));
             }
         }
         "callees" => {
@@ -463,7 +471,7 @@ fn impact(c: &Connection, pid: i64, top: &TSym, depth: usize, lines: &mut Vec<St
     // not followed (a guess through dispatch must not multiply).
     let mut leaf: HashMap<i64, bool> = HashMap::new();
     // Dependents (or top-level files) whose only link so far is a weak guess.
-    let mut weak: HashSet<(i64, String)> = HashSet::new();
+    let mut weak: HashSet<(i64, String, usize)> = HashSet::new();
     let mut parents: HashMap<i64, Option<String>> = HashMap::new();
     let mut disp: HashMap<i64, Disp> = HashMap::new();
     let mut disp_top: HashMap<String, Disp> = HashMap::new();
@@ -516,7 +524,7 @@ fn impact(c: &Connection, pid: i64, top: &TSym, depth: usize, lines: &mut Vec<St
                 is_weak(amb, recv, rvia.as_deref(), parent.as_deref())
             } {
                 if src == 0 || !guess.contains_key(&src) {
-                    weak.insert((src, path.clone()));
+                    weak.insert((src, path.clone(), d));
                 }
                 continue;
             }
@@ -603,7 +611,12 @@ fn impact(c: &Connection, pid: i64, top: &TSym, depth: usize, lines: &mut Vec<St
         .sum::<usize>();
     let g = if guessed > 0 { format!(", {guessed} through name guesses") } else { String::new() };
     let f = if nfiles > 0 { format!(", {nfiles} files at top level") } else { String::new() };
-    let weak_n = weak.iter().filter(|(src, path)| if *src == 0 { !top_seen.contains(path) } else { !guess.contains_key(src) }).count();
+    let weak: Vec<usize> = weak
+        .iter()
+        .filter(|(src, path, _)| if *src == 0 { !top_seen.contains(path) } else { !guess.contains_key(src) })
+        .map(|x| x.2)
+        .collect();
+    let weak_n = weak.len();
     let g = g + &weak_note(weak_n);
     lines.push(format!(
         "impact of {}: {nsyms} symbols{f}; per depth {}{g}",
@@ -626,6 +639,9 @@ fn impact(c: &Connection, pid: i64, top: &TSym, depth: usize, lines: &mut Vec<St
     crate::tsindex::trace("impact: guessed elsewhere", t0);
     lines.extend(cut);
     lines.extend(dsp.capped);
+    if let Some(d) = weak.iter().min() {
+        lines.push(format!("partial at d{}: {}", d + 1, weak_left_out(weak_n)));
+    }
     for (d, (lvl, v)) in levels.iter().zip(syms).enumerate() {
         lines.push(format!("d{}", d + 1));
         let mut by: BTreeMap<String, Vec<(i64, String)>> = BTreeMap::new();

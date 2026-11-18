@@ -26,8 +26,9 @@ session brief names the MCP tools.
   package that re-exports it) resolves to that module's definition; one imported from outside the
   project resolves to none of the project's.
 - A call guessed among more than eight same-name definitions through a receiver named unlike the
-  target's type (`response.close()` with dozens of `close` methods) is no longer listed as a caller or dependent; the header counts it
-  (`, 3 weak guesses left out`).
+  target's type (`response.close()` with dozens of `close` methods) is no longer listed as a
+  caller or dependent; the header counts it (`, 3 weak guesses left out`) and a `partial` or
+  `may be incomplete` line says it may be real.
 - Dispatch: a method's `impact` also lists callers of the interface or base methods it
   implements or overrides (` via Router.add`), and an interface method's `impact` lists its
   implementations (` implements Router.add`) and their callers. Supertypes come from TS
