@@ -108,7 +108,8 @@ fn sites(c: &Connection, targets: &[i64], calls_only: bool, lines: &mut Vec<Stri
     let ids = targets.iter().map(i64::to_string).collect::<Vec<_>>().join(",");
     let kind = if calls_only { "AND r.kind = 'call'" } else { "" };
     let sql = format!(
-        "SELECT r.path, r.line, r.src, s.name, json_extract(s.meta,'$.parent'), r.amb FROM ts_ref r LEFT JOIN node s ON s.id = r.src
+        "SELECT r.path, r.line, r.src, s.name, json_extract(s.meta,'$.parent'), r.amb, r.recv, r.via, json_extract(d.meta,'$.parent')
+         FROM ts_ref r LEFT JOIN node s ON s.id = r.src LEFT JOIN node d ON d.id = r.dst
          WHERE r.dst != 0 AND r.dst IN ({ids}) {kind} ORDER BY r.path, r.line"
     );
     let mut q = c.prepare(&sql)?;
@@ -117,7 +118,7 @@ fn sites(c: &Connection, targets: &[i64], calls_only: bool, lines: &mut Vec<Stri
     let mut by: BTreeMap<String, Vec<Who>> = BTreeMap::new();
     let mut seen = HashSet::new();
     let (mut n, mut guessed, mut weak) = (0, 0, 0);
-    for (path, line, src, sname, sparent, amb) in q
+    for (path, line, src, sname, sparent, amb, recv, via, dparent) in q
         .query_map([], |r| {
             Ok((
                 r.get::<_, String>(0)?,
@@ -126,6 +127,9 @@ fn sites(c: &Connection, targets: &[i64], calls_only: bool, lines: &mut Vec<Stri
                 r.get::<_, Option<String>>(3)?,
                 r.get::<_, Option<String>>(4)?,
                 r.get::<_, i64>(5)?,
+                r.get::<_, bool>(6)?,
+                r.get::<_, Option<String>>(7)?,
+                r.get::<_, Option<String>>(8)?,
             ))
         })?
         .flatten()
@@ -133,7 +137,7 @@ fn sites(c: &Connection, targets: &[i64], calls_only: bool, lines: &mut Vec<Stri
         if !seen.insert((path.clone(), line, src)) {
             continue;
         }
-        if amb > WEAK_GUESS {
+        if is_weak(amb, recv, via.as_deref(), dparent.as_deref()) {
             weak += 1;
             continue;
         }
@@ -175,6 +179,16 @@ fn sites(c: &Connection, targets: &[i64], calls_only: bool, lines: &mut Vec<Stri
 /// A guess among more same-name definitions than this says nothing about which one is meant
 /// (`response.close()` with dozens of `close` methods): counted, not listed.
 const WEAK_GUESS: i64 = 8;
+
+/// A guess among more than [`WEAK_GUESS`] candidates with no receiver named like the target's
+/// type (`router.match()` for `Router.match` is informative; `response.close()` is not).
+fn is_weak(amb: i64, recv: bool, via: Option<&str>, target_parent: Option<&str>) -> bool {
+    if amb <= WEAK_GUESS {
+        return false;
+    }
+    let ty = target_parent.map(|p| p.rsplit('.').next().unwrap_or(p)).unwrap_or("");
+    !(recv && via.is_some_and(|v| crate::tsindex::SELF_NAMES.contains(&v) || !ty.is_empty() && crate::tsindex::via_match(v, ty) > 0))
+}
 
 /// `, N weak guesses left out` for a header, or nothing.
 fn weak_note(weak: usize) -> String {
@@ -450,6 +464,7 @@ fn impact(c: &Connection, pid: i64, top: &TSym, depth: usize, lines: &mut Vec<St
     let mut leaf: HashMap<i64, bool> = HashMap::new();
     // Dependents (or top-level files) whose only link so far is a weak guess.
     let mut weak: HashSet<(i64, String)> = HashSet::new();
+    let mut parents: HashMap<i64, Option<String>> = HashMap::new();
     let mut disp: HashMap<i64, Disp> = HashMap::new();
     let mut disp_top: HashMap<String, Disp> = HashMap::new();
     for m in &dsp.up {
@@ -496,7 +511,10 @@ fn impact(c: &Connection, pid: i64, top: &TSym, depth: usize, lines: &mut Vec<St
             })?
             .flatten()
         {
-            if amb > WEAK_GUESS {
+            if amb > WEAK_GUESS && {
+                let parent = parents.entry(dst).or_insert_with(|| by_id(c, dst).and_then(|t| t.parent));
+                is_weak(amb, recv, rvia.as_deref(), parent.as_deref())
+            } {
                 if src == 0 || !guess.contains_key(&src) {
                     weak.insert((src, path.clone()));
                 }
@@ -927,7 +945,7 @@ fn guessed_elsewhere(
 ) -> Result<Option<String>> {
     use crate::tsindex::{common_dirs, dir_of, via_match};
     let mut q = c.prepare_cached(
-        "SELECT path, dst, recv, via FROM ts_ref WHERE project_id = ?1 AND name = ?2 AND amb BETWEEN 1 AND ?3 AND dst != 0 AND kind = 'call' LIMIT 5000",
+        "SELECT path, dst, recv, via FROM ts_ref WHERE project_id = ?1 AND name = ?2 AND amb > 0 AND (amb <= ?3 OR recv != 0) AND dst != 0 AND kind = 'call' LIMIT 5000",
     )?;
     let mut dst_path: HashMap<i64, Option<String>> = HashMap::new();
     let mut asked = 0;

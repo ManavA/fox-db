@@ -16,24 +16,34 @@ session brief names the MCP tools.
   A parameter or local of the same name is not, in any declaration form (Python comprehension,
   `with`/`except ... as`, `*args`, walrus and module-level loop variables; JS destructuring, rest
   and `catch` parameters; Go `select` and type-switch variables), nor is an all-caps C constant
-  or macro (`elog(ERROR, ...)`). A value read through a receiver (`f(request.id)`) resolves to a
+  or macro (`elog(ERROR, ...)`). A parameter hides the name only in its own function, lambda or
+  comprehension; a name taken from `require(...)` or a module-level rebinding of a definition
+  (`main = click.command(main)`) hides nothing. A value read through a receiver (`f(request.id)`) resolves to a
   member only through `self`/`this`, an import or the exact type name, in its own file too.
 - Python and JS: a bare name never resolves to a method, and a call through another object's
-  receiver (`self.connection.close()`) is no longer certain to reach a same-file method.
+  receiver (`self.connection.close()`) is no longer certain to reach a same-file method. A name
+  imported from a module (`import { X } from "./m"`, `from pkg.core import X`, including a
+  package that re-exports it) resolves to that module's definition; one imported from outside the
+  project resolves to none of the project's.
+- A call guessed among more than eight same-name definitions through a receiver named unlike the
+  target's type (`response.close()` with dozens of `close` methods) is no longer listed as a caller or dependent; the header counts it
+  (`, 3 weak guesses left out`).
 - Dispatch: a method's `impact` also lists callers of the interface or base methods it
   implements or overrides (` via Router.add`), and an interface method's `impact` lists its
   implementations (` implements Router.add`) and their callers. Supertypes come from TS
   `implements`/`extends` (on any line of the class header), plain JS `extends`, Python base
-  classes, Kotlin and other grammars' supertype lists, stored as their own reference kind. A Go
+  classes, Kotlin and other grammars' supertype lists, stored as their own reference kind and
+  followed only when resolved with certainty. A Go
   type implements an interface when it has every method of it, embedded interfaces included (an
   interface embedding one outside the project is skipped), and the link has evidence: both in one
-  directory, or a file of the type's package that imports the interface's package and names the
-  interface. A caller of the interface method found only by a name guess is listed but not
+  directory, or a file of the type's package that imports the interface's package (by its full
+  path: a standard library `log` is not the project's `internal/log`) and names the interface. A caller of the interface method found only by a name guess is listed but not
   followed further, and in Python and JS only counts through `self`/`this` or a receiver named
   like the base type. A capped candidate list adds a `partial at d1:` line.
 - Go package-qualified calls (`stats.Register()`) prefer the package named by the full import
   path, and reach only packages of that name (`io.Reader` is not the local `Reader`); method
-  calls on values (`req.Header.Get()`) get no such preference.
+  calls on values (`req.Header.Get()`), including a local named like a package
+  (`user := ...; user.Save()`), get no such preference.
 - Finding a function's locals and a call's receiver no longer walks up the tree from every
   name: a deeply nested function (psql's `tab-complete.c`, one function with hundreds of
   `else if`) indexes several times faster than in 0.2.1.
@@ -44,7 +54,7 @@ session brief names the MCP tools.
   every file the answer lists at any depth.
 - A paged `fox code` or board answer ends `+N more (answer cut) · cursor=K`. Search footers and
   the MCP tool definitions are unchanged.
-- The store moves to schema 17: on the next index run every code file parses again once, and
+- The store moves to schema 18: on the next index run every code file parses again once, and
   every project re-scores its references.
 
 ## 0.2.1 (2026-11-17)
