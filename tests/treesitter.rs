@@ -1018,3 +1018,45 @@ fn go_stdlib_imports_and_local_receivers_are_not_project_packages() {
     let out = fox_code(&p, &format!("c:{id:x}"), "callers", 800);
     assert!(out.contains("touch") && !out.contains("update"), "{out}");
 }
+
+/// Python: a base class imported from a package that re-exports it (`from dj.db.models import
+/// Field`) names the package's class, with certainty, not a same-name test class.
+#[test]
+fn python_base_classes_follow_package_reexports() {
+    let _g = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    let (_h, _r, p) = inline_project(&[
+        ("dj/__init__.py", ""),
+        ("dj/db/__init__.py", ""),
+        ("dj/db/models/__init__.py", "from dj.db.models.fields import Field\n"),
+        ("dj/db/models/fields/__init__.py", "class Field:\n    def clean(self):\n        pass\n"),
+        ("tests/model_fields/tests.py", "class Field:\n    pass\n"),
+        ("tests/forms/tests.py", "class Field:\n    pass\n"),
+        ("dj/contrib/pg/array.py", "from dj.db.models import Field\n\n\nclass ArrayField(Field):\n    pass\n"),
+    ]);
+    let c = db::open_ro().unwrap();
+    let id: i64 =
+        c.query_row("SELECT id FROM node WHERE name = 'Field' AND path = 'dj/db/models/fields/__init__.py'", [], |r| r.get(0)).unwrap();
+    let out = fox_code(&p, &format!("c:{id:x}"), "impact", 2000);
+    assert!(out.contains("ArrayField c:") && !out.contains("guess"), "{out}");
+}
+
+/// A guess among many same-name definitions (`response.close()` with a dozen `close` methods
+/// in the project) is no dependent or caller: it is counted, not listed.
+#[test]
+fn weak_guesses_are_counted_not_listed() {
+    let _g = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    let mut files: Vec<(String, String)> =
+        (0..12).map(|i| (format!("m{i}/conn.py"), format!("class Conn{i}:\n    def close(self):\n        pass\n"))).collect();
+    files.push(("t/test_resp.py".into(), "import m0.conn\n\n\ndef test_close(response):\n    response.close()\n".into()));
+    let refs: Vec<(&str, &str)> = files.iter().map(|(a, b)| (a.as_str(), b.as_str())).collect();
+    let (_h, _r, p) = inline_project(&refs);
+    let c = db::open_ro().unwrap();
+    let (dst, amb): (i64, i64) = c
+        .query_row("SELECT dst, amb FROM ts_ref WHERE path = 't/test_resp.py' AND name = 'close'", [], |r| Ok((r.get(0)?, r.get(1)?)))
+        .unwrap();
+    assert!(dst != 0 && amb > 8, "the call is a guess among many: {dst} {amb}");
+    let out = fox_code(&p, &format!("c:{dst:x}"), "callers", 800);
+    assert!(!out.contains("test_close") && out.contains("1 weak guess left out"), "{out}");
+    let out = fox_code(&p, &format!("c:{dst:x}"), "impact", 800);
+    assert!(!out.contains("test_close") && out.contains("1 weak guess left out"), "{out}");
+}

@@ -102,8 +102,9 @@ pub fn resolve(c: &Connection, pid: i64, q: &str) -> Result<Vec<TSym>> {
 
 /// Call or reference sites of `targets`, grouped by file: `path (n)` then `  :line Caller c:h`.
 /// A site whose target was guessed by name among several same-name definitions ends in
-/// `guess 1 of N`. Returns (sites, their files, guessed sites).
-fn sites(c: &Connection, targets: &[i64], calls_only: bool, lines: &mut Vec<String>) -> Result<(usize, HashSet<String>, usize)> {
+/// `guess 1 of N`; one guessed among more than [`WEAK_GUESS`] is only counted. Returns (sites,
+/// their files, guessed sites, weak guesses left out).
+fn sites(c: &Connection, targets: &[i64], calls_only: bool, lines: &mut Vec<String>) -> Result<(usize, HashSet<String>, usize, usize)> {
     let ids = targets.iter().map(i64::to_string).collect::<Vec<_>>().join(",");
     let kind = if calls_only { "AND r.kind = 'call'" } else { "" };
     let sql = format!(
@@ -115,7 +116,7 @@ fn sites(c: &Connection, targets: &[i64], calls_only: bool, lines: &mut Vec<Stri
     type Who = (String, Vec<i64>, i64);
     let mut by: BTreeMap<String, Vec<Who>> = BTreeMap::new();
     let mut seen = HashSet::new();
-    let (mut n, mut guessed) = (0, 0);
+    let (mut n, mut guessed, mut weak) = (0, 0, 0);
     for (path, line, src, sname, sparent, amb) in q
         .query_map([], |r| {
             Ok((
@@ -130,6 +131,10 @@ fn sites(c: &Connection, targets: &[i64], calls_only: bool, lines: &mut Vec<Stri
         .flatten()
     {
         if !seen.insert((path.clone(), line, src)) {
+            continue;
+        }
+        if amb > WEAK_GUESS {
+            weak += 1;
             continue;
         }
         let who = match (sname, sparent) {
@@ -164,7 +169,20 @@ fn sites(c: &Connection, targets: &[i64], calls_only: bool, lines: &mut Vec<Stri
         }),
         lines,
     );
-    Ok((n, files, guessed))
+    Ok((n, files, guessed, weak))
+}
+
+/// A guess among more same-name definitions than this says nothing about which one is meant
+/// (`response.close()` with dozens of `close` methods): counted, not listed.
+const WEAK_GUESS: i64 = 8;
+
+/// `, N weak guesses left out` for a header, or nothing.
+fn weak_note(weak: usize) -> String {
+    match weak {
+        0 => String::new(),
+        1 => ", 1 weak guess left out".into(),
+        n => format!(", {n} weak guesses left out"),
+    }
 }
 
 /// One line when `top`'s name occurs in more files than `listed` (its resolved sites) and its
@@ -291,8 +309,8 @@ pub fn run(c: &Connection, p: &Project, sym: &str, rel: &str, depth: usize, curs
             let calls = rel == "callers" && is_callable_kind(&top.kind);
             lines.push(format!("{rel} of {}", top.row()));
             let at = lines.len();
-            let (n, files, guessed) = sites(c, &[top.id], calls, &mut lines)?;
-            let g = if guessed > 0 { format!(", {guessed} guessed by name") } else { String::new() };
+            let (n, files, guessed, weak) = sites(c, &[top.id], calls, &mut lines)?;
+            let g = if guessed > 0 { format!(", {guessed} guessed by name") } else { String::new() } + &weak_note(weak);
             lines.insert(at, format!("{n} {} in {} files{g}", if calls { "call sites" } else { "refs" }, files.len()));
             if let Some(l) = completeness(c, p.id, top, &files, calls, "may be incomplete")? {
                 lines.insert(at + 1, l);
@@ -430,6 +448,8 @@ fn impact(c: &Connection, pid: i64, top: &TSym, depth: usize, lines: &mut Vec<St
     // Dependents reached only through a guessed call to an interface or base method: listed,
     // not followed (a guess through dispatch must not multiply).
     let mut leaf: HashMap<i64, bool> = HashMap::new();
+    // Dependents (or top-level files) whose only link so far is a weak guess.
+    let mut weak: HashSet<(i64, String)> = HashSet::new();
     let mut disp: HashMap<i64, Disp> = HashMap::new();
     let mut disp_top: HashMap<String, Disp> = HashMap::new();
     for m in &dsp.up {
@@ -476,6 +496,12 @@ fn impact(c: &Connection, pid: i64, top: &TSym, depth: usize, lines: &mut Vec<St
             })?
             .flatten()
         {
+            if amb > WEAK_GUESS {
+                if src == 0 || !guess.contains_key(&src) {
+                    weak.insert((src, path.clone()));
+                }
+                continue;
+            }
             let base = if d == 0 { up.get(&dst).copied() } else { None };
             if let Some(m) = base {
                 // Only a call to the interface or base method may dispatch to `top`; a guessed one
@@ -559,6 +585,8 @@ fn impact(c: &Connection, pid: i64, top: &TSym, depth: usize, lines: &mut Vec<St
         .sum::<usize>();
     let g = if guessed > 0 { format!(", {guessed} through name guesses") } else { String::new() };
     let f = if nfiles > 0 { format!(", {nfiles} files at top level") } else { String::new() };
+    let weak_n = weak.iter().filter(|(src, path)| if *src == 0 { !top_seen.contains(path) } else { !guess.contains_key(src) }).count();
+    let g = g + &weak_note(weak_n);
     lines.push(format!(
         "impact of {}: {nsyms} symbols{f}; per depth {}{g}",
         top.row(),
@@ -899,7 +927,7 @@ fn guessed_elsewhere(
 ) -> Result<Option<String>> {
     use crate::tsindex::{common_dirs, dir_of, via_match};
     let mut q = c.prepare_cached(
-        "SELECT path, dst, recv, via FROM ts_ref WHERE project_id = ?1 AND name = ?2 AND amb > 0 AND dst != 0 AND kind = 'call' LIMIT 5000",
+        "SELECT path, dst, recv, via FROM ts_ref WHERE project_id = ?1 AND name = ?2 AND amb BETWEEN 1 AND ?3 AND dst != 0 AND kind = 'call' LIMIT 5000",
     )?;
     let mut dst_path: HashMap<i64, Option<String>> = HashMap::new();
     let mut asked = 0;
@@ -915,7 +943,7 @@ fn guessed_elsewhere(
             if asked > 100 {
                 return Ok(None);
             }
-            let rows = q.query_map(params![pid, name], |r| {
+            let rows = q.query_map(params![pid, name, WEAK_GUESS], |r| {
                 Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?, r.get::<_, bool>(2)?, r.get::<_, Option<String>>(3)?))
             })?;
             for (path, dst, recv, via) in rows.flatten() {

@@ -1229,7 +1229,13 @@ impl FileImports {
         // The module's file, its package (`pkg/core/__init__`, `dir/index`), or a module inside
         // that package (a re-export).
         let ends = |a: &str, b: &str| a == b || a.ends_with(b) && a[..a.len() - b.len()].ends_with('/');
-        let hit = ends(stem, &module) || ends(dir_of(stem), &module) || dir_of(stem).ends_with(&format!("/{module}"));
+        let inside = stem.starts_with(&format!("{module}/")) || stem.contains(&format!("/{module}/"));
+        let hit = ends(stem, &module)
+            || match fam {
+                // A package re-exports what its modules define (`django.db.models` -> `fields/`).
+                "python" => inside,
+                _ => stem.ends_with("/index") && ends(dir_of(stem), &module),
+            };
         Some(if hit { Source::Match } else { Source::Other })
     }
     fn hits(&self, fam: &str, name: &str, s: &Cand) -> bool {
