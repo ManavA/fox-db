@@ -12,3 +12,5 @@
 (keyed_element value: (literal_element (identifier) @name)) @reference.ref
 ; A function passed as an argument (`wait.Until(worker)`): a reference. Parameters and locals are dropped.
 (argument_list (identifier) @name) @reference.ref
+; An interface embedded in an interface (`type ReadCloser interface { Reader; Close() error }`).
+(interface_type (type_elem [(type_identifier) @name (qualified_type name: (type_identifier) @name)])) @reference.implementation

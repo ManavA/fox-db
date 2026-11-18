@@ -70,7 +70,7 @@ pub static LANGS: &[Lang] = &[
         exts: &["js", "jsx", "mjs", "cjs"],
         family: "js",
         language: || tree_sitter_javascript::LANGUAGE.into(),
-        queries: &[q!("ecma"), q!("jsx")],
+        queries: &[q!("ecma"), q!("jsx"), q!("javascript")],
     },
     Lang { name: "go", exts: &["go"], family: "go", language: || tree_sitter_go::LANGUAGE.into(), queries: &[q!("go")] },
     Lang { name: "rust", exts: &["rs"], family: "rust", language: || tree_sitter_rust::LANGUAGE.into(), queries: &[q!("rust")] },

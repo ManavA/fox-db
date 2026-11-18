@@ -19,3 +19,5 @@
 ; `callback=parse`), and a base class: a reference. Parameters and locals are dropped.
 (argument_list [(identifier) @name (attribute attribute: (identifier) @name)]) @reference.ref
 (keyword_argument value: [(identifier) @name (attribute attribute: (identifier) @name)]) @reference.ref
+; Base classes (`class A(Base)`, `class A(mod.Base)`): named supertypes.
+(class_definition superclasses: (argument_list [(identifier) @name (attribute attribute: (identifier) @name)])) @reference.implementation

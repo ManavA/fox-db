@@ -369,6 +369,18 @@ pub(crate) fn migrate(c: &Connection) -> Result<()> {
              PRAGMA user_version = 16;",
         )?;
     }
+    if v < 17 {
+        // 0.2.2: named supertypes get their own reference kind (`impl`) in every grammar, Go
+        // interfaces record the interfaces they embed, more local and constant forms are left
+        // out, and same-file members through another object's receiver are no longer certain.
+        // Every code file parses again once, and references re-score.
+        c.execute_batch(
+            "UPDATE ts_file SET hash = '', size = -1;
+             INSERT OR REPLACE INTO meta(k, v)
+               SELECT 'rescore:' || p.id, 1 FROM project p WHERE EXISTS (SELECT 1 FROM ts_ref r WHERE r.project_id = p.id);
+             PRAGMA user_version = 17;",
+        )?;
+    }
     // Cheap when already set: the setting lives in each table's own config.
     for t in MERGE_TABLES {
         defer_merges(c, t)?;
@@ -670,7 +682,7 @@ pub fn minority(c: &Connection, ranges: &[(i64, i64)]) -> bool {
 }
 
 /// The schema version this build writes.
-pub const LATEST: i64 = 16;
+pub const LATEST: i64 = 17;
 
 /// Read-only connection for the hot paths. None if the store does not exist yet.
 pub fn open_ro() -> Option<Connection> {

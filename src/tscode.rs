@@ -356,7 +356,7 @@ pub fn run(c: &Connection, p: &Project, sym: &str, rel: &str, depth: usize, curs
             // Supertype references (`reference.implementation` / `reference.class`) resolved to this type.
             lines.push(format!("{rel} of {}", top.row()));
             let mut q = c.prepare_cached(&format!(
-                "SELECT DISTINCT {COLS} FROM ts_ref r JOIN node n ON n.id = r.src WHERE r.dst = ?1 AND r.dst != 0 AND r.kind = 'ref' AND json_extract(n.meta,'$.k') IN ('class','interface','object','struct','enum','trait') ORDER BY n.path, n.line"
+                "SELECT DISTINCT {COLS} FROM ts_ref r JOIN node n ON n.id = r.src WHERE r.dst = ?1 AND r.dst != 0 AND r.kind IN ('ref', 'impl') AND json_extract(n.meta,'$.k') IN ('class','interface','object','struct','enum','trait') ORDER BY n.path, n.line"
             ))?;
             let v: Vec<TSym> = q.query_map([top.id], map)?.flatten().collect();
             lines.push(format!("{} types reference it", v.len()));
@@ -422,7 +422,11 @@ fn impact(c: &Connection, pid: i64, top: &TSym, depth: usize, lines: &mut Vec<St
     // Dispatch: calls to the methods `top` implements count as calls to it; implementations of
     // `top` are first-level dependents.
     let dsp = dispatch(c, pid, top)?;
-    let up: HashMap<i64, String> = dsp.up.iter().map(|m| (m.id, format!(" via {}", m.qname()))).collect();
+    let up: HashMap<i64, &TSym> = dsp.up.iter().map(|m| (m.id, m)).collect();
+    let dynamic = matches!(crate::lang::for_path(&top.path).map(|l| l.family), Some("python" | "js"));
+    // Dependents reached only through a guessed call to an interface or base method: listed,
+    // not followed (a guess through dispatch must not multiply).
+    let mut leaf: HashMap<i64, bool> = HashMap::new();
     let mut disp: HashMap<i64, Disp> = HashMap::new();
     let mut disp_top: HashMap<String, Disp> = HashMap::new();
     for m in &dsp.up {
@@ -449,12 +453,12 @@ fn impact(c: &Connection, pid: i64, top: &TSym, depth: usize, lines: &mut Vec<St
         }
         let ids = frontier.iter().map(i64::to_string).collect::<Vec<_>>().join(",");
         let mut q = c.prepare(&format!(
-            "SELECT src, dst, amb, path, line, kind FROM ts_ref WHERE dst != 0 AND dst IN ({ids}) AND (src != 0 OR kind != 'import') ORDER BY path, line"
+            "SELECT src, dst, amb, path, line, kind, recv, via FROM ts_ref WHERE dst != 0 AND dst IN ({ids}) AND (src != 0 OR kind != 'import') ORDER BY path, line"
         ))?;
         let mut lvl = if d == 0 { std::mem::take(&mut first) } else { Level::default() };
         let mut found: HashMap<i64, Guess> = HashMap::new();
         let mut tops: BTreeMap<String, (Vec<i64>, Guess)> = BTreeMap::new();
-        for (src, dst, amb, path, line, kind) in q
+        for (src, dst, amb, path, line, kind, recv, rvia) in q
             .query_map([], |r| {
                 Ok((
                     r.get::<_, i64>(0)?,
@@ -463,14 +467,28 @@ fn impact(c: &Connection, pid: i64, top: &TSym, depth: usize, lines: &mut Vec<St
                     r.get::<_, String>(3)?,
                     r.get::<_, i64>(4)?,
                     r.get::<_, String>(5)?,
+                    r.get::<_, bool>(6)?,
+                    r.get::<_, Option<String>>(7)?,
                 ))
             })?
             .flatten()
         {
-            let dl: Disp = if d == 0 { up.get(&dst).cloned() } else { None };
-            // Only a call to the interface or base method may dispatch to `top`.
-            if dl.is_some() && kind != "call" {
-                continue;
+            let base = if d == 0 { up.get(&dst).copied() } else { None };
+            if let Some(m) = base {
+                // Only a call to the interface or base method may dispatch to `top`; a guessed one
+                // in Python or JS only through `self`/`this` or a receiver named like the base type.
+                let named = |v: &str| {
+                    let ty = m.parent.as_deref().map(|p| p.rsplit('.').next().unwrap_or(p)).unwrap_or("");
+                    crate::tsindex::SELF_NAMES.contains(&v) || crate::tsindex::via_match(v, ty) > 0
+                };
+                if kind != "call" || amb > 0 && dynamic && !(recv && rvia.as_deref().is_some_and(named)) {
+                    continue;
+                }
+            }
+            let dl: Disp = base.map(|m| format!(" via {}", m.qname()));
+            if d == 0 && src != 0 {
+                let only = base.is_some() && amb > 0;
+                leaf.entry(src).and_modify(|x| *x &= only).or_insert(only);
             }
             let via = if amb > 0 { Some(amb) } else { guess.get(&dst).copied().flatten().map(|_| 0) };
             if d == 0 {
@@ -519,7 +537,7 @@ fn impact(c: &Connection, pid: i64, top: &TSym, depth: usize, lines: &mut Vec<St
         top_seen.extend(tops.keys().cloned());
         lvl.tops = tops;
         guess.extend(found);
-        frontier = lvl.syms.clone();
+        frontier = lvl.syms.iter().copied().filter(|i| !leaf.get(i).copied().unwrap_or(false)).collect();
         levels.push(lvl);
         if cut.is_some() {
             break;
@@ -553,6 +571,7 @@ fn impact(c: &Connection, pid: i64, top: &TSym, depth: usize, lines: &mut Vec<St
     lines.extend(completeness(c, pid, top, &listed, false, "partial at d1")?);
     lines.extend(guessed_elsewhere(c, pid, &syms, &guess, &listed)?);
     lines.extend(cut);
+    lines.extend(dsp.capped);
     for (d, (lvl, v)) in levels.iter().zip(syms).enumerate() {
         lines.push(format!("d{}", d + 1));
         let mut by: BTreeMap<String, Vec<(i64, String)>> = BTreeMap::new();
@@ -577,42 +596,61 @@ fn impact(c: &Connection, pid: i64, top: &TSym, depth: usize, lines: &mut Vec<St
 /// Same-name methods `top` is dispatched with: `up`, the interface or base methods it implements
 /// or overrides (a call to one may reach `top`), and `down`, when `top` is declared in an
 /// interface, the methods implementing it. Named supertypes (`implements`, `extends`, base
-/// classes) are followed both ways; a Go type implements an interface whose methods it all has.
+/// classes) are followed both ways. A Go type implements an interface when it has every method
+/// of it (embedded interfaces included) and the link has evidence: the same directory, or a
+/// file of the type's package that imports the interface's package and names the interface.
 struct Dispatch {
     up: Vec<TSym>,
     down: Vec<TSym>,
+    /// `partial at d1:` when a candidate list was capped.
+    capped: Option<String>,
 }
 
-/// Most same-name Go methods checked against interfaces by method set.
+/// Most same-name Go methods checked against an interface by method set.
 const DISPATCH_GO_MAX: usize = 300;
+/// Most same-name symbols read for dispatch.
+const DISPATCH_SAME_MAX: usize = 2000;
 
 const SYM_PID: &str = "COALESCE(json_extract(n.meta, '$.pid'), 0)";
 
 fn dispatch(c: &Connection, pid: i64, top: &TSym) -> Result<Dispatch> {
-    let mut d = Dispatch { up: vec![], down: vec![] };
+    let mut d = Dispatch { up: vec![], down: vec![], capped: None };
     if !is_callable_kind(&top.kind) || top.parent.as_deref().is_none_or(str::is_empty) {
         return Ok(d);
     }
-    // Same-name symbols with their containers.
+    // Same-name symbols with their containers, interface members (which have one) first.
     let mut q = c.prepare_cached(&format!(
         "SELECT {COLS}, {SYM_PID} FROM node n INDEXED BY node_sym_name
-         WHERE n.project_id = ?1 AND n.kind = 'symbol' AND n.source = 'treesitter' AND n.name = ?2 COLLATE NOCASE LIMIT 2000"
+         WHERE n.project_id = ?1 AND n.kind = 'symbol' AND n.source = 'treesitter' AND n.name = ?2 COLLATE NOCASE
+         ORDER BY {SYM_PID} = 0, n.id LIMIT {DISPATCH_SAME_MAX}"
     ))?;
-    let same: Vec<(TSym, i64)> = q
-        .query_map(params![pid, top.name], |r| Ok((map(r)?, r.get::<_, i64>(7)?)))?
-        .flatten()
-        .filter(|(s, _)| s.name == top.name)
-        .collect();
+    let same: Vec<(TSym, i64)> = q.query_map(params![pid, top.name], |r| Ok((map(r)?, r.get::<_, i64>(7)?)))?.flatten().collect();
+    let read = same.len();
     let fam = |p: &str| crate::lang::for_path(p).map(|l| l.family).unwrap_or("");
-    let same: Vec<(TSym, i64)> = same.into_iter().filter(|(s, _)| s.id != top.id && fam(&s.path) == fam(&top.path)).collect();
+    let same: Vec<(TSym, i64)> =
+        same.into_iter().filter(|(s, _)| s.name == top.name && s.id != top.id && fam(&s.path) == fam(&top.path)).collect();
     if same.is_empty() {
         return Ok(d);
     }
+    let cap = |checked: usize, of: &str| format!("partial at d1: dispatch checked the first {checked} of {of} same-name methods");
+    if read >= DISPATCH_SAME_MAX {
+        d.capped = Some(cap(DISPATCH_SAME_MAX, "more"));
+    }
     let mut owners = Owners::default();
     let Some(owner) = owner_type(c, pid, top, &mut owners)? else { return Ok(d) };
+    if fam(&top.path) == "go" {
+        go_dispatch(c, pid, &owner, &same, &mut owners, &mut d)?;
+        if d.capped.is_none() && same.len() > DISPATCH_GO_MAX && owner.kind == "interface" {
+            d.capped = Some(cap(DISPATCH_GO_MAX, &same.len().to_string()));
+        }
+        return Ok(d);
+    }
     let ups = related_types(c, owner.id, true)?;
     let downs =
         if matches!(owner.kind.as_str(), "interface" | "trait" | "protocol") { related_types(c, owner.id, false)? } else { HashSet::new() };
+    if ups.is_empty() && downs.is_empty() {
+        return Ok(d);
+    }
     for (s, spid) in &same {
         let spid = if *spid != 0 { Some(*spid) } else { owner_type(c, pid, s, &mut owners)?.map(|t| t.id) };
         match spid {
@@ -621,29 +659,87 @@ fn dispatch(c: &Connection, pid: i64, top: &TSym) -> Result<Dispatch> {
             _ => {}
         }
     }
-    // Go: implicit interfaces, by method set (names only), within a bounded candidate list.
-    if fam(&top.path) == "go" {
-        let mut sets: HashMap<i64, HashSet<String>> = HashMap::new();
-        let owner_set = method_set(c, pid, &owner, &mut sets)?;
-        for (s, _) in same.iter().take(DISPATCH_GO_MAX) {
-            if d.up.iter().chain(&d.down).any(|x| x.id == s.id) {
-                continue;
-            }
-            let Some(t) = owner_type(c, pid, s, &mut owners)? else { continue };
-            let t_set = method_set(c, pid, &t, &mut sets)?;
-            if t.kind == "interface" && owner.kind != "interface" && !t_set.is_empty() && t_set.is_subset(&owner_set) {
-                d.up.push(s.clone());
-            } else if owner.kind == "interface" && t.kind != "interface" && !owner_set.is_empty() && owner_set.is_subset(&t_set) {
-                d.down.push(s.clone());
-            }
-        }
-    }
     Ok(d)
 }
 
+/// Go: implicit interfaces by method set, with evidence for each link (see [`Dispatch`]).
+fn go_dispatch(c: &Connection, pid: i64, owner: &TSym, same: &[(TSym, i64)], owners: &mut Owners, d: &mut Dispatch) -> Result<()> {
+    let mut sets: HashMap<i64, Option<HashSet<String>>> = HashMap::new();
+    let mut evidence: HashMap<(i64, String), bool> = HashMap::new();
+    if owner.kind == "interface" {
+        let Some(want) = method_set(c, pid, owner, &mut sets, 0)? else { return Ok(()) };
+        if want.is_empty() {
+            return Ok(());
+        }
+        // Types in the interface's own directory first.
+        let mut cands: Vec<&TSym> = same.iter().filter(|(_, spid)| *spid == 0).map(|(s, _)| s).collect();
+        let here = owner.path.rsplit_once('/').map(|x| x.0).unwrap_or("");
+        cands.sort_by_key(|s| s.path.rsplit_once('/').map(|x| x.0).unwrap_or("") != here);
+        for s in cands.into_iter().take(DISPATCH_GO_MAX) {
+            let Some(t) = owner_type(c, pid, s, owners)? else { continue };
+            if t.kind == "interface" || !method_set(c, pid, &t, &mut sets, 0)?.is_some_and(|have| want.is_subset(&have)) {
+                continue;
+            }
+            if go_evidence(c, pid, owner, &t, &mut evidence)? {
+                d.down.push(s.clone());
+            }
+        }
+    } else {
+        let Some(have) = method_set(c, pid, owner, &mut sets, 0)? else { return Ok(()) };
+        // Interface methods: their container is the interface.
+        for (s, spid) in same.iter().filter(|(_, spid)| *spid != 0).take(DISPATCH_GO_MAX) {
+            let Some(iface) = by_id(c, *spid).filter(|t| t.kind == "interface") else { continue };
+            if !method_set(c, pid, &iface, &mut sets, 0)?.is_some_and(|want| !want.is_empty() && want.is_subset(&have)) {
+                continue;
+            }
+            if go_evidence(c, pid, &iface, owner, &mut evidence)? {
+                d.up.push(s.clone());
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Evidence that Go type `t` is used as interface `iface`: both in one directory, or a file in
+/// `t`'s directory that imports `iface`'s package and names the interface (`var _ I = (*T)(nil)`,
+/// a parameter or conversion).
+fn go_evidence(c: &Connection, pid: i64, iface: &TSym, t: &TSym, cache: &mut HashMap<(i64, String), bool>) -> Result<bool> {
+    let dir_of = crate::tsindex::dir_of;
+    let (idir, tdir) = (dir_of(&iface.path), dir_of(&t.path));
+    if idir == tdir {
+        return Ok(true);
+    }
+    if let Some(v) = cache.get(&(iface.id, tdir.to_string())) {
+        return Ok(*v);
+    }
+    let lo = if tdir.is_empty() { String::new() } else { format!("{tdir}/") };
+    let hi = if tdir.is_empty() { "\u{10ffff}".to_string() } else { format!("{tdir}0") };
+    let files: Vec<String> = {
+        let mut q = c.prepare_cached("SELECT path FROM ts_file WHERE project_id = ?1 AND path >= ?2 AND path < ?3 LIMIT 500")?;
+        q.query_map(params![pid, lo, hi], |r| r.get::<_, String>(0))?.flatten().filter(|p| !p[lo.len()..].contains('/')).collect()
+    };
+    let ends = |a: &str, b: &str| a == b || a.ends_with(b) && a[..a.len() - b.len()].ends_with('/');
+    let mut imports = c.prepare_cached("SELECT name FROM ts_ref WHERE project_id = ?1 AND path = ?2 AND kind = 'import'")?;
+    let mut word = c.prepare_cached("SELECT 1 FROM fts_word WHERE fts_word MATCH ?1 AND rowid = ?2")?;
+    let w = format!("words:\"{}\"", crate::tsindex::case_word(&iface.name));
+    let mut found = false;
+    for f in files {
+        let imports_it = imports
+            .query_map(params![pid, f], |r| r.get::<_, String>(0))?
+            .flatten()
+            .any(|i| ends(i.trim_matches('"'), idir) || ends(idir, i.trim_matches('"')));
+        if imports_it && word.exists(params![w, crate::tsindex::word_rowid(pid, &f)])? {
+            found = true;
+            break;
+        }
+    }
+    cache.insert((iface.id, tdir.to_string()), found);
+    Ok(found)
+}
+
 /// The type declaring method `m`: its container, or (Go methods sit outside their type) the
-/// type of that name in the same directory.
-/// Types found by `owner_type`, by (directory, name) for types outside their methods.
+/// type of that name in the same directory. Types outside their methods are cached by
+/// (directory, name).
 type Owners = HashMap<(String, String), Option<TSym>>;
 
 fn owner_type(c: &Connection, pid: i64, m: &TSym, cache: &mut Owners) -> Result<Option<TSym>> {
@@ -657,29 +753,32 @@ fn owner_type(c: &Connection, pid: i64, m: &TSym, cache: &mut Owners) -> Result<
     if let Some(t) = cache.get(&key) {
         return Ok(t.clone());
     }
+    let lo = if dir.is_empty() { String::new() } else { format!("{dir}/") };
+    let hi = if dir.is_empty() { "\u{10ffff}".to_string() } else { format!("{dir}0") };
     let mut q = c.prepare_cached(&format!(
-        "SELECT {COLS} FROM node n INDEXED BY node_sym_name
-         WHERE n.project_id = ?1 AND n.kind = 'symbol' AND n.source = 'treesitter' AND n.name = ?2 COLLATE NOCASE LIMIT 2000"
+        "SELECT {COLS} FROM node n INDEXED BY node_project_path
+         WHERE n.project_id = ?1 AND n.path >= ?2 AND n.path < ?3 AND n.kind = 'symbol' AND n.source = 'treesitter' AND n.name = ?4"
     ))?;
     let t = q
-        .query_map(params![pid, parent], map)?
+        .query_map(params![pid, lo, hi, parent], map)?
         .flatten()
-        .find(|t| t.name == parent && is_type_kind(&t.kind) && t.path.rsplit_once('/').map(|x| x.0).unwrap_or("") == dir);
+        .find(|t| is_type_kind(&t.kind) && t.path.rsplit_once('/').map(|x| x.0).unwrap_or("") == dir);
     cache.insert(key, t.clone());
     Ok(t)
 }
 
 /// Types reachable from `t` by named supertype references, upward (`up`) or downward, three
-/// steps at most.
+/// steps at most. A supertype reference is an `impl` row (`implements`, `extends`, a base
+/// class), or, for grammars that tag supertypes as plain type references, one on the type's
+/// own line; a type named in the body (a field's type) is no supertype.
 fn related_types(c: &Connection, t: i64, up: bool) -> Result<HashSet<i64>> {
-    // A supertype is named on the type's own line (`class A(Base)`, `class R implements Router`);
-    // a type named in its body (a field's type) is no supertype.
     let sql = if up {
         "SELECT DISTINCT r.dst FROM ts_ref r JOIN node n ON n.id = r.dst JOIN node s ON s.id = r.src
-         WHERE r.src = ?1 AND r.src != 0 AND r.dst != 0 AND r.kind = 'ref' AND r.line = s.line
+         WHERE r.src = ?1 AND r.src != 0 AND r.dst != 0 AND (r.kind = 'impl' OR r.kind = 'ref' AND r.line = s.line)
            AND json_extract(n.meta,'$.k') IN ('class','interface','object','struct','enum','trait','protocol')"
     } else {
-        "SELECT DISTINCT r.src FROM ts_ref r JOIN node n ON n.id = r.src WHERE r.dst = ?1 AND r.dst != 0 AND r.kind = 'ref' AND r.line = n.line
+        "SELECT DISTINCT r.src FROM ts_ref r JOIN node n ON n.id = r.src
+         WHERE r.dst = ?1 AND r.dst != 0 AND (r.kind = 'impl' OR r.kind = 'ref' AND r.line = n.line)
            AND json_extract(n.meta,'$.k') IN ('class','interface','object','struct','enum','trait','protocol')"
     };
     let mut q = c.prepare_cached(sql)?;
@@ -699,19 +798,41 @@ fn related_types(c: &Connection, t: i64, up: bool) -> Result<HashSet<i64>> {
     Ok(seen)
 }
 
-/// Method names of type `t`: its members, or (Go) the methods named with it as receiver in its
-/// directory.
-fn method_set(c: &Connection, pid: i64, t: &TSym, cache: &mut HashMap<i64, HashSet<String>>) -> Result<HashSet<String>> {
+/// Method names of Go type `t`: an interface's own methods and those of the interfaces it
+/// embeds, or a type's methods (named with it as receiver in its directory). None when an
+/// embedded interface is not in the project: its methods are unknown.
+fn method_set(
+    c: &Connection,
+    pid: i64,
+    t: &TSym,
+    cache: &mut HashMap<i64, Option<HashSet<String>>>,
+    depth: usize,
+) -> Result<Option<HashSet<String>>> {
     if let Some(s) = cache.get(&t.id) {
         return Ok(s.clone());
     }
-    let mut set: HashSet<String> = {
+    let mut set: HashSet<String> = HashSet::new();
+    if t.kind == "interface" {
         let mut q = c.prepare_cached(
             "SELECT name FROM node WHERE kind = 'symbol' AND json_extract(meta, '$.pid') = ?1 AND json_extract(meta,'$.k') = 'method'",
         )?;
-        q.query_map([t.id], |r| r.get::<_, String>(0))?.flatten().collect()
-    };
-    if t.kind != "interface" {
+        set.extend(q.query_map([t.id], |r| r.get::<_, String>(0))?.flatten());
+        let embeds: Vec<i64> = {
+            let mut q = c.prepare_cached("SELECT dst FROM ts_ref WHERE src = ?1 AND src != 0 AND kind = 'impl'")?;
+            q.query_map([t.id], |r| r.get::<_, i64>(0))?.flatten().collect()
+        };
+        for e in embeds {
+            let inner = match by_id(c, e).filter(|x| x.kind == "interface") {
+                Some(x) if depth < 5 => method_set(c, pid, &x, cache, depth + 1)?,
+                _ => None,
+            };
+            let Some(inner) = inner else {
+                cache.insert(t.id, None);
+                return Ok(None);
+            };
+            set.extend(inner);
+        }
+    } else {
         let dir = t.path.rsplit_once('/').map(|x| x.0).unwrap_or("");
         let lo = if dir.is_empty() { String::new() } else { format!("{dir}/") };
         let hi = if dir.is_empty() { "\u{10ffff}".to_string() } else { format!("{dir}0") };
@@ -725,13 +846,15 @@ fn method_set(c: &Connection, pid: i64, t: &TSym, cache: &mut HashMap<i64, HashS
             }
         }
     }
-    cache.insert(t.id, set.clone());
-    Ok(set)
+    cache.insert(t.id, Some(set.clone()));
+    Ok(Some(set))
 }
 
 /// `partial at dN:` when a call named like a dependent the walk expanded (any level but the
-/// last) was guessed to another same-name definition, in a file the answer does not list: that
-/// call may reach the dependent instead. One line, for the shallowest such level.
+/// last), in a file the answer does not list, was guessed to another same-name definition that
+/// ours was a real alternative to: through a receiver named like our dependent's type, or
+/// (no receiver) to a definition in our dependent's directory or no nearer the call than ours.
+/// That call may reach the dependent instead. One line, for the shallowest such level.
 fn guessed_elsewhere(
     c: &Connection,
     pid: i64,
@@ -739,23 +862,49 @@ fn guessed_elsewhere(
     walked: &HashMap<i64, Guess>,
     listed: &HashSet<String>,
 ) -> Result<Option<String>> {
-    let mut q =
-        c.prepare_cached("SELECT path, dst FROM ts_ref WHERE project_id = ?1 AND name = ?2 AND amb > 0 AND dst != 0 AND kind = 'call'")?;
+    use crate::tsindex::{common_dirs, dir_of, via_match};
+    let mut q = c.prepare_cached(
+        "SELECT path, dst, recv, via FROM ts_ref WHERE project_id = ?1 AND name = ?2 AND amb > 0 AND dst != 0 AND kind = 'call' LIMIT 5000",
+    )?;
+    let mut dst_path: HashMap<i64, Option<String>> = HashMap::new();
     let mut asked = 0;
     for (d, lvl) in levels.iter().enumerate().take(levels.len().saturating_sub(1)) {
-        let mut names: Vec<&str> = lvl.iter().map(|s| s.name.as_str()).collect();
-        names.sort_unstable();
-        names.dedup();
+        let mut by_name: BTreeMap<&str, Vec<&TSym>> = BTreeMap::new();
+        for s in lvl {
+            by_name.entry(s.name.as_str()).or_default().push(s);
+        }
         let mut files: HashSet<String> = HashSet::new();
         let mut which: Vec<&str> = vec![];
-        for name in names {
+        for (name, ours) in by_name {
             asked += 1;
-            if asked > 500 {
+            if asked > 200 {
                 return Ok(None);
             }
-            for (path, dst) in q.query_map(params![pid, name], |r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?)))?.flatten() {
-                if !walked.contains_key(&dst) && !listed.contains(&path) && files.insert(path) && which.last() != Some(&name) {
-                    which.push(name);
+            let rows = q.query_map(params![pid, name], |r| {
+                Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?, r.get::<_, bool>(2)?, r.get::<_, Option<String>>(3)?))
+            })?;
+            for (path, dst, recv, via) in rows.flatten() {
+                if walked.contains_key(&dst) || listed.contains(&path) || files.contains(&path) {
+                    continue;
+                }
+                let could = if recv {
+                    via.as_deref().is_some_and(|v| {
+                        ours.iter().any(|o| {
+                            let ty = o.parent.as_deref().map(|p| p.rsplit('.').next().unwrap_or(p)).unwrap_or("");
+                            !ty.is_empty() && via_match(v, ty) > 0
+                        })
+                    })
+                } else {
+                    let dp = dst_path.entry(dst).or_insert_with(|| by_id(c, dst).map(|s| s.path)).clone();
+                    dp.is_some_and(|dp| {
+                        ours.iter().any(|o| dir_of(&dp) == dir_of(&o.path) || common_dirs(&path, &dp) == common_dirs(&path, &o.path))
+                    })
+                };
+                if could {
+                    files.insert(path);
+                    if which.last() != Some(&name) {
+                        which.push(name);
+                    }
                 }
             }
         }

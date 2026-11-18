@@ -674,12 +674,12 @@ fn impact_says_when_the_walk_was_cut_or_guessed() {
     assert!(!out.contains("partial"), "the depth asked for is no cut: {out}");
     let out = run("f3", 4);
     assert!(!out.contains("partial"), "{out}");
-    // `pick_one` has two definitions: the calls in y/sub/ and z/ are guessed to the other one
-    // (nearer, or first of a tie), so they may still reach `base` through this one.
+    // `pick_one` has two definitions: the call in y/sub/ is guessed to the one nearer it (no
+    // tie, so not ours); the call in z/ is a tie between both, so it may still reach `base`.
     let out = run("base", 2);
     assert!(out.contains(":1 pick_one c:") && !out.contains("user c:") && !out.contains("other c:"), "{out}");
     assert!(
-        out.contains("\npartial at d2: calls in 2 other files were guessed to another `pick_one`; they may reach a d1 dependent"),
+        out.contains("\npartial at d2: calls in 1 other file were guessed to another `pick_one`; they may reach a d1 dependent"),
         "{out}"
     );
     // The guessed call, as a dependent: marked, and nothing is missing.
@@ -710,4 +710,191 @@ fn go_package_calls_follow_the_full_import_path() {
         let out = fox_code(&p, &format!("c:{:x}", id(other)), "callers", 800);
         assert!(out.contains("0 call sites"), "{other}: {out}");
     }
+}
+
+/// Finding a function's parameters and locals is linear in its size: a function nested
+/// thousands of levels deep (a long `else if` chain) indexes in about the time of a flat one.
+#[test]
+fn deeply_nested_functions_index_in_linear_time() {
+    let _g = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    let mut body = String::from("int complete(const char *t, int n)\n{\n  if (match(t, \"A\"))\n    n = take(n, 0);\n");
+    for i in 0..3000 {
+        body += &format!("  else if (match(t, \"A{i}\"))\n    n = take(n, {i});\n");
+    }
+    body += "  return n;\n}\nint match(const char *a, const char *b) { return 0; }\nint take(int a, int b) { return a; }\n";
+    let t = std::time::Instant::now();
+    let (_h, _r, p) = inline_project(&[("src/tab.c", body.as_str())]);
+    let took = t.elapsed();
+    assert!(took < std::time::Duration::from_secs(4), "indexing took {took:?}");
+    let out = fox_code(&p, "take", "callers", 400);
+    assert!(out.contains("3001 call sites in 1 files"), "{out}");
+}
+
+/// Go dispatch needs evidence beyond matching names: the interface in the same directory as
+/// the type, or a file of the type's package that imports the interface's package and names
+/// the interface. A one-method interface elsewhere links nothing on its name alone. Callers of
+/// the interface method found by name guesses are listed but not followed further.
+#[test]
+fn go_dispatch_needs_evidence_and_does_not_multiply_guesses() {
+    let _g = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    let (_h, _r, p) = inline_project(&[
+        ("pkg/utilnet/net.go", "package utilnet\n\ntype Closeable interface {\n\tClose() error\n}\n"),
+        ("pkg/web/writer.go", "package web\n\ntype Writer struct{}\n\nfunc (w *Writer) Close() error { return nil }\n"),
+        (
+            "pkg/store/conn.go",
+            "package store\n\nimport \"example.com/pkg/utilnet\"\n\ntype Conn struct{}\n\nfunc (c *Conn) Close() error { return nil }\n\nvar _ utilnet.Closeable = (*Conn)(nil)\n",
+        ),
+        ("pkg/app/use.go", "package app\n\nimport \"example.com/pkg/utilnet\"\n\nfunc Shut(c utilnet.Closeable) { c.Close() }\n"),
+        ("pkg/app/main.go", "package app\n\nfunc Main() { Shut(nil) }\n"),
+    ]);
+    let out = fox_code(&p, "Writer.Close", "impact", 2000);
+    assert!(!out.contains("Shut") && !out.contains("via"), "{out}");
+    let out = fox_code(&p, "Conn.Close", "impact", 2000);
+    assert!(out.contains(":5 Shut c:") && out.contains(" via Closeable.Close"), "{out}");
+    // Shut reached Close only through a name guess: it is not followed to Main.
+    assert!(!out.contains("Main"), "{out}");
+    let out = fox_code(&p, "Closeable.Close", "impact", 2000);
+    assert!(out.contains("Conn.Close") && !out.contains("Writer.Close"), "{out}");
+}
+
+/// Go method sets include embedded interfaces; an interface embedding one that is not in the
+/// project is skipped, not treated as smaller. A capped candidate list says so.
+#[test]
+fn go_interface_method_sets_expand_embeds_and_caps_are_reported() {
+    let _g = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    let mut many = String::from("package many\n\ntype Stopper interface {\n\tStop() error\n}\n");
+    for i in 0..320 {
+        many += &format!("\ntype T{i} struct{{}}\n\nfunc (T{i}) Stop() error {{ return nil }}\n");
+    }
+    let (_h, _r, p) = inline_project(&[
+        (
+            "pkg/rw/rw.go",
+            "package rw\n\nimport \"io\"\n\ntype Reader interface {\n\tRead() int\n}\n\ntype ReadCloser interface {\n\tReader\n\tClose() error\n}\n\ntype IOCloser interface {\n\tio.Reader\n\tClose() error\n}\n\ntype File struct{}\n\nfunc (f *File) Close() error { return nil }\n\ntype Pipe struct{}\n\nfunc (p *Pipe) Close() error { return nil }\n\nfunc (p *Pipe) Read() int { return 0 }\n",
+        ),
+        ("pkg/many/many.go", many.as_str()),
+    ]);
+    let out = fox_code(&p, "ReadCloser.Close", "impact", 2000);
+    assert!(out.contains("Pipe.Close") && !out.contains("File.Close"), "{out}");
+    let out = fox_code(&p, "IOCloser.Close", "impact", 2000);
+    assert!(!out.contains("Pipe.Close") && !out.contains("File.Close"), "{out}");
+    // More same-name methods than the name lookup lists: ask by handle.
+    let id: i64 = db::open_ro()
+        .unwrap()
+        .query_row("SELECT id FROM node WHERE name = 'Stop' AND json_extract(meta, '$.parent') = 'Stopper'", [], |r| r.get(0))
+        .unwrap();
+    let out = fox_code(&p, &format!("c:{id:x}"), "impact", 400);
+    assert!(out.contains("\npartial at d1: dispatch checked"), "{out}");
+}
+
+/// Parameters and locals in every declaration form are not references to a same-name
+/// function, and a bare name never resolves to a method in Python or JS.
+#[test]
+fn locals_in_every_declaration_form_are_not_references() {
+    let _g = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    let (_h, _r, p) = inline_project(&[
+        (
+            "lk/m.go",
+            "package m\n\nfunc v() int { return 1 }\n\nfunc run(ch chan int, x interface{}) {\n\tselect {\n\tcase v := <-ch:\n\t\tuse(v)\n\t}\n\tswitch v := x.(type) {\n\tdefault:\n\t\tuse(v)\n\t}\n}\n\nfunc use(a interface{}) {}\n",
+        ),
+        (
+            "lk/m.js",
+            "class Ctx {\n  get id() { return 1; }\n  args() { return 2; }\n  err() { return 3; }\n}\nfunction run(params, ...args) {\n  const { script: id } = params;\n  log(id);\n  log(args);\n  try { log(1); } catch (err) { log(err); }\n}\nfunction log(x) { return x; }\n",
+        ),
+        (
+            "lk/m.py",
+            "class Rec:\n    @property\n    def name(self):\n        return \"n\"\n\n    def args(self):\n        return 1\n\ndef show(names, *args, **kwargs):\n    print([emit(name) for name in names])\n    emit(args)\n    emit(kwargs)\n    if (n := len(names)):\n        emit(n)\n\ndef emit(x):\n    return x\n",
+        ),
+        ("pkg/conf.py", "def path(route, view):\n    return (route, view)\n\ndef item():\n    return 1\n"),
+        (
+            "pkg/use.py",
+            "from pkg.conf import path\n\ndef resolve_all(paths, items):\n    out = [resolve(path) for path in paths]\n    with open(\"x\") as item:\n        consume(item)\n    try:\n        pass\n    except Exception as path2:\n        log(path2)\n    return out\n\ndef resolve(p):\n    return p\n\ndef consume(x):\n    pass\n\ndef log(x):\n    pass\n\nfor item in [1, 2]:\n    consume(item)\n",
+        ),
+        (
+            "src/handle.c",
+            "int handle(int x) { return x; }\nint walk(int (*cb)(int), int v);\nint run(int handle, int v)\n{\n#ifdef FAST\n  return walk(handle, v);\n#else\n  return walk(handle, v + 1);\n#endif\n}\n",
+        ),
+    ]);
+    for q in ["v", "Ctx.id", "Ctx.args", "Ctx.err", "Rec.name", "Rec.args", "handle"] {
+        let out = fox_code(&p, q, "refs", 800);
+        assert!(out.contains("0 refs"), "{q}: {out}");
+    }
+    let out = fox_code(&p, "path", "refs", 800);
+    assert!(!out.contains(":4 "), "{out}");
+    let out = fox_code(&p, "item", "refs", 800);
+    assert!(!out.contains(":6 ") && !out.contains(":23 "), "{out}");
+}
+
+/// A member value passed as an argument (`log(request.id)`) is not a certain reference to a
+/// same-file member of another type; through `this` or `self` it is.
+#[test]
+fn member_values_are_not_same_file_members_of_other_types() {
+    let _g = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    let (_h, _r, p) = inline_project(&[
+        (
+            "src/m.js",
+            "class Ctx {\n  get id() { return 1; }\n  show() { log(this.id); }\n}\nfunction handle(request) {\n  log(request.id);\n}\nfunction log(x) { return x; }\n",
+        ),
+        ("app/m.py", "class Rec:\n    def name(self):\n        return 1\n\ndef show(obj):\n    emit(obj.name)\n\ndef emit(x):\n    return x\n"),
+    ]);
+    let out = fox_code(&p, "Ctx.id", "refs", 800);
+    assert!(out.contains(":3 Ctx.show") && !out.contains("handle"), "{out}");
+    let out = fox_code(&p, "Rec.name", "refs", 800);
+    assert!(out.contains("0 refs"), "{out}");
+}
+
+/// Supertypes named on a later line than the class name count (`export class Multi\n
+/// implements Router`, `class A(\n    Base)`), and plain JS `extends` gives dispatch too.
+#[test]
+fn supertypes_on_later_lines_and_js_extends_dispatch() {
+    let _g = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    let (_h, _r, p) = inline_project(&[
+        (
+            "src/iface.ts",
+            "export interface Router {\n  route(p: string): void;\n}\nexport class Multi\n  implements Router {\n  route(p: string): void {}\n}\n",
+        ),
+        ("ext/base.py", "class Base:\n    def run(self):\n        pass\n\n    def start(self):\n        self.run()\n"),
+        ("ext/a.py", "from ext.base import Base\n\n\nclass A(\n    Base,\n):\n    def run(self):\n        pass\n"),
+        ("js/base.js", "export class Base {\n  run() { return 1; }\n}\nexport function go(base) { return base.run(); }\n"),
+        ("js/child.js", "import { Base } from './base';\nexport class Child extends Base {\n  run() { return 2; }\n}\n"),
+    ]);
+    let out = fox_code(&p, "Router.route", "impact", 2000);
+    assert!(out.contains("Multi.route") && out.contains(" implements Router.route"), "{out}");
+    let out = fox_code(&p, "A.run", "impact", 2000);
+    assert!(out.contains("Base.start c:") && out.contains(" via Base.run"), "{out}");
+    let out = fox_code(&p, "Child.run", "impact", 2000);
+    assert!(out.contains(":4 go c:") && out.contains(" via Base.run"), "{out}");
+}
+
+/// Dispatch in Python and JS follows calls through `self`/`this` or a receiver named like the
+/// base type, not a call on some other object that a name guess put on the base method.
+#[test]
+fn dynamic_dispatch_ignores_calls_on_other_objects() {
+    let _g = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    let (_h, _r, p) = inline_project(&[
+        (
+            "db/base.py",
+            "class BaseDatabaseWrapper:\n    def close(self):\n        pass\n\n    def _close(self):\n        self.connection.close()\n\n    def __del__(self):\n        self.close()\n",
+        ),
+        (
+            "db/sqlite.py",
+            "from db.base import BaseDatabaseWrapper\n\n\nclass DatabaseWrapper(BaseDatabaseWrapper):\n    def close(self):\n        pass\n",
+        ),
+    ]);
+    let out = fox_code(&p, "DatabaseWrapper.close", "impact", 2000);
+    assert!(out.contains("__del__") && !out.contains("_close"), "{out}");
+}
+
+/// C and C++ constants and macros passed as arguments (`elog(ERROR, ...)`) are no references.
+#[test]
+fn c_all_caps_arguments_are_not_stored() {
+    let _g = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    let (_h, _r, p) = inline_project(&[(
+        "src/e.c",
+        "void elog(int level, const char *m);\nint f(void) { elog(ERROR, \"x\"); elog(LOG_LEVEL, \"y\"); return 0; }\n",
+    )]);
+    let c = db::open_ro().unwrap();
+    let n: i64 = c
+        .query_row("SELECT COUNT(*) FROM ts_ref WHERE project_id = ?1 AND name IN ('ERROR', 'LOG_LEVEL')", [p.id], |r| r.get(0))
+        .unwrap();
+    assert_eq!(n, 0);
 }

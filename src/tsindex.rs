@@ -92,13 +92,16 @@ fn ref_kind(suffix: &str) -> &'static str {
     match suffix {
         "call" | "send" => "call",
         "import" => "import",
+        // A named supertype (`implements`, `extends`, a base class): kept apart from other type
+        // references so dispatch can trust it.
+        "implementation" => "impl",
         _ => "ref",
     }
 }
 
 /// Is this call name reached through a receiver expression (`x.f`, `x->f`, `[x f]`, `x::f`)?
-fn has_receiver(n: tree_sitter::Node) -> bool {
-    let Some(p) = n.parent() else { return false };
+fn has_receiver(n: tree_sitter::Node, p: Option<tree_sitter::Node>) -> bool {
+    let Some(p) = p else { return false };
     let k = p.kind();
     if ["navigation", "member", "field", "selector", "attribute", "scoped", "qualified"].iter().any(|w| k.contains(w)) {
         return p.named_child(0).is_some_and(|c| c.id() != n.id());
@@ -108,8 +111,8 @@ fn has_receiver(n: tree_sitter::Node) -> bool {
 
 /// The last name of the receiver a call goes through: `x` in `x.f()`, `Evaluator` in
 /// `pl.Evaluator.Preempt()`. None for calls, indexing or literals as receivers.
-fn receiver_name(n: tree_sitter::Node, src: &[u8]) -> Option<String> {
-    let p = n.parent()?;
+fn receiver_name(n: tree_sitter::Node, p: Option<tree_sitter::Node>, src: &[u8]) -> Option<String> {
+    let p = p?;
     let mut r = p.child_by_field_name("object").or_else(|| p.child_by_field_name("operand")).or_else(|| p.child_by_field_name("argument"));
     if r.is_none() {
         r = p.named_child(0).filter(|c| c.id() != n.id());
@@ -149,76 +152,158 @@ const FN_KINDS: &[&str] = &[
 /// element, a keyed value), or just a parameter or local of the enclosing function.
 const VALUE_SLOTS: &[&str] = &["literal_element", "initializer_pair", "initializer_list", "argument_list", "arguments", "keyword_argument"];
 
-/// The names declared as parameters or locals in each outermost function, computed once per
-/// function (a file passes many identifiers as arguments).
-#[derive(Default)]
-struct Locals(HashMap<usize, HashSet<String>>);
+/// Parameter lists: a name declared in one outside any function body (a C prototype) is no
+/// file-level local.
+const PARAM_LISTS: &[&str] = &["parameter_list", "parameters", "formal_parameters"];
 
-impl Locals {
-    /// Is the identifier `n` declared as a parameter or local of the outermost function enclosing
-    /// it (Go `name := ...`, `var name`, `func f(name string)`; C `int size`; Python and JS
-    /// parameters and assignments)?
-    fn is_local(&mut self, n: tree_sitter::Node, src: &[u8]) -> bool {
-        let Ok(name) = n.utf8_text(src) else { return false };
-        let mut f = None;
-        let mut cur = n.parent();
-        while let Some(x) = cur {
-            if FN_KINDS.contains(&x.kind()) {
-                f = Some(x);
-            }
-            cur = x.parent();
-        }
-        let Some(f) = f else { return false };
-        self.0
-            .entry(f.id())
-            .or_insert_with(|| {
-                let mut names = HashSet::new();
-                let mut stack = vec![f];
-                while let Some(x) = stack.pop() {
-                    if x.kind() == "identifier" && declares(x) {
-                        names.extend(x.utf8_text(src).ok().map(str::to_string));
-                    }
-                    let mut w = x.walk();
-                    stack.extend(x.named_children(&mut w));
-                }
-                names
-            })
-            .contains(name)
-    }
+/// Node kinds that name a declared variable.
+fn is_ident(k: &str) -> bool {
+    matches!(k, "identifier" | "shorthand_property_identifier_pattern")
 }
 
-/// Is identifier `x` in a declaring position: a parameter or variable name, not a use?
-fn declares(x: tree_sitter::Node) -> bool {
+/// What one top-down pass over a file's tree finds.
+struct Walk<'t> {
+    /// Start bytes of identifiers in value slots that name a parameter or local of their
+    /// outermost function, or a name declared at file level (a Python module-level loop
+    /// variable, a C global).
+    locals: HashSet<usize>,
+    /// The parent of every named leaf (by node id): a reference's name node looks up its
+    /// receiver here.
+    parents: HashMap<usize, tree_sitter::Node<'t>>,
+}
+
+/// One top-down pass over the tree (see [`Walk`]). Linear in the tree size: ancestors are kept
+/// on a stack, never looked up with `parent()`, which walks down from the root on every call
+/// and made deeply nested functions (a long `else if` chain) quadratic.
+fn walk_tree<'t>(root: tree_sitter::Node<'t>, src: &[u8]) -> Walk<'t> {
+    let mut parents: HashMap<usize, tree_sitter::Node<'t>> = HashMap::new();
+    let mut funcs: Vec<HashSet<String>> = vec![];
+    let mut file: HashSet<String> = HashSet::new();
+    // (start byte, outermost function, name) of identifiers in value slots.
+    let mut slots: Vec<(usize, Option<usize>, String)> = vec![];
+    let mut anc: Vec<tree_sitter::Node> = vec![];
+    // The outermost function being walked: (its depth, its index in `funcs`).
+    let mut in_fn: Option<(usize, usize)> = None;
+    let mut cur = root.walk();
+    'walk: loop {
+        let n = cur.node();
+        if in_fn.is_none() && FN_KINDS.contains(&n.kind()) {
+            funcs.push(HashSet::new());
+            in_fn = Some((anc.len(), funcs.len() - 1));
+        }
+        if is_ident(n.kind())
+            && let Ok(name) = n.utf8_text(src)
+        {
+            if declares(n, &anc) {
+                match in_fn {
+                    Some((_, i)) => {
+                        funcs[i].insert(name.to_string());
+                    }
+                    None if !anc.iter().any(|a| PARAM_LISTS.contains(&a.kind())) => {
+                        file.insert(name.to_string());
+                    }
+                    None => {}
+                }
+            }
+            if anc.last().is_some_and(|p| VALUE_SLOTS.contains(&p.kind())) {
+                slots.push((n.start_byte(), in_fn.map(|f| f.1), name.to_string()));
+            }
+        }
+        if cur.goto_first_child() {
+            anc.push(n);
+            continue;
+        }
+        if n.is_named()
+            && let Some(p) = anc.last()
+        {
+            parents.insert(n.id(), *p);
+        }
+        loop {
+            // Leaving the node at depth `anc.len()`.
+            if in_fn.is_some_and(|(d, _)| d == anc.len()) {
+                in_fn = None;
+            }
+            if cur.goto_next_sibling() {
+                continue 'walk;
+            }
+            if !cur.goto_parent() {
+                break 'walk;
+            }
+            anc.pop();
+        }
+    }
+    let locals = slots
+        .into_iter()
+        .filter(|(_, f, name)| file.contains(name) || f.is_some_and(|i| funcs[i].contains(name)))
+        .map(|(pos, ..)| pos)
+        .collect();
+    Walk { locals, parents }
+}
+
+/// Is identifier `x` in a declaring position (a parameter or variable name, not a use)?
+/// `anc` holds its ancestors, the parent last.
+fn declares(x: tree_sitter::Node, anc: &[tree_sitter::Node]) -> bool {
     let is_field = |p: tree_sitter::Node, field: &str, c: tree_sitter::Node| p.child_by_field_name(field).is_some_and(|y| y.id() == c.id());
     let mut c = x;
-    while let Some(p) = c.parent() {
+    // Passed through a C function declarator: a function pointer parameter, or a prototype.
+    let mut via_fn_declarator = false;
+    for i in (0..anc.len()).rev() {
+        let p = anc[i];
         match p.kind() {
-            // Python and JS parameters, Python assignments and loop targets, JS declarators.
+            // Python and JS parameters (`*args`, `...rest` pass through their patterns).
             "parameters" | "lambda_parameters" | "formal_parameters" => return true,
             "default_parameter" | "typed_default_parameter" => return is_field(p, "name", c),
             "typed_parameter" => return !is_field(p, "type", c),
-            "assignment" | "for_statement" | "for_in_statement" | "assignment_pattern" => return is_field(p, "left", c),
-            "variable_declarator" => return is_field(p, "name", c),
+            "assignment" | "for_statement" | "for_in_statement" | "for_in_clause" | "assignment_pattern" => {
+                return is_field(p, "left", c);
+            }
+            // Python `with ... as x`, `except E as x`, walrus `(x := ...)`.
+            "as_pattern_target" => return true,
+            "except_clause" => return p.named_child(0).is_some_and(|f| f.id() != c.id()),
+            "named_expression" => return is_field(p, "name", c),
+            // JS declarators, except a name bound to a function (that is a definition).
+            "variable_declarator" => {
+                let fn_value = p
+                    .child_by_field_name("value")
+                    .is_some_and(|v| matches!(v.kind(), "arrow_function" | "function_expression" | "function" | "class"));
+                return is_field(p, "name", c) && !fn_value;
+            }
             "required_parameter" | "optional_parameter" => return is_field(p, "pattern", c),
             "arrow_function" => return is_field(p, "parameter", c),
-            "pattern_list" | "tuple_pattern" | "array_pattern" | "object_pattern" | "shorthand_property_identifier_pattern" => c = p,
-            // Go: `name := ...` and `for name := range ...` (the left-hand list).
-            "expression_list" => {
-                return p.parent().is_some_and(|g| matches!(g.kind(), "short_var_declaration" | "range_clause") && is_field(g, "left", p));
+            "catch_clause" => return is_field(p, "parameter", c),
+            "pair_pattern" => {
+                if !is_field(p, "value", c) {
+                    return false;
+                }
+                c = p;
             }
-            "parameter_declaration"
-            | "variadic_parameter_declaration"
-            | "var_spec"
-            | "const_spec"
-            | "declaration"
-            | "optional_parameter_declaration" => {
+            "pattern_list" | "tuple_pattern" | "list_pattern" | "array_pattern" | "object_pattern" | "rest_pattern"
+            | "list_splat_pattern" | "dictionary_splat_pattern" => c = p,
+            // Go: `name := ...`, `for name := range ...`, `case name := <-ch`,
+            // `switch name := x.(type)` (the left-hand list).
+            "expression_list" => {
+                return i > 0 && {
+                    let g = anc[i - 1];
+                    match g.kind() {
+                        "short_var_declaration" | "range_clause" | "receive_statement" => is_field(g, "left", p),
+                        "type_switch_statement" => is_field(g, "alias", p),
+                        _ => false,
+                    }
+                };
+            }
+            "parameter_declaration" | "variadic_parameter_declaration" | "optional_parameter_declaration" => {
                 return !is_field(p, "type", c) && !is_field(p, "value", c);
             }
-            // C/C++: a declarator wraps the name (`*p`, `a[4]`, `x = 1`).
-            "pointer_declarator" | "array_declarator" | "parenthesized_declarator" | "reference_declarator" | "init_declarator" => {
+            "var_spec" | "const_spec" | "declaration" => {
+                return !via_fn_declarator && !is_field(p, "type", c) && !is_field(p, "value", c);
+            }
+            // C/C++: a declarator wraps the name (`*p`, `a[4]`, `x = 1`, `(*fn)(int)`).
+            "pointer_declarator" | "array_declarator" | "parenthesized_declarator" | "reference_declarator" | "init_declarator"
+            | "function_declarator" => {
                 if !is_field(p, "declarator", c) && p.kind() != "parenthesized_declarator" {
                     return false;
                 }
+                via_fn_declarator |= p.kind() == "function_declarator";
                 c = p;
             }
             _ => return false,
@@ -240,7 +325,8 @@ pub fn extract(l: &Lang, src: &[u8]) -> Parsed {
     let mut cur = QueryCursor::new();
     let mut it = cur.matches(q, tree.root_node(), src);
     let text = |n: tree_sitter::Node| n.utf8_text(src).unwrap_or("").to_string();
-    let mut locals = Locals::default();
+    let walk = walk_tree(tree.root_node(), src);
+    let c_family = l.family == "c";
     while let Some(m) = it.next() {
         let mut name_node = None;
         let mut outer: Option<(tree_sitter::Node, &str)> = None;
@@ -301,18 +387,23 @@ pub fn extract(l: &Lang, src: &[u8]) -> Parsed {
                 stat,
             });
         } else if let Some(k) = cn.strip_prefix("reference.") {
-            // A value in a keyed literal or designated initializer (`Name: name`, `.size = size`)
-            // that names a parameter or local of the enclosing function is no function reference.
-            if ref_kind(k) == "ref" && nn.parent().is_some_and(|p| VALUE_SLOTS.contains(&p.kind())) && locals.is_local(nn, src) {
+            // A value in an argument list, keyed literal or initializer (`f(name)`, `Name: name`,
+            // `.size = size`) that names a parameter or local is no function reference; nor is a
+            // C constant or macro (`elog(ERROR, ...)`).
+            if ref_kind(k) == "ref"
+                && (walk.locals.contains(&nn.start_byte())
+                    || c_family && name.chars().any(|ch| ch.is_ascii_uppercase()) && !name.chars().any(|ch| ch.is_lowercase()))
+            {
                 continue;
             }
+            let parent = walk.parents.get(&nn.id()).copied().or_else(|| nn.parent());
             out.refs.push(Ref {
                 kind: ref_kind(k),
                 name,
                 line: nn.start_position().row as u32 + 1,
                 caller: None,
-                recv: has_receiver(nn),
-                via: if has_receiver(nn) { receiver_name(nn, src) } else { None },
+                recv: has_receiver(nn, parent),
+                via: if has_receiver(nn, parent) { receiver_name(nn, parent, src) } else { None },
                 pos: nn.start_byte(),
             });
         }
@@ -365,8 +456,16 @@ fn nest(p: &mut Parsed) {
         }
     }
     // Refs: innermost definition whose byte range contains the reference (definitions are sorted).
-    p.refs.sort_by_key(|r| r.pos);
-    p.refs.dedup_by(|a, b| a.pos == b.pos && a.name == b.name && a.kind == b.kind);
+    // One reference per name and position: a supertype (`class A(Base)`) also matches the
+    // argument pattern, and keeps its own kind.
+    let rank = |k: &str| match k {
+        "impl" => 0,
+        "call" => 1,
+        "ref" => 2,
+        _ => 3,
+    };
+    p.refs.sort_by(|a, b| (a.pos, rank(a.kind)).cmp(&(b.pos, rank(b.kind))));
+    p.refs.dedup_by(|a, b| a.pos == b.pos && a.name == b.name);
     let mut stack: Vec<usize> = vec![];
     let mut di = 0;
     for r in p.refs.iter_mut() {
@@ -1007,6 +1106,9 @@ impl FileImports {
 
 const UNIQUE_FALLBACK: &[&str] = &["c", "bash", "lua", "ruby", "php", "dart", "dotnet", "swift"];
 
+/// Receivers that name the enclosing object itself.
+pub(crate) const SELF_NAMES: &[&str] = &["self", "this", "cls", "super"];
+
 /// Most same-score candidates a name-only guess picks among (receiver calls, C free functions).
 const GUESS_MAX: usize = 3;
 
@@ -1015,13 +1117,13 @@ fn is_header(p: &str) -> bool {
 }
 
 /// Leading directories two paths share.
-fn common_dirs(a: &str, b: &str) -> i32 {
+pub(crate) fn common_dirs(a: &str, b: &str) -> i32 {
     dir_of(a).split('/').zip(dir_of(b).split('/')).take_while(|(x, y)| x == y && !x.is_empty()).count() as i32
 }
 
 /// How well a receiver name of three or more characters matches a type name: 20 for the same
 /// name in any case, 12 when the type name ends with it as a word (`inputs` / `SessionInputs`).
-fn via_match(via: &str, ty: &str) -> i32 {
+pub(crate) fn via_match(via: &str, ty: &str) -> i32 {
     // One- and two-letter receivers (`t`, `ev`) say too little.
     if via.len() < 3 {
         return 0;
@@ -1054,7 +1156,7 @@ fn is_aux(p: &str) -> bool {
     p.split('/').rev().skip(1).any(|d| matches!(d, "test" | "tests" | "testing" | "samples" | "examples" | "tools"))
 }
 
-fn dir_of(p: &str) -> &str {
+pub(crate) fn dir_of(p: &str) -> &str {
     p.rsplit_once('/').map(|x| x.0).unwrap_or("")
 }
 fn stem_of(p: &str) -> &str {
@@ -1072,11 +1174,16 @@ fn score(r: &RefRow, cands: &[Cand], imp: Option<&FileImports>) -> (i64, i64) {
     // C/C++: one global namespace. A prototype stands for its definition, so it is no candidate
     // while a visible definition of the name exists.
     let c_fam = fam == "c";
+    // Languages where a receiver's type is unknown until run time.
+    let dynamic = matches!(fam, "python" | "js");
     let has_def = c_fam && cands.iter().any(|s| s.family == fam && !s.decl && (s.path == r.path || !s.file_local && !s.local));
     // A receiver named exactly like a candidate's type (`pl.Evaluator.Preempt()`) rules out a
     // same-file member of another type (a local interface with the same method).
     let via = if r.recv { r.via.as_deref() } else { None };
     let via_hit = via.is_some_and(|v| cands.iter().any(|s| s.family == fam && via_match(v, &s.parent) == 20));
+    // Go: `pkg.Name` through an imported package's name reaches only a package of that name
+    // (`io.Reader` is not this package's `Reader`).
+    let pkg_qualified = fam == "go" && via.is_some_and(|v| imp.is_some_and(|i| i.lasts.contains(v)));
     // (score, id, candidates at that score, same file, member, score without the receiver match)
     let mut best = (0i32, 0i64, 0usize, false, false, 0i32);
     let mut eligible = 0i64;
@@ -1087,21 +1194,44 @@ fn score(r: &RefRow, cands: &[Cand], imp: Option<&FileImports>) -> (i64, i64) {
         if via_hit && s.path == r.path && via.is_some_and(|v| via_match(v, &s.parent) < 20) {
             continue;
         }
-        let same_file = s.path == r.path;
-        // Local declarations (inside a function) and C `static` ones are only visible in their own file.
-        if !same_file && (s.local || s.file_local) || has_def && s.decl {
+        if pkg_qualified && via.is_some_and(|v| dir_of(&s.path).rsplit('/').next() != Some(v)) {
             continue;
         }
-        // A value read through a receiver (`f(res.status)`) is mostly a field: it names another
-        // file's member only through an import or the type itself (`Type::method`, `Base.run`).
-        if !call && r.recv && !same_file && !imp.is_some_and(|v| v.hits(fam, &r.name, s)) && via.is_none_or(|v| v != s.parent) {
+        let member = s.pid != 0 || !s.parent.is_empty();
+        // Python and JS: a bare name (`f()`, `g(x)`) never reaches a method; that takes a receiver.
+        if dynamic && !r.recv && s.kind == "method" {
+            continue;
+        }
+        // Through a receiver that is not `self`/`this` nor named like the candidate's type
+        // (`self.connection.close()`, `log(request.id)`), a same-file member of a dynamic
+        // language is no more certain than one elsewhere.
+        // A value (not a call) through any receiver inside the candidate's own type
+        // (`connect(o.spider_opened)` in a method of that type) counts as its own too.
+        let own_receiver = via.is_some_and(|v| SELF_NAMES.contains(&v) || via_match(v, &s.parent) == 20)
+            || !call && s.pid != 0 && s.pid == r.caller_parent;
+        let same_file = s.path == r.path && !(r.recv && member && (dynamic || !call) && !own_receiver);
+        // Local declarations (inside a function) and C `static` ones are only visible in their own file.
+        if s.path != r.path && (s.local || s.file_local) || has_def && s.decl {
+            continue;
+        }
+        // A value read through a receiver (`f(res.status)`) is mostly a field: it names a member
+        // only through `self`/`this`, an import, or the type itself (`Type::method`, `Base.run`).
+        if !call
+            && r.recv
+            && !same_file
+            && !own_receiver
+            && (s.path == r.path || !imp.is_some_and(|v| v.hits(fam, &r.name, s)))
+            && via.is_none_or(|v| v != s.parent)
+        {
             continue;
         }
         eligible += 1;
         let mut score = if same_file {
             100
         } else if imp.is_some_and(|v| v.hits(fam, &r.name, s)) {
-            if fam == "go" && imp.is_some_and(|v| v.names_dir(dir_of(&s.path))) { 65 } else { 60 }
+            // Go: a package-qualified call (`stats.Register()`) prefers the package its full
+            // import path names; a method call on a value (`req.Header.Get()`) does not.
+            if pkg_qualified && !member && imp.is_some_and(|v| v.names_dir(dir_of(&s.path))) { 65 } else { 60 }
         } else if dir_of(&s.path) == dir_of(&r.path) {
             40
         } else {
@@ -1118,7 +1248,6 @@ fn score(r: &RefRow, cands: &[Cand], imp: Option<&FileImports>) -> (i64, i64) {
         if call && !(is_callable_kind(&s.kind) || is_type_kind(&s.kind)) {
             score -= 5;
         }
-        let member = s.pid != 0 || !s.parent.is_empty();
         if call && !same_file {
             // `f()` rarely reaches another type's member; `x.f()` rarely a free function.
             if !r.recv && s.pid != 0 && s.pid != r.caller_parent {
@@ -1402,6 +1531,53 @@ pub fn has_symbols(c: &Connection, pid: i64) -> bool {
 
 #[cfg(test)]
 mod via_tests {
+    use super::{Cand, FileImports, RefRow, score};
+
+    fn cand(id: i64, path: &str, kind: &str, parent: &str) -> Cand {
+        Cand {
+            id,
+            path: path.into(),
+            kind: kind.into(),
+            pid: 0,
+            parent: parent.into(),
+            family: "go",
+            local: false,
+            decl: false,
+            file_local: false,
+        }
+    }
+
+    fn call(name: &str, via: &str) -> RefRow {
+        RefRow {
+            rowid: 1,
+            path: "pkg/cmd/use.go".into(),
+            src: 99,
+            name: name.into(),
+            kind: "call".into(),
+            dst: 0,
+            recv: true,
+            amb: 0,
+            caller_parent: -1,
+            via: Some(via.into()),
+            line: 9,
+        }
+    }
+
+    /// Go: the full import path picks the package of a package-qualified call
+    /// (`stats.Compute()`), but never breaks a tie for a method call on a value
+    /// (`req.Header.Get()` in a file that imports a package with a `Get` method).
+    #[test]
+    fn import_path_preference_is_for_package_qualified_calls() {
+        let mut imp = FileImports::default();
+        imp.push("github.com/ext/other");
+        imp.push("example.com/pkg/rest");
+        imp.push("example.com/pkg/b/stats");
+        let cands = [cand(1, "pkg/other/thing.go", "method", "Thing"), cand(2, "pkg/rest/client.go", "method", "RESTClient")];
+        assert_ne!(score(&call("Get", "Header"), &cands, Some(&imp)).0, 2);
+        let cands = [cand(1, "pkg/a/stats/s.go", "function", ""), cand(2, "pkg/b/stats/s.go", "function", "")];
+        assert_eq!(score(&call("Compute", "stats"), &cands, Some(&imp)).0, 2);
+    }
+
     #[test]
     fn receiver_names_match_type_names() {
         assert_eq!(super::via_match("inputs", "Inputs"), 20);
