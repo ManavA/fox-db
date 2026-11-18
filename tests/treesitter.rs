@@ -616,6 +616,9 @@ fn impact_follows_interface_dispatch() {
             "package cfg\n\ntype Getter interface {\n\tToConfig() int\n\tToMapper() int\n}\n\ntype Flags struct{}\n\nfunc (f *Flags) ToConfig() int { return 1 }\n\nfunc (f *Flags) ToMapper() int { return 2 }\n\ntype Partial struct{}\n\nfunc (p *Partial) ToConfig() int { return 3 }\n",
         ),
         ("pkg/cmd/run.go", "package cmd\n\nimport \"example.com/pkg/cfg\"\n\nfunc Run(g cfg.Getter) int { return g.ToConfig() }\n"),
+        ("src/store.ts", "export interface Store {\n  save(): void\n}\n"),
+        ("src/service.ts", "import { Store } from './store'\n\nexport class Service {\n  store: Store\n  save() {}\n}\n"),
+        ("src/persist.ts", "import { Store } from './store'\n\nexport function persist(s: Store) {\n  s.save()\n}\n"),
         ("ext/base.py", "class Base:\n    def close(self):\n        pass\n"),
         ("ext/disk.py", "from ext.base import Base\n\n\nclass Disk(Base):\n    def close(self):\n        pass\n"),
         ("ext/use.py", "from ext.base import Base\n\n\ndef shutdown(b: Base):\n    Base.close(b)\n"),
@@ -635,6 +638,9 @@ fn impact_follows_interface_dispatch() {
     assert!(!out.contains("Run"), "{out}");
     let out = fox_code(&p, "Getter.ToConfig", "impact", 2000);
     assert!(out.contains("Flags.ToConfig") && !out.contains("Partial.ToConfig"), "{out}");
+    // A type named in a class body (a field's type) is no supertype.
+    let out = fox_code(&p, "Service.save", "impact", 2000);
+    assert!(!out.contains("persist"), "{out}");
     // Python: a subclass override is reached through calls to the base method.
     let out = fox_code(&p, "Disk.close", "impact", 2000);
     assert!(out.contains(":4 shutdown c:") && out.contains(" via Base.close"), "{out}");

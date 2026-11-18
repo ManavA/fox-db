@@ -67,7 +67,7 @@ pub const PROTOCOL_VERSIONS: &[&str] = &["2025-11-25", "2025-06-18", "2025-03-26
 pub fn tools() -> Value {
     let ro = json!({"readOnlyHint": true});
     let budget = json!({"type": "integer", "description": "tokens, default 500, max 4000"});
-    let cursor = json!({"type": "integer", "description": "from a '+N more (answer cut) · cursor=K' footer"});
+    let cursor = json!({"type": "integer", "description": "from a '+N more · cursor=K' footer"});
     json!([
         {"name": "fox_find",
          "description": "Ranked search over symbols, files, dirs, docs, milestones, memory and past sessions; rows end in path:line. Use instead of grep/glob to locate a name or topic in a big repo. Handles: s/c symbol, f file, d doc, m milestone, a dir, g memory, x session. ~ = not compiler-resolved.",

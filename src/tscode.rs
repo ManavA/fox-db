@@ -498,6 +498,10 @@ fn impact(c: &Connection, pid: i64, top: &TSym, depth: usize, lines: &mut Vec<St
             if guess.contains_key(&src) {
                 continue;
             }
+            if !found.contains_key(&src) && guess.len() + found.len() >= IMPACT_CAP {
+                cut = Some(format!("partial at d{}: stopped after {IMPACT_CAP} dependents", d + 1));
+                break;
+            }
             if d == 0 {
                 match disp.get_mut(&src) {
                     Some(x) => merge_disp(x, dl),
@@ -517,8 +521,11 @@ fn impact(c: &Connection, pid: i64, top: &TSym, depth: usize, lines: &mut Vec<St
         guess.extend(found);
         frontier = lvl.syms.clone();
         levels.push(lvl);
+        if cut.is_some() {
+            break;
+        }
     }
-    if cut.is_none() && depth > max && !frontier.is_empty() && has_dependents(c, &frontier, &guess)? {
+    if cut.is_none() && depth > max && !frontier.is_empty() && has_dependents(c, &frontier, &guess, &top_seen)? {
         cut = Some(format!("partial at d{max}: dependents continue past depth {max}, the deepest walked"));
     }
     let nsyms: usize = levels.iter().map(|l| l.syms.len()).sum();
@@ -576,6 +583,9 @@ struct Dispatch {
     down: Vec<TSym>,
 }
 
+/// Most same-name Go methods checked against interfaces by method set.
+const DISPATCH_GO_MAX: usize = 300;
+
 const SYM_PID: &str = "COALESCE(json_extract(n.meta, '$.pid'), 0)";
 
 fn dispatch(c: &Connection, pid: i64, top: &TSym) -> Result<Dispatch> {
@@ -586,7 +596,7 @@ fn dispatch(c: &Connection, pid: i64, top: &TSym) -> Result<Dispatch> {
     // Same-name symbols with their containers.
     let mut q = c.prepare_cached(&format!(
         "SELECT {COLS}, {SYM_PID} FROM node n INDEXED BY node_sym_name
-         WHERE n.project_id = ?1 AND n.kind = 'symbol' AND n.source = 'treesitter' AND n.name = ?2 LIMIT 2000"
+         WHERE n.project_id = ?1 AND n.kind = 'symbol' AND n.source = 'treesitter' AND n.name = ?2 COLLATE NOCASE LIMIT 2000"
     ))?;
     let same: Vec<(TSym, i64)> = q
         .query_map(params![pid, top.name], |r| Ok((map(r)?, r.get::<_, i64>(7)?)))?
@@ -598,12 +608,13 @@ fn dispatch(c: &Connection, pid: i64, top: &TSym) -> Result<Dispatch> {
     if same.is_empty() {
         return Ok(d);
     }
-    let Some(owner) = owner_type(c, pid, top)? else { return Ok(d) };
+    let mut owners = Owners::default();
+    let Some(owner) = owner_type(c, pid, top, &mut owners)? else { return Ok(d) };
     let ups = related_types(c, owner.id, true)?;
     let downs =
         if matches!(owner.kind.as_str(), "interface" | "trait" | "protocol") { related_types(c, owner.id, false)? } else { HashSet::new() };
     for (s, spid) in &same {
-        let spid = if *spid != 0 { Some(*spid) } else { owner_type(c, pid, s)?.map(|t| t.id) };
+        let spid = if *spid != 0 { Some(*spid) } else { owner_type(c, pid, s, &mut owners)?.map(|t| t.id) };
         match spid {
             Some(t) if ups.contains(&t) => d.up.push(s.clone()),
             Some(t) if downs.contains(&t) => d.down.push(s.clone()),
@@ -614,11 +625,11 @@ fn dispatch(c: &Connection, pid: i64, top: &TSym) -> Result<Dispatch> {
     if fam(&top.path) == "go" {
         let mut sets: HashMap<i64, HashSet<String>> = HashMap::new();
         let owner_set = method_set(c, pid, &owner, &mut sets)?;
-        for (s, _) in same.iter().take(200) {
+        for (s, _) in same.iter().take(DISPATCH_GO_MAX) {
             if d.up.iter().chain(&d.down).any(|x| x.id == s.id) {
                 continue;
             }
-            let Some(t) = owner_type(c, pid, s)? else { continue };
+            let Some(t) = owner_type(c, pid, s, &mut owners)? else { continue };
             let t_set = method_set(c, pid, &t, &mut sets)?;
             if t.kind == "interface" && owner.kind != "interface" && !t_set.is_empty() && t_set.is_subset(&owner_set) {
                 d.up.push(s.clone());
@@ -632,30 +643,43 @@ fn dispatch(c: &Connection, pid: i64, top: &TSym) -> Result<Dispatch> {
 
 /// The type declaring method `m`: its container, or (Go methods sit outside their type) the
 /// type of that name in the same directory.
-fn owner_type(c: &Connection, pid: i64, m: &TSym) -> Result<Option<TSym>> {
+/// Types found by `owner_type`, by (directory, name) for types outside their methods.
+type Owners = HashMap<(String, String), Option<TSym>>;
+
+fn owner_type(c: &Connection, pid: i64, m: &TSym, cache: &mut Owners) -> Result<Option<TSym>> {
     let spid: i64 = c.query_row(&format!("SELECT {SYM_PID} FROM node n WHERE n.id = ?1"), [m.id], |r| r.get(0)).unwrap_or(0);
     if spid != 0 {
         return Ok(by_id(c, spid).filter(|t| is_type_kind(&t.kind)));
     }
     let Some(parent) = m.parent.as_deref().map(|p| p.rsplit('.').next().unwrap_or(p)) else { return Ok(None) };
     let dir = m.path.rsplit_once('/').map(|x| x.0).unwrap_or("");
+    let key = (dir.to_string(), parent.to_string());
+    if let Some(t) = cache.get(&key) {
+        return Ok(t.clone());
+    }
     let mut q = c.prepare_cached(&format!(
         "SELECT {COLS} FROM node n INDEXED BY node_sym_name
-         WHERE n.project_id = ?1 AND n.kind = 'symbol' AND n.source = 'treesitter' AND n.name = ?2 LIMIT 500"
+         WHERE n.project_id = ?1 AND n.kind = 'symbol' AND n.source = 'treesitter' AND n.name = ?2 COLLATE NOCASE LIMIT 2000"
     ))?;
-    Ok(q.query_map(params![pid, parent], map)?
+    let t = q
+        .query_map(params![pid, parent], map)?
         .flatten()
-        .find(|t| t.name == parent && is_type_kind(&t.kind) && t.path.rsplit_once('/').map(|x| x.0).unwrap_or("") == dir))
+        .find(|t| t.name == parent && is_type_kind(&t.kind) && t.path.rsplit_once('/').map(|x| x.0).unwrap_or("") == dir);
+    cache.insert(key, t.clone());
+    Ok(t)
 }
 
 /// Types reachable from `t` by named supertype references, upward (`up`) or downward, three
 /// steps at most.
 fn related_types(c: &Connection, t: i64, up: bool) -> Result<HashSet<i64>> {
+    // A supertype is named on the type's own line (`class A(Base)`, `class R implements Router`);
+    // a type named in its body (a field's type) is no supertype.
     let sql = if up {
-        "SELECT DISTINCT r.dst FROM ts_ref r JOIN node n ON n.id = r.dst WHERE r.src = ?1 AND r.src != 0 AND r.dst != 0 AND r.kind = 'ref'
+        "SELECT DISTINCT r.dst FROM ts_ref r JOIN node n ON n.id = r.dst JOIN node s ON s.id = r.src
+         WHERE r.src = ?1 AND r.src != 0 AND r.dst != 0 AND r.kind = 'ref' AND r.line = s.line
            AND json_extract(n.meta,'$.k') IN ('class','interface','object','struct','enum','trait','protocol')"
     } else {
-        "SELECT DISTINCT r.src FROM ts_ref r JOIN node n ON n.id = r.src WHERE r.dst = ?1 AND r.dst != 0 AND r.kind = 'ref'
+        "SELECT DISTINCT r.src FROM ts_ref r JOIN node n ON n.id = r.src WHERE r.dst = ?1 AND r.dst != 0 AND r.kind = 'ref' AND r.line = n.line
            AND json_extract(n.meta,'$.k') IN ('class','interface','object','struct','enum','trait','protocol')"
     };
     let mut q = c.prepare_cached(sql)?;
@@ -707,8 +731,7 @@ fn method_set(c: &Connection, pid: i64, t: &TSym, cache: &mut HashMap<i64, HashS
 
 /// `partial at dN:` when a call named like a dependent the walk expanded (any level but the
 /// last) was guessed to another same-name definition, in a file the answer does not list: that
-/// call may reach the dependent instead. Only guesses among at most three candidates count (with
-/// more, any one of them is unlikely). One line, for the shallowest such level.
+/// call may reach the dependent instead. One line, for the shallowest such level.
 fn guessed_elsewhere(
     c: &Connection,
     pid: i64,
@@ -716,9 +739,8 @@ fn guessed_elsewhere(
     walked: &HashMap<i64, Guess>,
     listed: &HashSet<String>,
 ) -> Result<Option<String>> {
-    let mut q = c.prepare_cached(
-        "SELECT path, dst FROM ts_ref WHERE project_id = ?1 AND name = ?2 AND amb BETWEEN 1 AND 3 AND dst != 0 AND kind = 'call'",
-    )?;
+    let mut q =
+        c.prepare_cached("SELECT path, dst FROM ts_ref WHERE project_id = ?1 AND name = ?2 AND amb > 0 AND dst != 0 AND kind = 'call'")?;
     let mut asked = 0;
     for (d, lvl) in levels.iter().enumerate().take(levels.len().saturating_sub(1)) {
         let mut names: Vec<&str> = lvl.iter().map(|s| s.name.as_str()).collect();
@@ -753,11 +775,11 @@ fn guessed_elsewhere(
 }
 
 /// Does anything not yet walked depend on `ids`?
-fn has_dependents(c: &Connection, ids: &[i64], seen: &HashMap<i64, Guess>) -> Result<bool> {
+fn has_dependents(c: &Connection, ids: &[i64], seen: &HashMap<i64, Guess>, top_seen: &HashSet<String>) -> Result<bool> {
     let list = ids.iter().map(i64::to_string).collect::<Vec<_>>().join(",");
-    let mut q = c.prepare(&format!("SELECT src FROM ts_ref WHERE dst != 0 AND dst IN ({list}) AND kind != 'import'"))?;
-    let srcs: Vec<i64> = q.query_map([], |r| r.get::<_, i64>(0))?.flatten().collect();
-    Ok(srcs.iter().any(|s| *s == 0 || !seen.contains_key(s)))
+    let mut q = c.prepare(&format!("SELECT src, path FROM ts_ref WHERE dst != 0 AND dst IN ({list}) AND kind != 'import'"))?;
+    let rows: Vec<(i64, String)> = q.query_map([], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?)))?.flatten().collect();
+    Ok(rows.iter().any(|(s, path)| if *s == 0 { !top_seen.contains(path) } else { !seen.contains_key(s) }))
 }
 
 fn outline_file(c: &Connection, p: &Project, rel: &str, cursor: usize, budget: usize) -> Result<Option<String>> {
