@@ -750,14 +750,14 @@ fn go_evidence(c: &Connection, pid: i64, iface: &TSym, tdir: &str, ev: &mut Evid
     if let Some(v) = ev.done.get(&(iface.id, tdir.to_string())) {
         return Ok(*v);
     }
-    if !ev.named.contains_key(&iface.id) {
+    if let std::collections::hash_map::Entry::Vacant(e) = ev.named.entry(iface.id) {
         let mut q = c.prepare_cached("SELECT path FROM fts_word WHERE fts_word MATCH ?1 AND project_id = ?2 LIMIT 50000")?;
         let w = format!("words:\"{}\"", crate::tsindex::case_word(&iface.name));
         let mut by: HashMap<String, Vec<String>> = HashMap::new();
         for f in q.query_map(params![w, pid], |r| r.get::<_, String>(0))?.flatten() {
             by.entry(dir_of(&f).to_string()).or_default().push(f);
         }
-        ev.named.insert(iface.id, by);
+        e.insert(by);
     }
     let ends = |a: &str, b: &str| a == b || a.ends_with(b) && a[..a.len() - b.len()].ends_with('/');
     let mut imports = c.prepare_cached("SELECT name FROM ts_ref WHERE project_id = ?1 AND path = ?2 AND kind = 'import'")?;
