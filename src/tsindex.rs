@@ -147,8 +147,7 @@ const FN_KINDS: &[&str] = &[
 
 /// Parents of a value slot whose identifier may name a function (an argument, an initializer
 /// element, a keyed value), or just a parameter or local of the enclosing function.
-const VALUE_SLOTS: &[&str] =
-    &["literal_element", "initializer_pair", "initializer_list", "argument_list", "arguments", "keyword_argument"];
+const VALUE_SLOTS: &[&str] = &["literal_element", "initializer_pair", "initializer_list", "argument_list", "arguments", "keyword_argument"];
 
 /// The names declared as parameters or locals in each outermost function, computed once per
 /// function (a file passes many identifiers as arguments).
@@ -304,10 +303,7 @@ pub fn extract(l: &Lang, src: &[u8]) -> Parsed {
         } else if let Some(k) = cn.strip_prefix("reference.") {
             // A value in a keyed literal or designated initializer (`Name: name`, `.size = size`)
             // that names a parameter or local of the enclosing function is no function reference.
-            if ref_kind(k) == "ref"
-                && nn.parent().is_some_and(|p| VALUE_SLOTS.contains(&p.kind()))
-                && locals.is_local(nn, src)
-            {
+            if ref_kind(k) == "ref" && nn.parent().is_some_and(|p| VALUE_SLOTS.contains(&p.kind())) && locals.is_local(nn, src) {
                 continue;
             }
             out.refs.push(Ref {
@@ -1097,13 +1093,8 @@ fn score(r: &RefRow, cands: &[Cand], imp: Option<&FileImports>) -> (i64, i64) {
             continue;
         }
         // A value read through a receiver (`f(res.status)`) is mostly a field: it names another
-        // file's member only through an import or a receiver named like the member's type.
-        if !call
-            && r.recv
-            && !same_file
-            && !imp.is_some_and(|v| v.hits(fam, &r.name, s))
-            && via.is_none_or(|v| s.parent.is_empty() || via_match(v, &s.parent) == 0)
-        {
+        // file's member only through an import or the type itself (`Type::method`, `Base.run`).
+        if !call && r.recv && !same_file && !imp.is_some_and(|v| v.hits(fam, &r.name, s)) && via.is_none_or(|v| v != s.parent) {
             continue;
         }
         eligible += 1;

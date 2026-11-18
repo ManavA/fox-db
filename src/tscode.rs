@@ -188,9 +188,7 @@ fn unlisted_files(c: &Connection, pid: i64, top: &TSym, listed: &HashSet<String>
     let (mut open, mut closed): (HashSet<String>, HashSet<String>) = Default::default();
     let mut q = c.prepare_cached("SELECT path, dst, amb, kind FROM ts_ref WHERE project_id = ?1 AND name = ?2 AND kind != 'import'")?;
     for (path, dst, amb, kind) in q
-        .query_map(params![pid, name], |r| {
-            Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?, r.get::<_, i64>(2)?, r.get::<_, String>(3)?))
-        })?
+        .query_map(params![pid, name], |r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?, r.get::<_, i64>(2)?, r.get::<_, String>(3)?)))?
         .flatten()
     {
         if dst == top.id && (!calls_only || kind == "call") {
@@ -451,19 +449,30 @@ fn impact(c: &Connection, pid: i64, top: &TSym, depth: usize, lines: &mut Vec<St
         }
         let ids = frontier.iter().map(i64::to_string).collect::<Vec<_>>().join(",");
         let mut q = c.prepare(&format!(
-            "SELECT src, dst, amb, path, line FROM ts_ref WHERE dst != 0 AND dst IN ({ids}) AND (src != 0 OR kind != 'import') ORDER BY path, line"
+            "SELECT src, dst, amb, path, line, kind FROM ts_ref WHERE dst != 0 AND dst IN ({ids}) AND (src != 0 OR kind != 'import') ORDER BY path, line"
         ))?;
         let mut lvl = if d == 0 { std::mem::take(&mut first) } else { Level::default() };
         let mut found: HashMap<i64, Guess> = HashMap::new();
         let mut tops: BTreeMap<String, (Vec<i64>, Guess)> = BTreeMap::new();
-        for (src, dst, amb, path, line) in q
+        for (src, dst, amb, path, line, kind) in q
             .query_map([], |r| {
-                Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)?, r.get::<_, i64>(2)?, r.get::<_, String>(3)?, r.get::<_, i64>(4)?))
+                Ok((
+                    r.get::<_, i64>(0)?,
+                    r.get::<_, i64>(1)?,
+                    r.get::<_, i64>(2)?,
+                    r.get::<_, String>(3)?,
+                    r.get::<_, i64>(4)?,
+                    r.get::<_, String>(5)?,
+                ))
             })?
             .flatten()
         {
-            let via = if amb > 0 { Some(amb) } else { guess.get(&dst).copied().flatten().map(|_| 0) };
             let dl: Disp = if d == 0 { up.get(&dst).cloned() } else { None };
+            // Only a call to the interface or base method may dispatch to `top`.
+            if dl.is_some() && kind != "call" {
+                continue;
+            }
+            let via = if amb > 0 { Some(amb) } else { guess.get(&dst).copied().flatten().map(|_| 0) };
             if d == 0 {
                 d1_paths.insert(path.clone());
             }
@@ -517,8 +526,7 @@ fn impact(c: &Connection, pid: i64, top: &TSym, depth: usize, lines: &mut Vec<St
     let guessed = levels
         .iter()
         .map(|l| {
-            l.syms.iter().filter(|i| guess.get(i).is_some_and(Option::is_some)).count()
-                + l.tops.values().filter(|t| t.1.is_some()).count()
+            l.syms.iter().filter(|i| guess.get(i).is_some_and(Option::is_some)).count() + l.tops.values().filter(|t| t.1.is_some()).count()
         })
         .sum::<usize>();
     let g = if guessed > 0 { format!(", {guessed} through name guesses") } else { String::new() };
@@ -528,23 +536,20 @@ fn impact(c: &Connection, pid: i64, top: &TSym, depth: usize, lines: &mut Vec<St
         top.row(),
         levels.iter().map(|l| (l.syms.len() + l.tops.len()).to_string()).collect::<Vec<_>>().join("/")
     ));
-    lines.extend(completeness(c, pid, top, &d1_paths, false, "partial at d1")?);
-    if guessed > 0 {
-        let at = levels
-            .iter()
-            .position(|l| l.syms.iter().any(|i| guess.get(i).is_some_and(Option::is_some)) || l.tops.values().any(|t| t.1.is_some()))
-            .unwrap_or(0);
-        lines.push(format!(
-            "partial at d{}: {guessed} dependent{} found only through name guesses (rows marked guess); the real targets may differ",
-            at + 1,
-            if guessed == 1 { "" } else { "s" }
-        ));
+    // Every file the answer lists, at any depth.
+    let syms: Vec<Vec<TSym>> = levels.iter().map(|l| l.syms.iter().filter_map(|i| by_id(c, *i)).collect()).collect();
+    let mut listed = d1_paths;
+    for (l, v) in levels.iter().zip(&syms) {
+        listed.extend(l.tops.keys().cloned());
+        listed.extend(v.iter().map(|s| s.path.clone()));
     }
+    lines.extend(completeness(c, pid, top, &listed, false, "partial at d1")?);
+    lines.extend(guessed_elsewhere(c, pid, &syms, &guess, &listed)?);
     lines.extend(cut);
-    for (d, lvl) in levels.iter().enumerate() {
+    for (d, (lvl, v)) in levels.iter().zip(syms).enumerate() {
         lines.push(format!("d{}", d + 1));
         let mut by: BTreeMap<String, Vec<(i64, String)>> = BTreeMap::new();
-        for s in lvl.syms.iter().filter_map(|i| by_id(c, *i)) {
+        for s in v {
             let mark = guess_mark(guess.get(&s.id).copied().flatten()) + disp.get(&s.id).cloned().flatten().as_deref().unwrap_or("");
             by.entry(s.path.clone()).or_default().push((s.line, format!("  :{} {} {}{mark}", s.line, s.qname(), s.h())));
         }
@@ -583,8 +588,11 @@ fn dispatch(c: &Connection, pid: i64, top: &TSym) -> Result<Dispatch> {
         "SELECT {COLS}, {SYM_PID} FROM node n INDEXED BY node_sym_name
          WHERE n.project_id = ?1 AND n.kind = 'symbol' AND n.source = 'treesitter' AND n.name = ?2 LIMIT 2000"
     ))?;
-    let same: Vec<(TSym, i64)> =
-        q.query_map(params![pid, top.name], |r| Ok((map(r)?, r.get::<_, i64>(7)?)))?.flatten().filter(|(s, _)| s.name == top.name).collect();
+    let same: Vec<(TSym, i64)> = q
+        .query_map(params![pid, top.name], |r| Ok((map(r)?, r.get::<_, i64>(7)?)))?
+        .flatten()
+        .filter(|(s, _)| s.name == top.name)
+        .collect();
     let fam = |p: &str| crate::lang::for_path(p).map(|l| l.family).unwrap_or("");
     let same: Vec<(TSym, i64)> = same.into_iter().filter(|(s, _)| s.id != top.id && fam(&s.path) == fam(&top.path)).collect();
     if same.is_empty() {
@@ -592,11 +600,8 @@ fn dispatch(c: &Connection, pid: i64, top: &TSym) -> Result<Dispatch> {
     }
     let Some(owner) = owner_type(c, pid, top)? else { return Ok(d) };
     let ups = related_types(c, owner.id, true)?;
-    let downs = if matches!(owner.kind.as_str(), "interface" | "trait" | "protocol") {
-        related_types(c, owner.id, false)?
-    } else {
-        HashSet::new()
-    };
+    let downs =
+        if matches!(owner.kind.as_str(), "interface" | "trait" | "protocol") { related_types(c, owner.id, false)? } else { HashSet::new() };
     for (s, spid) in &same {
         let spid = if *spid != 0 { Some(*spid) } else { owner_type(c, pid, s)?.map(|t| t.id) };
         match spid {
@@ -690,9 +695,7 @@ fn method_set(c: &Connection, pid: i64, t: &TSym, cache: &mut HashMap<i64, HashS
             "SELECT name, path FROM node WHERE project_id = ?1 AND path >= ?2 AND path < ?3 AND kind = 'symbol'
                AND json_extract(meta,'$.k') = 'method' AND json_extract(meta,'$.parent') = ?4",
         )?;
-        for (name, path) in
-            q.query_map(params![pid, lo, hi, t.name], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))?.flatten()
-        {
+        for (name, path) in q.query_map(params![pid, lo, hi, t.name], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))?.flatten() {
             if !path[lo.len()..].contains('/') {
                 set.insert(name);
             }
@@ -700,6 +703,53 @@ fn method_set(c: &Connection, pid: i64, t: &TSym, cache: &mut HashMap<i64, HashS
     }
     cache.insert(t.id, set.clone());
     Ok(set)
+}
+
+/// `partial at dN:` when a call named like a dependent the walk expanded (any level but the
+/// last) was guessed to another same-name definition, in a file the answer does not list: that
+/// call may reach the dependent instead. Only guesses among at most three candidates count (with
+/// more, any one of them is unlikely). One line, for the shallowest such level.
+fn guessed_elsewhere(
+    c: &Connection,
+    pid: i64,
+    levels: &[Vec<TSym>],
+    walked: &HashMap<i64, Guess>,
+    listed: &HashSet<String>,
+) -> Result<Option<String>> {
+    let mut q = c.prepare_cached(
+        "SELECT path, dst FROM ts_ref WHERE project_id = ?1 AND name = ?2 AND amb BETWEEN 1 AND 3 AND dst != 0 AND kind = 'call'",
+    )?;
+    let mut asked = 0;
+    for (d, lvl) in levels.iter().enumerate().take(levels.len().saturating_sub(1)) {
+        let mut names: Vec<&str> = lvl.iter().map(|s| s.name.as_str()).collect();
+        names.sort_unstable();
+        names.dedup();
+        let mut files: HashSet<String> = HashSet::new();
+        let mut which: Vec<&str> = vec![];
+        for name in names {
+            asked += 1;
+            if asked > 500 {
+                return Ok(None);
+            }
+            for (path, dst) in q.query_map(params![pid, name], |r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?)))?.flatten() {
+                if !walked.contains_key(&dst) && !listed.contains(&path) && files.insert(path) && which.last() != Some(&name) {
+                    which.push(name);
+                }
+            }
+        }
+        if !files.is_empty() {
+            let n = files.len();
+            let more = if which.len() > 1 { format!(" (and {} other names)", which.len() - 1) } else { String::new() };
+            return Ok(Some(format!(
+                "partial at d{}: calls in {n} other file{} were guessed to another `{}`{more}; they may reach a d{} dependent",
+                d + 2,
+                if n == 1 { "" } else { "s" },
+                which[0],
+                d + 1
+            )));
+        }
+    }
+    Ok(None)
 }
 
 /// Does anything not yet walked depend on `ids`?

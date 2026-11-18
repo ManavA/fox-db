@@ -567,7 +567,10 @@ fn functions_passed_as_arguments_are_dependents() {
             "revision.c",
             "static int handle_one(const char *r, void *cb) { return 0; }\nint each_ref(int (*fn)(const char *, void *), void *cb);\nint add_all(void *cb) { return each_ref(handle_one, cb); }\nint pass_on(void *handle_one) { return each_ref(0, handle_one); }\n",
         ),
-        ("pkg/a/a.go", "package a\n\nfunc worker() {}\n\nfunc Until(f func()) {}\n\nfunc Run() { Until(worker) }\n\nfunc Other(worker func()) { Until(worker) }\n"),
+        (
+            "pkg/a/a.go",
+            "package a\n\nfunc worker() {}\n\nfunc Until(f func()) {}\n\nfunc Run() { Until(worker) }\n\nfunc Other(worker func()) { Until(worker) }\n",
+        ),
         (
             "ext/logcount.py",
             "class LogCount:\n    @classmethod\n    def from_crawler(cls, crawler):\n        o = cls()\n        crawler.signals.connect(o.spider_opened, signal=1)\n        crawler.engine.schedule(callback=o.spider_closed)\n        return o\n\n    def spider_opened(self, spider):\n        pass\n\n    def spider_closed(self, spider):\n        pass\n",
@@ -637,29 +640,46 @@ fn impact_follows_interface_dispatch() {
     assert!(out.contains(":4 shutdown c:") && out.contains(" via Base.close"), "{out}");
 }
 
-/// The walk says when it stopped early: past the deepest level it walks while dependents
-/// remain, or through name guesses. A walk that ends on its own says nothing.
+/// The walk says when it may have missed something: it stopped past the deepest level it walks
+/// while dependents remain, or a call named like a dependent was guessed to another same-name
+/// definition. A walk that ends on its own, or whose guesses all land on its own rows, says
+/// nothing.
 #[test]
 fn impact_says_when_the_walk_was_cut_or_guessed() {
     let _g = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
     let (_h, _r, p) = inline_project(&[
-        ("chain.c", "int f0(void) { return 0; }\nint f1(void) { return f0(); }\nint f2(void) { return f1(); }\nint f3(void) { return f2(); }\nint f4(void) { return f3(); }\nint f5(void) { return f4(); }\n"),
-        ("x/a.c", "int pick_one(void) { return 0; }\n"),
+        (
+            "chain.c",
+            "int f0(void) { return 0; }\nint f1(void) { return f0(); }\nint f2(void) { return f1(); }\nint f3(void) { return f2(); }\nint f4(void) { return f3(); }\nint f5(void) { return f4(); }\n",
+        ),
+        ("lib/core.c", "int base(void) { return 0; }\n"),
+        ("x/a.c", "int pick_one(void) { return base(); }\n"),
         ("y/b.c", "int pick_one(void) { return 1; }\n"),
-        ("z/use.c", "int user(void) { return pick_one(); }\n"),
+        ("y/sub/use.c", "int user(void) { return pick_one(); }\n"),
+        ("z/use.c", "int other(void) { return pick_one(); }\n"),
     ]);
     let c = db::open_ro().unwrap();
-    let run = |sym: &str, depth: usize| code::run(&c, &p, sym, &code::CodeOpts { rel: "impact", depth, budget: 2000, cursor: 0, fallback: false }).unwrap();
+    let run = |sym: &str, depth: usize| {
+        code::run(&c, &p, sym, &code::CodeOpts { rel: "impact", depth, budget: 2000, cursor: 0, fallback: false }).unwrap()
+    };
     let out = run("f0", 6);
     assert!(out.contains("\npartial at d4: dependents continue past depth 4"), "{out}");
     let out = run("f0", 4);
     assert!(!out.contains("partial"), "the depth asked for is no cut: {out}");
     let out = run("f3", 4);
     assert!(!out.contains("partial"), "{out}");
-    // `pick_one` has two definitions and no scope signal: the call is a guess.
-    let dst: i64 = c.query_row("SELECT dst FROM ts_ref WHERE path = 'z/use.c' AND name = 'pick_one'", [], |r| r.get(0)).unwrap();
+    // `pick_one` has two definitions: the calls in y/sub/ and z/ are guessed to the other one
+    // (nearer, or first of a tie), so they may still reach `base` through this one.
+    let out = run("base", 2);
+    assert!(out.contains(":1 pick_one c:") && !out.contains("user c:") && !out.contains("other c:"), "{out}");
+    assert!(
+        out.contains("\npartial at d2: calls in 2 other files were guessed to another `pick_one`; they may reach a d1 dependent"),
+        "{out}"
+    );
+    // The guessed call, as a dependent: marked, and nothing is missing.
+    let dst: i64 = c.query_row("SELECT dst FROM ts_ref WHERE path = 'y/sub/use.c' AND name = 'pick_one'", [], |r| r.get(0)).unwrap();
     let out = run(&format!("c:{dst:x}"), 2);
-    assert!(out.contains("\npartial at d1: 1 dependent found only through name guesses"), "{out}");
+    assert!(out.contains(":1 user c:") && out.contains("guess 1 of 2") && !out.contains("partial at d2"), "{out}");
 }
 
 /// Go: a call through a package name reaches the package its import path names, not a
@@ -675,7 +695,8 @@ fn go_package_calls_follow_the_full_import_path() {
     ]);
     let c = db::open_ro().unwrap();
     let id = |dir: &str| -> i64 {
-        c.query_row("SELECT id FROM node WHERE name = 'Register' AND path = ?1", [format!("pkg/{dir}/stats/stats.go")], |r| r.get(0)).unwrap()
+        c.query_row("SELECT id FROM node WHERE name = 'Register' AND path = ?1", [format!("pkg/{dir}/stats/stats.go")], |r| r.get(0))
+            .unwrap()
     };
     let out = fox_code(&p, &format!("c:{:x}", id("b")), "callers", 800);
     assert!(out.contains("1 call sites in 1 files") && out.contains("NewController"), "{out}");
