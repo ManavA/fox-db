@@ -421,7 +421,10 @@ fn impact(c: &Connection, pid: i64, top: &TSym, depth: usize, lines: &mut Vec<St
     let mut levels: Vec<Level> = vec![];
     // Dispatch: calls to the methods `top` implements count as calls to it; implementations of
     // `top` are first-level dependents.
+    let t0 = std::time::Instant::now();
     let dsp = dispatch(c, pid, top)?;
+    crate::tsindex::trace("impact: dispatch", t0);
+    let t_walk = std::time::Instant::now();
     let up: HashMap<i64, &TSym> = dsp.up.iter().map(|m| (m.id, m)).collect();
     let dynamic = matches!(crate::lang::for_path(&top.path).map(|l| l.family), Some("python" | "js"));
     // Dependents reached only through a guessed call to an interface or base method: listed,
@@ -562,14 +565,19 @@ fn impact(c: &Connection, pid: i64, top: &TSym, depth: usize, lines: &mut Vec<St
         levels.iter().map(|l| (l.syms.len() + l.tops.len()).to_string()).collect::<Vec<_>>().join("/")
     ));
     // Every file the answer lists, at any depth.
+    crate::tsindex::trace("impact: walk", t_walk);
     let syms: Vec<Vec<TSym>> = levels.iter().map(|l| l.syms.iter().filter_map(|i| by_id(c, *i)).collect()).collect();
     let mut listed = d1_paths;
     for (l, v) in levels.iter().zip(&syms) {
         listed.extend(l.tops.keys().cloned());
         listed.extend(v.iter().map(|s| s.path.clone()));
     }
+    let t0 = std::time::Instant::now();
     lines.extend(completeness(c, pid, top, &listed, false, "partial at d1")?);
+    crate::tsindex::trace("impact: completeness", t0);
+    let t0 = std::time::Instant::now();
     lines.extend(guessed_elsewhere(c, pid, &syms, &guess, &listed)?);
+    crate::tsindex::trace("impact: guessed elsewhere", t0);
     lines.extend(cut);
     lines.extend(dsp.capped);
     for (d, (lvl, v)) in levels.iter().zip(syms).enumerate() {
@@ -626,22 +634,30 @@ fn dispatch(c: &Connection, pid: i64, top: &TSym) -> Result<Dispatch> {
     ))?;
     let same: Vec<(TSym, i64)> = q.query_map(params![pid, top.name], |r| Ok((map(r)?, r.get::<_, i64>(7)?)))?.flatten().collect();
     let read = same.len();
+    // Interface members come first: the list was cut inside them only if its last row is one.
+    let cut_in_members = read >= DISPATCH_SAME_MAX && same.last().is_some_and(|(_, spid)| *spid != 0);
     let fam = |p: &str| crate::lang::for_path(p).map(|l| l.family).unwrap_or("");
     let same: Vec<(TSym, i64)> =
         same.into_iter().filter(|(s, _)| s.name == top.name && s.id != top.id && fam(&s.path) == fam(&top.path)).collect();
     if same.is_empty() {
         return Ok(d);
     }
-    let cap = |checked: usize, of: &str| format!("partial at d1: dispatch checked the first {checked} of {of} same-name methods");
-    if read >= DISPATCH_SAME_MAX {
-        d.capped = Some(cap(DISPATCH_SAME_MAX, "more"));
-    }
+    let cap = |checked: usize, of: &str| {
+        format!("partial at d1: dispatch checked the first {checked} of {of} same-name methods; the rest may implement or override it too")
+    };
+    let over = format!("over {DISPATCH_SAME_MAX}");
     let mut owners = Owners::default();
     let Some(owner) = owner_type(c, pid, top, &mut owners)? else { return Ok(d) };
     if fam(&top.path) == "go" {
-        go_dispatch(c, pid, &owner, &same, &mut owners, &mut d)?;
-        if d.capped.is_none() && same.len() > DISPATCH_GO_MAX && owner.kind == "interface" {
-            d.capped = Some(cap(DISPATCH_GO_MAX, &same.len().to_string()));
+        let many = go_dispatch(c, pid, &owner, &same, &mut owners, &mut d)?;
+        // A concrete type looks only at interface members; an interface at every other method.
+        if many {
+            d.capped = Some(format!(
+                "partial at d1: dispatch checked the first {DISPATCH_GO_MAX} same-name methods with evidence of use as {}; the rest may implement it too",
+                owner.name
+            ));
+        } else if owner.kind == "interface" && read >= DISPATCH_SAME_MAX || owner.kind != "interface" && cut_in_members {
+            d.capped = Some(cap(DISPATCH_SAME_MAX, &over));
         }
         return Ok(d);
     }
@@ -650,6 +666,9 @@ fn dispatch(c: &Connection, pid: i64, top: &TSym) -> Result<Dispatch> {
         if matches!(owner.kind.as_str(), "interface" | "trait" | "protocol") { related_types(c, owner.id, false)? } else { HashSet::new() };
     if ups.is_empty() && downs.is_empty() {
         return Ok(d);
+    }
+    if read >= DISPATCH_SAME_MAX {
+        d.capped = Some(cap(DISPATCH_SAME_MAX, &over));
     }
     for (s, spid) in &same {
         let spid = if *spid != 0 { Some(*spid) } else { owner_type(c, pid, s, &mut owners)?.map(|t| t.id) };
@@ -663,77 +682,94 @@ fn dispatch(c: &Connection, pid: i64, top: &TSym) -> Result<Dispatch> {
 }
 
 /// Go: implicit interfaces by method set, with evidence for each link (see [`Dispatch`]).
-fn go_dispatch(c: &Connection, pid: i64, owner: &TSym, same: &[(TSym, i64)], owners: &mut Owners, d: &mut Dispatch) -> Result<()> {
+/// Returns whether the candidates with evidence were more than [`DISPATCH_GO_MAX`].
+fn go_dispatch(c: &Connection, pid: i64, owner: &TSym, same: &[(TSym, i64)], owners: &mut Owners, d: &mut Dispatch) -> Result<bool> {
     let mut sets: HashMap<i64, Option<HashSet<String>>> = HashMap::new();
-    let mut evidence: HashMap<(i64, String), bool> = HashMap::new();
+    let mut evidence = Evidence::default();
     if owner.kind == "interface" {
-        let Some(want) = method_set(c, pid, owner, &mut sets, 0)? else { return Ok(()) };
+        let Some(want) = method_set(c, pid, owner, &mut sets, 0)? else { return Ok(false) };
         if want.is_empty() {
-            return Ok(());
+            return Ok(false);
         }
-        // Types in the interface's own directory first.
+        // Types in the interface's own directory first; only directories with evidence (cheap,
+        // from the word index) get their method sets read.
         let mut cands: Vec<&TSym> = same.iter().filter(|(_, spid)| *spid == 0).map(|(s, _)| s).collect();
-        let here = owner.path.rsplit_once('/').map(|x| x.0).unwrap_or("");
-        cands.sort_by_key(|s| s.path.rsplit_once('/').map(|x| x.0).unwrap_or("") != here);
-        for s in cands.into_iter().take(DISPATCH_GO_MAX) {
-            let Some(t) = owner_type(c, pid, s, owners)? else { continue };
-            if t.kind == "interface" || !method_set(c, pid, &t, &mut sets, 0)?.is_some_and(|have| want.is_subset(&have)) {
+        let here = crate::tsindex::dir_of(&owner.path);
+        cands.sort_by_key(|s| crate::tsindex::dir_of(&s.path) != here);
+        let mut checked = 0;
+        for s in cands {
+            if !go_evidence(c, pid, owner, crate::tsindex::dir_of(&s.path), &mut evidence)? {
                 continue;
             }
-            if go_evidence(c, pid, owner, &t, &mut evidence)? {
+            checked += 1;
+            if checked > DISPATCH_GO_MAX {
+                return Ok(true);
+            }
+            let Some(t) = owner_type(c, pid, s, owners)? else { continue };
+            if t.kind != "interface" && method_set(c, pid, &t, &mut sets, 0)?.is_some_and(|have| want.is_subset(&have)) {
                 d.down.push(s.clone());
             }
         }
     } else {
-        let Some(have) = method_set(c, pid, owner, &mut sets, 0)? else { return Ok(()) };
+        let Some(have) = method_set(c, pid, owner, &mut sets, 0)? else { return Ok(false) };
+        let tdir = crate::tsindex::dir_of(&owner.path);
         // Interface methods: their container is the interface.
-        for (s, spid) in same.iter().filter(|(_, spid)| *spid != 0).take(DISPATCH_GO_MAX) {
+        for (n, (s, spid)) in same.iter().filter(|(_, spid)| *spid != 0).enumerate() {
+            if n >= DISPATCH_GO_MAX {
+                return Ok(true);
+            }
             let Some(iface) = by_id(c, *spid).filter(|t| t.kind == "interface") else { continue };
             if !method_set(c, pid, &iface, &mut sets, 0)?.is_some_and(|want| !want.is_empty() && want.is_subset(&have)) {
                 continue;
             }
-            if go_evidence(c, pid, &iface, owner, &mut evidence)? {
+            if go_evidence(c, pid, &iface, tdir, &mut evidence)? {
                 d.up.push(s.clone());
             }
         }
     }
-    Ok(())
+    Ok(false)
 }
 
 /// Evidence that Go type `t` is used as interface `iface`: both in one directory, or a file in
 /// `t`'s directory that imports `iface`'s package and names the interface (`var _ I = (*T)(nil)`,
 /// a parameter or conversion).
-fn go_evidence(c: &Connection, pid: i64, iface: &TSym, t: &TSym, cache: &mut HashMap<(i64, String), bool>) -> Result<bool> {
+#[derive(Default)]
+struct Evidence {
+    /// Per interface: the files naming it, by directory.
+    named: HashMap<i64, HashMap<String, Vec<String>>>,
+    /// Per (interface, directory): the answer.
+    done: HashMap<(i64, String), bool>,
+}
+
+fn go_evidence(c: &Connection, pid: i64, iface: &TSym, tdir: &str, ev: &mut Evidence) -> Result<bool> {
     let dir_of = crate::tsindex::dir_of;
-    let (idir, tdir) = (dir_of(&iface.path), dir_of(&t.path));
+    let idir = dir_of(&iface.path);
     if idir == tdir {
         return Ok(true);
     }
-    if let Some(v) = cache.get(&(iface.id, tdir.to_string())) {
+    if let Some(v) = ev.done.get(&(iface.id, tdir.to_string())) {
         return Ok(*v);
     }
-    let lo = if tdir.is_empty() { String::new() } else { format!("{tdir}/") };
-    let hi = if tdir.is_empty() { "\u{10ffff}".to_string() } else { format!("{tdir}0") };
-    let files: Vec<String> = {
-        let mut q = c.prepare_cached("SELECT path FROM ts_file WHERE project_id = ?1 AND path >= ?2 AND path < ?3 LIMIT 500")?;
-        q.query_map(params![pid, lo, hi], |r| r.get::<_, String>(0))?.flatten().filter(|p| !p[lo.len()..].contains('/')).collect()
-    };
+    if !ev.named.contains_key(&iface.id) {
+        let mut q = c.prepare_cached("SELECT path FROM fts_word WHERE fts_word MATCH ?1 AND project_id = ?2 LIMIT 50000")?;
+        let w = format!("words:\"{}\"", crate::tsindex::case_word(&iface.name));
+        let mut by: HashMap<String, Vec<String>> = HashMap::new();
+        for f in q.query_map(params![w, pid], |r| r.get::<_, String>(0))?.flatten() {
+            by.entry(dir_of(&f).to_string()).or_default().push(f);
+        }
+        ev.named.insert(iface.id, by);
+    }
     let ends = |a: &str, b: &str| a == b || a.ends_with(b) && a[..a.len() - b.len()].ends_with('/');
     let mut imports = c.prepare_cached("SELECT name FROM ts_ref WHERE project_id = ?1 AND path = ?2 AND kind = 'import'")?;
-    let mut word = c.prepare_cached("SELECT 1 FROM fts_word WHERE fts_word MATCH ?1 AND rowid = ?2")?;
-    let w = format!("words:\"{}\"", crate::tsindex::case_word(&iface.name));
     let mut found = false;
-    for f in files {
-        let imports_it = imports
-            .query_map(params![pid, f], |r| r.get::<_, String>(0))?
-            .flatten()
-            .any(|i| ends(i.trim_matches('"'), idir) || ends(idir, i.trim_matches('"')));
-        if imports_it && word.exists(params![w, crate::tsindex::word_rowid(pid, &f)])? {
+    for f in ev.named.get(&iface.id).and_then(|by| by.get(tdir)).into_iter().flatten() {
+        let mut rows = imports.query_map(params![pid, f], |r| r.get::<_, String>(0))?.flatten();
+        if rows.any(|i| ends(i.trim_matches('"'), idir) || ends(idir, i.trim_matches('"'))) {
             found = true;
             break;
         }
     }
-    cache.insert((iface.id, tdir.to_string()), found);
+    ev.done.insert((iface.id, tdir.to_string()), found);
     Ok(found)
 }
 
@@ -877,7 +913,7 @@ fn guessed_elsewhere(
         let mut which: Vec<&str> = vec![];
         for (name, ours) in by_name {
             asked += 1;
-            if asked > 200 {
+            if asked > 100 {
                 return Ok(None);
             }
             let rows = q.query_map(params![pid, name], |r| {

@@ -277,8 +277,14 @@ fn declares(x: tree_sitter::Node, anc: &[tree_sitter::Node]) -> bool {
                 }
                 c = p;
             }
-            "pattern_list" | "tuple_pattern" | "list_pattern" | "array_pattern" | "object_pattern" | "rest_pattern"
-            | "list_splat_pattern" | "dictionary_splat_pattern" => c = p,
+            "pattern_list"
+            | "tuple_pattern"
+            | "list_pattern"
+            | "array_pattern"
+            | "object_pattern"
+            | "rest_pattern"
+            | "list_splat_pattern"
+            | "dictionary_splat_pattern" => c = p,
             // Go: `name := ...`, `for name := range ...`, `case name := <-ch`,
             // `switch name := x.(type)` (the left-hand list).
             "expression_list" => {
@@ -298,7 +304,11 @@ fn declares(x: tree_sitter::Node, anc: &[tree_sitter::Node]) -> bool {
                 return !via_fn_declarator && !is_field(p, "type", c) && !is_field(p, "value", c);
             }
             // C/C++: a declarator wraps the name (`*p`, `a[4]`, `x = 1`, `(*fn)(int)`).
-            "pointer_declarator" | "array_declarator" | "parenthesized_declarator" | "reference_declarator" | "init_declarator"
+            "pointer_declarator"
+            | "array_declarator"
+            | "parenthesized_declarator"
+            | "reference_declarator"
+            | "init_declarator"
             | "function_declarator" => {
                 if !is_field(p, "declarator", c) && p.kind() != "parenthesized_declarator" {
                     return false;
@@ -790,7 +800,7 @@ pub fn index_project_with(c: &mut Connection, p: &Project, delta: Option<&crate:
     Ok(st)
 }
 
-fn trace(what: &str, t0: std::time::Instant) {
+pub(crate) fn trace(what: &str, t0: std::time::Instant) {
     if std::env::var_os("FOXDB_TRACE").is_some() {
         eprintln!("{what} {:?}", t0.elapsed());
     }

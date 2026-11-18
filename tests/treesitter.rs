@@ -783,7 +783,7 @@ fn go_interface_method_sets_expand_embeds_and_caps_are_reported() {
         .query_row("SELECT id FROM node WHERE name = 'Stop' AND json_extract(meta, '$.parent') = 'Stopper'", [], |r| r.get(0))
         .unwrap();
     let out = fox_code(&p, &format!("c:{id:x}"), "impact", 400);
-    assert!(out.contains("\npartial at d1: dispatch checked"), "{out}");
+    assert!(out.contains("\npartial at d1: dispatch checked the first 300 same-name methods"), "{out}");
 }
 
 /// Parameters and locals in every declaration form are not references to a same-name
@@ -834,7 +834,10 @@ fn member_values_are_not_same_file_members_of_other_types() {
             "src/m.js",
             "class Ctx {\n  get id() { return 1; }\n  show() { log(this.id); }\n}\nfunction handle(request) {\n  log(request.id);\n}\nfunction log(x) { return x; }\n",
         ),
-        ("app/m.py", "class Rec:\n    def name(self):\n        return 1\n\ndef show(obj):\n    emit(obj.name)\n\ndef emit(x):\n    return x\n"),
+        (
+            "app/m.py",
+            "class Rec:\n    def name(self):\n        return 1\n\ndef show(obj):\n    emit(obj.name)\n\ndef emit(x):\n    return x\n",
+        ),
     ]);
     let out = fox_code(&p, "Ctx.id", "refs", 800);
     assert!(out.contains(":3 Ctx.show") && !out.contains("handle"), "{out}");
@@ -893,8 +896,7 @@ fn c_all_caps_arguments_are_not_stored() {
         "void elog(int level, const char *m);\nint f(void) { elog(ERROR, \"x\"); elog(LOG_LEVEL, \"y\"); return 0; }\n",
     )]);
     let c = db::open_ro().unwrap();
-    let n: i64 = c
-        .query_row("SELECT COUNT(*) FROM ts_ref WHERE project_id = ?1 AND name IN ('ERROR', 'LOG_LEVEL')", [p.id], |r| r.get(0))
-        .unwrap();
+    let n: i64 =
+        c.query_row("SELECT COUNT(*) FROM ts_ref WHERE project_id = ?1 AND name IN ('ERROR', 'LOG_LEVEL')", [p.id], |r| r.get(0)).unwrap();
     assert_eq!(n, 0);
 }
