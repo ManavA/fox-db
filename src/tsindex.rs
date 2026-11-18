@@ -1249,7 +1249,19 @@ impl FileImports {
         self.lasts.contains(name)
             || self.lasts.contains(&s.parent)
             || fam != "go" && self.lasts.contains(stem_of(&s.path))
-            || fam == "go" && self.lasts.contains(dir.rsplit('/').next().unwrap_or("")) && self.names_dir(dir)
+            || fam == "go" && self.imports_package(dir)
+    }
+    /// Go: a package in `dir` is imported: its full path names the directory, or a non-standard
+    /// import path (`example.com/m/models`, with a domain) ends in the directory's last name. A
+    /// standard library path (`log`) never imports a project package (`internal/log`).
+    fn imports_package(&self, dir: &str) -> bool {
+        let last = dir.rsplit('/').next().unwrap_or("");
+        self.lasts.contains(last)
+            && (self.names_dir(dir)
+                || self
+                    .all
+                    .iter()
+                    .any(|m| m.last == last && m.raw.contains('/') && m.raw.split('/').next().is_some_and(|f| f.contains('.'))))
     }
     /// Go: an import path names directory `dir` itself (`example.com/pkg/b/stats` and
     /// `pkg/b/stats`, either one ending with the other), not only a package with its last name.
