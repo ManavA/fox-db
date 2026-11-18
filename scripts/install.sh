@@ -6,14 +6,14 @@
 #   scripts/install.sh --source        always build from source (needs cargo)
 #   scripts/install.sh --tarball FILE  install from a downloaded release tarball (checks FILE.sha256 if present)
 #
-# Environment: FOXDB_HOME (default ~/.foxdb), FOXDB_VERSION (default 0.2.1),
+# Environment: FOXDB_HOME (default ~/.foxdb), FOXDB_VERSION (default 0.2.2),
 # FOXDB_REPO (default ManavA/foxdb), FOXDB_RELEASE_URL (default
 # https://github.com/$FOXDB_REPO/releases/download/v$FOXDB_VERSION). No GitHub login is
 # needed. It never edits any harness setting (Claude Code, Codex, opencode, T3 Code):
 # registering the MCP server and hooks is a separate, explicit step.
 set -eu
 
-VERSION=${FOXDB_VERSION:-0.2.1}
+VERSION=${FOXDB_VERSION:-0.2.2}
 REPO=${FOXDB_REPO:-ManavA/foxdb}
 DEST=${FOXDB_HOME:-$HOME/.foxdb}/bin
 TARGET=x86_64-unknown-linux-gnu

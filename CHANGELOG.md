@@ -1,6 +1,6 @@
 # Changelog
 
-## 0.2.2 (unreleased)
+## 0.2.2 (2026-11-18)
 
 `impact` finds much more of what a change breaks and says when it may have missed something; the
 session brief names the MCP tools.
