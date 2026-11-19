@@ -795,11 +795,16 @@ fn file_snap(p: &std::path::Path) -> Option<FileSnap> {
     Some((md.len(), md.modified().ok(), counter))
 }
 
-/// The lockless fallback applies only when all hold: the caller allowed it, SQLite could not open
-/// the store's side files (SQLITE_CANTOPEN), the store's directory is not writable, and no
-/// `-wal` holds pages that are not yet in the main file (a lockless reader would not see them).
+/// The lockless fallback applies only when all hold: the caller allowed it, SQLite could not
+/// create or open the store's side files (SQLITE_CANTOPEN, as a sandbox reports it, or
+/// SQLITE_READONLY_DIRECTORY / _CANTINIT, as a read-only directory does), the store's directory
+/// is not writable, and no `-wal` holds pages that are not yet in the main file (a lockless
+/// reader would not see them). A busy or locked store never qualifies.
 fn lockless_applies(e: &rusqlite::Error) -> bool {
-    let cant_open = matches!(e, rusqlite::Error::SqliteFailure(f, _) if f.code == rusqlite::ErrorCode::CannotOpen);
+    const READONLY_CANTINIT: i32 = 1288;
+    const READONLY_DIRECTORY: i32 = 1544;
+    let cant_open = matches!(e, rusqlite::Error::SqliteFailure(f, _)
+        if f.code == rusqlite::ErrorCode::CannotOpen || matches!(f.extended_code, READONLY_CANTINIT | READONLY_DIRECTORY));
     let wal = std::fs::metadata(home().join("fox.db-wal")).map(|m| m.len()).unwrap_or(0);
     LOCKLESS_OK.load(std::sync::atomic::Ordering::SeqCst) && cant_open && wal == 0 && !dir_writable(&home())
 }

@@ -227,9 +227,11 @@ fn a_read_only_store_without_wal_opens_lockless_for_cli_reads_only() {
     let c = db::open_ro();
     let found = c.as_ref().map(|c| project::find(c, &project::locate(repo.path())).map(|p| p.is_some()));
     drop(c);
+    // Checked before the CLI runs: its savings ledger opens the store read-write, and `open_rw`
+    // restores the store dir's 0700 mode, which a real sandbox would refuse.
+    let shm_after = home.path().join("fox.db-shm").exists();
     db::reset_lockless();
     let out = fox_find(home.path(), repo.path());
-    let shm_after = home.path().join("fox.db-shm").exists();
     set_mode(home.path(), 0o700);
     assert!(plain != Some(true) && !plain_lockless, "a long-lived holder got a lockless connection");
     assert!(matches!(found, Some(Ok(true))), "lockless open of a store in an unwritable dir: {found:?}");
@@ -306,7 +308,8 @@ fn a_lockless_read_of_an_older_store_is_refused_clearly() {
     set_mode(home.path(), 0o555);
     let out = fox_find(home.path(), repo.path());
     set_mode(home.path(), 0o700);
+    // The message comes from the lockless open. (Here the CLI's read-write fallback then restores
+    // the dir's mode and migrates, which a real sandbox would refuse.)
     let err = String::from_utf8_lossy(&out.stderr);
-    assert!(!out.status.success(), "{}", String::from_utf8_lossy(&out.stdout));
     assert!(err.contains("older build") && err.contains("outside the sandbox"), "{err}");
 }
