@@ -36,6 +36,9 @@ pub struct Def {
     pub decl: bool,
     /// Declared `static` (C/C++): visible only in its own file, unless that file is a header.
     pub stat: bool,
+    /// A class field holding a function (`dispatch = () => {}`): a method reached only through
+    /// `this`, its own file or a receiver named like its type; any other call to it is a guess.
+    pub field_fn: bool,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -423,6 +426,11 @@ pub fn extract(l: &Lang, src: &[u8]) -> Parsed {
                 last = b;
             }
             // A class field holding a function (`handleClick = () => {}`) is a method.
+            let field_fn = kind == FIELD
+                && node
+                    .child_by_field_name("value")
+                    .or_else(|| node.child_by_field_name("right"))
+                    .is_some_and(|v| matches!(v.kind(), "arrow_function" | "function_expression" | "function" | "lambda"));
             if kind == FIELD
                 && node
                     .child_by_field_name("value")
@@ -446,6 +454,7 @@ pub fn extract(l: &Lang, src: &[u8]) -> Parsed {
                 container_name: container,
                 decl: node.kind() == "declaration",
                 stat,
+                field_fn,
             });
         } else if let Some(k) = cn.strip_prefix("reference.") {
             // A value in an argument list, keyed literal or initializer (`f(name)`, `Name: name`,
@@ -1046,6 +1055,9 @@ fn store_file(
         if d.stat {
             meta["s"] = 1.into();
         }
+        if d.field_fn {
+            meta["f"] = 1.into();
+        }
         ins.execute(params![pid, format!("t:{pid}:{path}#{i}"), d.name, path, d.line, d.end_line, lang, meta.to_string(), now])?;
         let id = tx.last_insert_rowid();
         ids.push(id);
@@ -1149,6 +1161,8 @@ struct Cand {
     decl: bool,
     /// C/C++ `static` outside a header: visible only in its own file.
     file_local: bool,
+    /// See [`Def::field_fn`].
+    field_fn: bool,
 }
 
 /// One reference row to score.
@@ -1427,6 +1441,8 @@ fn score(r: &RefRow, cands: &[Cand], imp: Option<&FileImports>) -> (i64, i64) {
     // (score, id, candidates at that score, same file, member, score without the receiver match)
     let mut best = (0i32, 0i64, 0usize, false, false, 0i32);
     let mut eligible = 0i64;
+    // The best candidate is a function-holding field reached without receiver evidence.
+    let mut field_fn_guess = false;
     for s in cands {
         if s.family != fam || s.id == r.src && call && is_type_kind(&s.kind) {
             continue;
@@ -1516,6 +1532,7 @@ fn score(r: &RefRow, cands: &[Cand], imp: Option<&FileImports>) -> (i64, i64) {
         }
         if score > best.0 {
             best = (score, s.id, 1, same_file, member, score - via_bonus);
+            field_fn_guess = s.field_fn && !same_file && !own_receiver;
         } else if score == best.0 {
             best.2 += 1;
         }
@@ -1536,7 +1553,8 @@ fn score(r: &RefRow, cands: &[Cand], imp: Option<&FileImports>) -> (i64, i64) {
     let dst = if best.0 >= 20 && !via_only || via_guess || unique || few { best.1 } else { 0 };
     let guess =
         dst != 0 && !best.3 && (eligible > 1 && (best.2 > 1 || call && r.recv || name_only) || name_only && call && r.recv || via_only);
-    (dst, if guess { eligible } else { 0 })
+    let guess = guess || dst != 0 && field_fn_guess;
+    (dst, if guess { eligible.max(1) } else { 0 })
 }
 
 fn map_cand(r: &rusqlite::Row) -> rusqlite::Result<(String, Cand)> {
@@ -1555,12 +1573,13 @@ fn map_cand(r: &rusqlite::Row) -> rusqlite::Result<(String, Cand)> {
             local: false,
             decl: r.get::<_, Option<i64>>(7)?.is_some(),
             file_local,
+            field_fn: r.get::<_, Option<i64>>(9)?.is_some(),
         },
     ))
 }
 
 const CAND_COLS: &str = "id, name, path, json_extract(meta,'$.k'), COALESCE(json_extract(meta,'$.pid'),0), \
-     COALESCE(json_extract(meta,'$.parent'),''), lang, json_extract(meta,'$.d'), json_extract(meta,'$.s')";
+     COALESCE(json_extract(meta,'$.parent'),''), lang, json_extract(meta,'$.d'), json_extract(meta,'$.s'), json_extract(meta,'$.f')";
 const REF_COLS: &str = "rowid, path, src, name, kind, dst, recv, amb, line, via";
 
 fn map_ref(r: &rusqlite::Row) -> rusqlite::Result<RefRow> {
@@ -1826,6 +1845,7 @@ mod via_tests {
             local: false,
             decl: false,
             file_local: false,
+            field_fn: false,
         }
     }
 

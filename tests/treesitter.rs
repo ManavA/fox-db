@@ -1519,3 +1519,67 @@ fn file_outlines_leave_fields_to_their_type() {
     let out = fox_code(&p, "Pod", "outline", 800);
     assert!(out.contains("field Name") || out.contains(" field Name"), "{out}");
 }
+
+// ---- verification fixes ----
+
+/// A field's answer lists lines of its own file that name it (not the definition line), and
+/// an answer with no mentions cannot read as "unused".
+#[test]
+fn field_answers_show_own_file_mentions_and_never_read_as_unused() {
+    let _g = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    let (_h, _r, p) = inline_project(&[
+        ("x/p.go", "package x\n\ntype P struct {\n\txval int\n}\n\nfunc (p *P) Get() int { return p.xval }\n"),
+        ("y/q.go", "package y\n\ntype Q struct {\n\tlonely int\n}\n"),
+    ]);
+    let out = fox_code(&p, "P.xval", "refs", 800);
+    assert!(out.contains("x/p.go:7 | func (p *P) Get() int { return p.xval }") && !out.contains("x/p.go:4 |"), "{out}");
+    let out = fox_code(&p, "Q.lonely", "refs", 800);
+    assert!(out.contains("does not mean it is unused") && !out.contains("no other file names"), "{out}");
+}
+
+/// A call through a receiver unrelated to the class reaches a function-holding field only as
+/// a guess; through `this` it is certain.
+#[test]
+fn arrow_field_methods_need_receiver_evidence() {
+    let _g = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    let (_h, _r, p) = inline_project(&[
+        (
+            "web/w.ts",
+            "export class Btn {\n  dispatch = (a: number) => { this.handle(); };\n  handle(): void {}\n  click() { this.dispatch(1); }\n}\n",
+        ),
+        (
+            "web/use.ts",
+            "import { createStore } from \"redux\";\nconst store = createStore(() => 0);\nexport function fire() {\n  store.dispatch({ type: \"x\" });\n}\n",
+        ),
+    ]);
+    let out = fox_code(&p, "Btn.dispatch", "callers", 800);
+    let fire = out.lines().find(|l| l.contains(" fire c:")).unwrap_or_default();
+    assert!(fire.is_empty() || fire.contains("guess"), "{out}");
+    let click = out.lines().find(|l| l.contains("Btn.click c:")).unwrap_or_default();
+    assert!(!click.is_empty() && !click.contains("guess"), "{out}");
+}
+
+/// Row code is clipped around the call, not the first mention of the name.
+#[test]
+fn row_code_centres_on_the_call() {
+    let _g = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    let pad = "x".repeat(200);
+    let src = format!("int far(void) {{ /* wake_task {pad} */ return wake_task(1); }}\n");
+    let (_h, _r, p) = inline_project(&[("core.c", "int wake_task(int p) { return p; }\n"), ("far.c", src.as_str())]);
+    let out = fox_code(&p, "wake_task", "callers", 2000);
+    let far = out.lines().find(|l| l.contains(" far c:")).unwrap_or_default();
+    assert!(far.contains("return wake_task(1);"), "{out}");
+}
+
+/// Equally good matches for a qualified target are named, not broken silently.
+#[test]
+fn equal_qualified_matches_are_named() {
+    let _g = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    let (_h, _r, p) = inline_project(&[
+        ("go.mod", "module example.com/m\n\ngo 1.21\n"),
+        ("vendor/github.com/acme/yaml/y.go", "package yaml\n\nfunc Marshal() int { return 1 }\n"),
+        ("third/github.com/acme/yaml/y.go", "package yaml\n\nfunc Marshal() int { return 2 }\n"),
+    ]);
+    let out = fox_code(&p, "github.com/acme/yaml.Marshal", "callers", 800);
+    assert!(out.contains("2 equally good matches"), "{out}");
+}

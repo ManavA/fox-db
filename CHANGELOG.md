@@ -17,7 +17,10 @@ First answers that were empty, wrong or padded in agent benchmark transcripts ar
   JavaScript and Python, so `fox_find ContainerLogMaxWorkers` finds the struct field first.
   Fields are never call or reference targets, so callers of a same-name function stay certain;
   `callers`, `refs` and `impact` of a field say its uses are not tracked and list the files that
-  name it. A JS/TS class field holding an arrow function is a method. Files of those grammars
+  name it, its own file included; an answer with no mentions says that does not mean the
+  field is unused. A JS/TS class field holding an arrow function is a method, reached with
+  certainty only through `this`, its own file or a receiver named like its type (else a guess).
+  A qualified target matched equally well by several definitions says so. Files of those grammars
   and PHP parse again once (store schema 20), and when that is most of a project the full-text
   tables are merged at the end, so an upgraded store is no larger than a fresh one.
 - When an identifier names a symbol, `fox_find` returns that symbol, names that contain it and

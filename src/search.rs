@@ -625,11 +625,16 @@ fn exact_arm(c: &Connection, q: &str, f: &Filter, k: usize) -> Result<Vec<i64>> 
         let last = qual.rsplit(['.', '/']).next().unwrap_or(qual);
         let sql = format!(
             "SELECT n.id, n.path, json_extract(n.meta, '$.parent') FROM node n WHERE n.name = ?1 COLLATE NOCASE AND n.kind = 'symbol'
-               AND (n.path LIKE '%' || ?2 || '%' OR json_extract(n.meta, '$.parent') LIKE '%' || ?2){}{} LIMIT 20000",
+               AND (n.path LIKE '%' || ?2 || '%' OR json_extract(n.meta, '$.parent') LIKE '%' || ?2){}{}
+             ORDER BY instr(n.path, ?3) = 0, instr(COALESCE(json_extract(n.meta, '$.parent'), ''), ?4) = 0, n.id LIMIT 20000",
             f.kind_sql, f.scope_sql
         );
         let mut s = c.prepare_cached(&sql)?;
-        let rows = s.query_map([member.split('(').next().unwrap_or(member), last], |r| {
+        // Rows whose path holds the whole qualifier (as a path) or whose container ends it come
+        // first, so the closest matches are never cut by the limit.
+        let as_path = qual.trim_start_matches('.').replace('.', "/");
+        let cont = qual.rsplit('/').next().unwrap_or(qual);
+        let rows = s.query_map([member.split('(').next().unwrap_or(member), last, as_path.as_str(), cont], |r| {
             Ok((r.get::<_, i64>(0)?, r.get::<_, Option<String>>(1)?, r.get::<_, Option<String>>(2)?))
         })?;
         let mut v: Vec<(i64, (bool, usize))> = rows

@@ -338,17 +338,22 @@ fn clip_around(line: &str, name: &str) -> Option<String> {
     Some(out)
 }
 
-/// Byte offset of `name` in `line` as a whole word.
+/// Byte offset of `name` in `line` as a whole word: a call (`name(`) first, else the first.
 fn word_at(line: &str, name: &str) -> Option<usize> {
     let w = |ch: Option<char>| ch.is_some_and(|ch| ch.is_alphanumeric() || ch == '_');
     let mut from = 0;
+    let mut first = None;
     while let Some(i) = line[from..].find(name).map(|i| i + from) {
-        if !w(line[..i].chars().next_back()) && !w(line[i + name.len()..].chars().next()) {
-            return Some(i);
+        let after = &line[i + name.len()..];
+        if !w(line[..i].chars().next_back()) && !w(after.chars().next()) {
+            if after.trim_start().starts_with('(') {
+                return Some(i);
+            }
+            first = first.or(Some(i));
         }
         from = i + name.len();
     }
-    None
+    first
 }
 
 /// Most files listed by path:line when an answer names files it could not resolve.
@@ -605,6 +610,20 @@ pub fn run(c: &Connection, p: &Project, sym: &str, rel: &str, depth: usize, curs
     let cands = resolve(c, p.id, sym)?;
     let Some(top) = cands.first() else { return Ok(None) };
     let mut lines: Vec<String> = vec![];
+    // A qualified target matched equally well by several definitions (vendored copies): say so.
+    if let Some((qual, _)) = sym.split('(').next().unwrap_or(sym).rsplit_once('.')
+        && cands.len() > 1
+    {
+        let q0 = qual_matches(top, qual);
+        let tied = cands.iter().filter(|s| s.name == top.name && qual_matches(s, qual) == q0).count();
+        if tied > 1 {
+            lines.push(format!(
+                "{tied} equally good matches for {sym:?}; using {} at {}, the lowest id (name a longer path to pick another)",
+                top.h(),
+                top.path
+            ));
+        }
+    }
     if cands.len() > 1 {
         let others: Vec<String> = cands.iter().skip(1).take(4).map(|s| format!("{} {}", s.h(), s.qname())).collect();
         lines.push(format!("{} matches; others: {}{}", cands.len(), others.join(", "), if cands.len() > 5 { ", ..." } else { "" }));
@@ -616,9 +635,34 @@ pub fn run(c: &Connection, p: &Project, sym: &str, rel: &str, depth: usize, curs
             // A field is no reference target: its reads and writes are not resolved, so the
             // answer is the files that name it, never a confident 0.
             lines.push(format!("{rel} of {}", top.row()));
+            // Its own file first (the definition line left out), then the other files naming it.
+            let mut src = SrcLines::new(&p.root, true);
+            let own: Vec<String> = src
+                .text(&top.path)
+                .map(|t| {
+                    t.iter()
+                        .enumerate()
+                        .filter(|(i, _)| *i as i64 + 1 != top.line)
+                        .filter_map(|(i, l)| clip_around(l.trim(), &top.name).map(|code| format!("  {}:{} | {code}", top.path, i + 1)))
+                        .take(5)
+                        .collect()
+                })
+                .unwrap_or_default();
             let files = unlisted_files(c, p.id, top, &HashSet::new(), false)?;
-            let (head, rows) = mentions(p, &top.name, &files, "field uses are not tracked", "by name");
-            lines.push(head.unwrap_or_else(|| format!("field uses are not tracked: no other file names `{}`", top.name)));
+            let lead = "field uses are not tracked (reads and writes are not resolved)";
+            let (head, rows) = mentions(p, &top.name, &files, lead, "by name");
+            match head {
+                Some(h) => lines.push(h),
+                None if !own.is_empty() => lines.push(format!("{lead}; lines in its own file that name it at the end")),
+                None => lines.push(format!(
+                    "{lead}; the index finds no line naming `{}` besides its definition, which does not mean it is unused (it may be reached by another name); Grep can confirm",
+                    top.name
+                )),
+            }
+            if !own.is_empty() {
+                tail.push("mentions in its own file:".into());
+                tail.extend(own);
+            }
             tail.extend(rows);
         }
         "callers" | "refs" => {
