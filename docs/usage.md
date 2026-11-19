@@ -199,6 +199,11 @@ every session pays that once, in its cached prefix.
 
 - `fox_find`, `fox_graph` and `fox_read` carry `readOnlyHint: true`, so Claude Code may run them in
   parallel; `fox_memory` writes and carries none.
+- `fox_find` and `fox_graph` carry `_meta: {"anthropic/alwaysLoad": true}` in `tools/list`: Claude
+  Code defers MCP tools behind tool search by default, and these two load up front. A user's
+  server-level `alwaysLoad: false` overrides it. `context-budget.json` pins which tools carry it
+  and the bytes every session pays before its first call (instructions, tool list and the
+  brief's tool line); a test fails when either changes, so growth is deliberate.
 - No tool has an `outputSchema` and no result carries `structuredContent`: Codex shows a result's
   structured JSON instead of its text, which would replace foxdb's budgeted rows.
 - `initialize` answers with the client's `protocolVersion` when foxdb implements it (2025-11-25,

@@ -106,7 +106,7 @@ fn mcp_tool_definitions_are_frozen() {
     assert_eq!(tools, mcp::tools().to_string());
 }
 
-const FROZEN_TOOLS_HASH: &str = "c1d3c01cfa006d8c";
+const FROZEN_TOOLS_HASH: &str = "d41fff6761ad89c0";
 
 fn fnv_hex(s: &str) -> String {
     // FNV-1a 64: dependency-free and stable across platforms; collisions are irrelevant here.
@@ -182,6 +182,14 @@ fn context_budget_file_matches() {
         ("instructions_bytes", init["result"]["instructions"].as_str().unwrap_or_default().len()),
         ("dispatch_brief_bytes", foxdb::orch::dispatch_brief("h:0").len()),
         ("report_schema_bytes", foxdb::report::SCHEMA.len()),
+        ("brief_tools_line_bytes", query::BRIEF_TOOLS_LINE.len()),
+        // What every session pays before its first tool call (T3's agentContextBudget).
+        (
+            "agent_context_bytes",
+            init["result"]["instructions"].as_str().unwrap_or_default().len()
+                + mcp::tools().to_string().len()
+                + query::BRIEF_TOOLS_LINE.len(),
+        ),
     ];
     let mut bad = vec![];
     for (k, n) in actual {
@@ -191,7 +199,18 @@ fn context_budget_file_matches() {
         }
     }
     assert!(bad.is_empty(), "context sizes moved; growth must be deliberate, update context-budget.json:\n{}", bad.join("\n"));
-    assert_eq!(budget.as_object().unwrap().len(), actual.len(), "context-budget.json has keys this test does not check");
+    // Tools Claude Code loads up front instead of deferring behind tool search.
+    let always: Vec<String> = mcp::tools()
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|t| t["_meta"]["anthropic/alwaysLoad"] == true)
+        .map(|t| t["name"].as_str().unwrap().to_string())
+        .collect();
+    let want: Vec<String> =
+        serde_json::from_value(budget["always_load_tools"].clone()).expect("context-budget.json lacks always_load_tools");
+    assert_eq!(always, want, "always-loaded tools changed; update context-budget.json");
+    assert_eq!(budget.as_object().unwrap().len(), actual.len() + 1, "context-budget.json has keys this test does not check");
 }
 
 /// headroom replaces tool output with markers like `Retrieve more: hash=…` and `[↑4L same as
@@ -396,4 +415,20 @@ fn tool_wording_leads_with_the_question_and_offers_no_way_out() {
     for tool in ["fox_find", "fox_graph", "fox_read", "fox_memory"] {
         assert!(tool_line.contains(tool), "{tool_line}");
     }
+}
+
+/// `fox_find` and `fox_graph` carry `_meta["anthropic/alwaysLoad"]`, so Claude Code loads them
+/// up front instead of deferring them behind tool search; the brief's second line is the tool line.
+#[test]
+fn find_and_graph_are_always_loaded() {
+    let _g = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    let r = mcp::handle(&serde_json::json!({"jsonrpc": "2.0", "id": 2, "method": "tools/list"})).unwrap();
+    for t in r["result"]["tools"].as_array().unwrap() {
+        let on = t["_meta"]["anthropic/alwaysLoad"] == true;
+        assert_eq!(on, matches!(t["name"].as_str(), Some("fox_find" | "fox_graph")), "{t}");
+    }
+    let (_home, repo) = setup();
+    let (c, p) = indexed(repo.path());
+    let brief = query::brief(&c, &p, Some("main"), 400).unwrap();
+    assert_eq!(brief.lines().nth(1), Some(query::BRIEF_TOOLS_LINE));
 }

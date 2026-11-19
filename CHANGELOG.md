@@ -26,6 +26,10 @@ First answers that were empty, wrong or padded in agent benchmark transcripts ar
   with the question each tool answers ("Where is X?", "Who calls X, and what breaks if X
   changes?"), say to call foxdb first even when a grep looks quicker, and no longer say to skip
   it when one grep answers. The skill is a find, trace, read loop with a completion check.
+- `fox_find` and `fox_graph` carry `_meta: {"anthropic/alwaysLoad": true}`, so Claude Code loads
+  them up front instead of deferring them behind tool search. `context-budget.json` now also pins
+  the brief's tool line, the bytes every session pays before its first call (instructions, tool
+  list and brief line: 4,935) and the list of always-loaded tools.
 - `fox_read` with no mode returns a symbol's body, and for a file its declarations with the last
   line of each (`..N`) and how to read one.
 

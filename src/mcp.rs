@@ -63,15 +63,18 @@ Rows end in path:line; pass a row's handle to fox_read or fox_graph.";
 /// client's version when it is one of these, else with the newest.
 pub const PROTOCOL_VERSIONS: &[&str] = &["2025-11-25", "2025-06-18", "2025-03-26", "2024-11-05"];
 
-/// The tool list. Never add `outputSchema` or return `structuredContent`: Codex replaces a
+/// The tool list (`fox_find` and `fox_graph` carry `_meta["anthropic/alwaysLoad"]`). Never add `outputSchema` or return `structuredContent`: Codex replaces a
 /// result's text with the structured JSON, losing foxdb's budgeted line format. The three
 /// read tools carry `readOnlyHint` so Claude Code may run them in parallel; `fox_memory` writes.
 pub fn tools() -> Value {
     let ro = json!({"readOnlyHint": true});
+    // Claude Code defers MCP tools behind tool search; these two load up front, so a where-is or
+    // who-calls question can reach them without a search round-trip. Never toggled mid-session.
+    let always = json!({"anthropic/alwaysLoad": true});
     let budget = json!({"type": "integer", "description": "tokens, default 500, max 4000"});
     let cursor = json!({"type": "integer", "description": "from a '+N more · cursor=K' footer"});
     json!([
-        {"name": "fox_find",
+        {"name": "fox_find", "_meta": always,
          "description": "Where is X? Finds a function, type, field, file, doc section or past decision by name or words; ranked rows end in path:line. Use it for every where-is or which-file question, even when a grep looks quicker. Handles: s/c symbol, f file, d doc, m milestone, a dir, g memory, x session. ~ = name-resolved.",
          "annotations": ro,
          "inputSchema": {"type": "object", "required": ["q"], "properties": {
@@ -79,7 +82,7 @@ pub fn tools() -> Value {
             "kind": {"type": "string", "enum": ["any", "symbol", "file", "dir", "doc", "milestone", "memory"]},
             "project": {"type": "string", "description": "project name or 'all'"},
             "budget": budget, "cursor": cursor}}},
-        {"name": "fox_graph",
+        {"name": "fox_graph", "_meta": always,
          "description": "Who calls X, and what breaks if X changes? Callers, callees, refs, overrides, conformers or impact of a symbol, with the code at each site. Use it before changing, renaming or deleting a function, field or type, even when a grep looks quicker: it follows qualified and aliased names. target: handle, name, Type.member or pkg.Name; impact without target = git diff.",
          "annotations": ro,
          "inputSchema": {"type": "object", "properties": {
