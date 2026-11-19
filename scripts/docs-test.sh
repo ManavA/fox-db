@@ -125,6 +125,20 @@ if [ $status = 0 ]; then
     [ ! -e "$scratch/agents/home/.foxdb" ] || { echo "FAIL AGENTS-SETUP.md: uninstall left ~/.foxdb"; status=1; }
 fi
 
+# The plugin: each installed harness accepts it from this checkout (offline, in a scratch home).
+if command -v claude >/dev/null 2>&1; then
+    home=$scratch/plugin-claude/home
+    mkdir -p "$home"
+    if out=$(cd "$repo" && env -i HOME="$home" PATH="$clean_path" claude plugin validate plugin 2>&1 \
+        && env -i HOME="$home" PATH="$clean_path" claude plugin validate . 2>&1) \
+        && [ "$(printf '%s' "$out" | grep -c 'Validation passed')" = 2 ]; then
+        echo "PASS claude plugin validate (plugin and marketplace)"
+    else
+        echo "FAIL claude plugin validate: $out"
+        status=1
+    fi
+fi
+
 # This machine's release tarball, when scripts/dist.sh has built one.
 tarball=$repo/dist/foxdb-$version-$(rustc -vV | sed -n 's/^host: //p').tar.gz
 if [ -f "$tarball" ]; then

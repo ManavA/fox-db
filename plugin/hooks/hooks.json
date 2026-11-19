@@ -1,0 +1,17 @@
+{
+  "description": "foxdb: project brief at session and subagent start, subagent reports and handoff packets on the board. Never injects from tool or prompt hooks.",
+  "hooks": {
+    "SessionStart": [
+      {"hooks": [{"type": "command", "command": "\"${CLAUDE_PLUGIN_ROOT}/scripts/hook.sh\" session-start", "timeout": 5}]}
+    ],
+    "SubagentStart": [
+      {"hooks": [{"type": "command", "command": "\"${CLAUDE_PLUGIN_ROOT}/scripts/hook.sh\" subagent-start", "timeout": 5}]}
+    ],
+    "SubagentStop": [
+      {"hooks": [{"type": "command", "command": "\"${CLAUDE_PLUGIN_ROOT}/scripts/hook.sh\" subagent-stop", "timeout": 5}]}
+    ],
+    "PreCompact": [
+      {"hooks": [{"type": "command", "command": "\"${CLAUDE_PLUGIN_ROOT}/scripts/hook.sh\" pre-compact", "timeout": 5}]}
+    ]
+  }
+}

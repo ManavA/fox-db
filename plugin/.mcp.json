@@ -1,0 +1,8 @@
+{
+  "mcpServers": {
+    "foxdb": {
+      "command": "${CLAUDE_PLUGIN_ROOT}/bin/fox",
+      "args": ["mcp"]
+    }
+  }
+}
