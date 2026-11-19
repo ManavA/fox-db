@@ -7,10 +7,20 @@ First answers that were empty, wrong or padded in agent benchmark transcripts ar
 - `fox_read` also carries `anthropic/alwaysLoad`: with only `fox_find` and `fox_graph` loaded,
   agents read bodies with the native Read instead. The brief's tool line now names
   `fox_read target=<handle>` as the way to read a body.
-- `callers`, `refs` and `impact` no longer read as incomplete over mentions that cannot be
-  calls: a file naming the target only in comments, imports, C-family declarations
-  (`extern`, prototypes) or strings is listed under `also mentioned (not calls):` and left out
-  of the `may be incomplete` / `partial at d1` count.
+- `callers`, `refs` and `impact` account for every line that names the target as a whole word
+  in the indexed code, so the answer is a labelled superset of `rg -w name` there. The first
+  line counts them by group (`16 lines name `f`: 7 calls, 1 definition, 5 imports,
+  2 declarations/prototypes, 1 in 1 same-name definition elsewhere, 1 comment/string; all
+  accounted for`); imports, C/C++ prototypes and `extern`s, same-name definitions of other
+  classes or packages (marked as different symbols), comments, strings and docstrings follow
+  as groups of `path:line | code` rows, after the unresolved mentions. Only unresolved lines,
+  and for `callers` a function passed as a value, make it read `may be incomplete` (`partial at
+  d1`); a cited file changed since indexing makes
+  it say the index is stale. A common name keeps to the budget: counts for every group, a few
+  rows each, and the budget that lists them all. A name with no indexed definition lists its
+  lines instead of answering nothing. On 80 scrapy commits that removed or re-signed a
+  function, the share of the lines those commits changed that callers plus refs list went from
+  34% to 73%.
 - `impact` rows at d1 show the line that uses the target (`| :5 raise HttpError(401)`), not
   only the dependent's definition line, and d1 `(top)` rows show their first use line.
 - A Go target qualified by its package resolves: `pod.GetContainerStatus`, the repo path
@@ -37,9 +47,8 @@ First answers that were empty, wrong or padded in agent benchmark transcripts ar
   `IContains`) or only neighbour it in the call graph (the callees of `exec_simple_query`) are
   left out. Doc sections holding a snake_case name (`get_user`) stay. One lookup checks all
   rows at once.
-- When the name occurs in files an answer could not resolve, `callers`, `refs` and `impact` no
-  longer ask for `rg`: up to 15 such files are listed at the end as `unresolved mentions`
-  (`path:line | code`); more are counted.
+- When the name occurs in lines an answer could not resolve, `callers`, `refs` and `impact` no
+  longer ask for `rg`: they are listed at the end as `unresolved mentions` (`path:line | code`).
 - Answers carry code. `callers` and `refs` rows end in the call site's line (`  :338 Caller c:1f | return f(x)`),
   or list one `   :line | code` row per site for a caller with several; `impact` rows end in the
   dependent's definition line. The code is shown only when the line still names the target
