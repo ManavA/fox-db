@@ -231,8 +231,7 @@ project's `AGENTS.md` (show them to the user; do not edit `CLAUDE.md` or memory 
 
 ```md
 ## Code navigation
-Use foxdb before grepping: `fox_find` / `fox find <q>`, `fox_graph` / `fox code <sym> --rel callers|outline|src|impact`,
-`fox_memory op=brief`. Rows start with handles and end in path:line; `~` rows are tree-sitter, not compiler-resolved.
+To find or trace code, call `fox_find` / `fox find <q>`, `fox_graph` / `fox code <sym> --rel callers|impact` and `fox_read` / `fox code <sym> --rel src|outline` first, even when a grep looks quicker; `fox_memory op=recall` for past decisions. Rows start with handles and end in path:line; `~` rows are tree-sitter, not compiler-resolved.
 - Shared agent context lives in foxdb: `fox_memory op=read since=auto` for new board posts, `op=take id=h:…` before working a handoff, `op=post` for findings; packets via `fox handoff render h:…`.
 ```
 
@@ -320,7 +319,7 @@ Remove the `PATH` line from the shell profile and any lines added to `AGENTS.md`
 | Session brief, recall, notes, board, packets, dispatch, wait | `fox_memory op=…` | `fox mem …`, `fox handoff …`, `fox dispatch`, `fox wait` |
 | What a doc cites that changed; minimal context for a reviewer | | `fox drift doc.md`, `fox pack doc.md` |
 
-Skip foxdb when one grep, a file already in context or a path you know answers faster.
+For a literal string, an error message or a file you already know, Grep and Read are the tools.
 
 **Handles.** Every row starts with a handle and ends in `path:line`: `s:` Swift symbol, `c:`
 tree-sitter symbol, `f:` file, `d:` doc section, `m:` milestone, `a:` directory, `g:` memory

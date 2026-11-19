@@ -191,7 +191,7 @@ top: code callers ~15k/5, code outline ~11k/3, code callees ~6397/1, code impact
 | `fox_memory` | `op` (brief/recall/note/post/read/pickup/take/packet/agents/dispatch/wait), `q?`, `text?`, `kind?`, `topic?`, `since?`, `evidence?`, `next?`, `id?`, `harness?`, `writer?`, `reviewer?`, `any?`, `timeout?`, `budget?` | Session brief, recall, notes, the handoff board, packets, the agent tree, dispatch and bounded wait (see [multi-agent.md](multi-agent.md)) |
 
 Each description says when to use the tool, and `initialize` returns a short server
-instructions string (four sentences). The definitions plus instructions are about 1,100 tokens,
+instructions string (five short sentences: one question and tool per line, then "call them first, even when a grep looks quicker"). The definitions plus instructions are about 1,100 tokens,
 and a test hashes them: they sit in every request's cached prefix, so they change only on purpose.
 Milestone 2 grew them by about 190 tokens (the multi-agent `fox_memory` ops and arguments) and
 milestone 3 by about 65 (the `readOnlyHint` annotations and the `any` and `reviewer` arguments);
@@ -297,7 +297,7 @@ Or, for any agent that only reads `AGENTS.md`, add:
 
 ```md
 ## Code navigation
-Use `~/.foxdb/bin/fox` before grepping: `fox find <q>`, `fox code <sym> --rel callers|outline|src|impact`,
+To find or trace code, run `~/.foxdb/bin/fox` first, even when a grep looks quicker: `fox find <q>`, `fox code <sym> --rel callers|outline|src|impact`,
 `fox mem brief`, `fox mem read` / `fox mem post <finding>`. Rows start with handles and end in path:line;
 `~` rows are tree-sitter, not compiler-resolved.
 ```

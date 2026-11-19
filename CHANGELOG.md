@@ -22,6 +22,10 @@ First answers that were empty, wrong or padded in agent benchmark transcripts ar
   or list one `   :line | code` row per site for a caller with several; `impact` rows end in the
   dependent's definition line. When the code would push an answer past its budget and the
   locations alone fit, the code is left out with a line saying which budget shows it.
+- The server instructions, the four tool descriptions, the skill and the brief's tool line lead
+  with the question each tool answers ("Where is X?", "Who calls X, and what breaks if X
+  changes?"), say to call foxdb first even when a grep looks quicker, and no longer say to skip
+  it when one grep answers. The skill is a find, trace, read loop with a completion check.
 - `fox_read` with no mode returns a symbol's body, and for a file its declarations with the last
   line of each (`..N`) and how to read one.
 

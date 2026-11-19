@@ -53,9 +53,11 @@ fn seen() -> &'static std::sync::Mutex<crate::spare::Seen> {
 
 /// Short server instructions, sent once in `initialize`. Frozen with the tool list (see the
 /// hash test): both sit in every request's cached prefix.
-pub const INSTRUCTIONS: &str = "foxdb indexes this machine's code, docs, milestones, agent memory and past sessions. \
-Use it before grepping a large repo for a symbol, its callers or a doc section, and before re-reading long logs. \
-Skip it when one grep or a file already in context answers. Rows end in path:line; pass a row's handle to fox_read or fox_graph.";
+pub const INSTRUCTIONS: &str = "foxdb answers code questions from an index of this repo. \
+Where is X: fox_find q=X. Who calls X, what breaks if X changes: fox_graph target=X rel=callers or impact. \
+X's body, or a file's declarations: fox_read target=X. A past decision or handoff: fox_memory op=recall. \
+Call them first, even when a grep looks quicker: they resolve qualified names and return the code at each site. \
+Rows end in path:line; pass a row's handle to fox_read or fox_graph.";
 
 /// Protocol versions this server implements, newest first. `initialize` answers with the
 /// client's version when it is one of these, else with the newest.
@@ -70,7 +72,7 @@ pub fn tools() -> Value {
     let cursor = json!({"type": "integer", "description": "from a '+N more · cursor=K' footer"});
     json!([
         {"name": "fox_find",
-         "description": "Ranked search over symbols, files, dirs, docs, milestones, memory and past sessions; rows end in path:line. Use instead of grep/glob to locate a name or topic in a big repo. Handles: s/c symbol, f file, d doc, m milestone, a dir, g memory, x session. ~ = not compiler-resolved.",
+         "description": "Where is X? Finds a function, type, field, file, doc section or past decision by name or words; ranked rows end in path:line. Use it for every where-is or which-file question, even when a grep looks quicker. Handles: s/c symbol, f file, d doc, m milestone, a dir, g memory, x session. ~ = name-resolved.",
          "annotations": ro,
          "inputSchema": {"type": "object", "required": ["q"], "properties": {
             "q": {"type": "string", "description": "name, substring or words"},
@@ -78,7 +80,7 @@ pub fn tools() -> Value {
             "project": {"type": "string", "description": "project name or 'all'"},
             "budget": budget, "cursor": cursor}}},
         {"name": "fox_graph",
-         "description": "Callers, callees, refs, conformers, overrides or blast radius of a symbol. Use before changing a signature instead of grepping for call sites. target: handle or Type.member; impact without target = git diff.",
+         "description": "Who calls X, and what breaks if X changes? Callers, callees, refs, overrides, conformers or impact of a symbol, with the code at each site. Use it before changing, renaming or deleting a function, field or type, even when a grep looks quicker: it follows qualified and aliased names. target: handle, name, Type.member or pkg.Name; impact without target = git diff.",
          "annotations": ro,
          "inputSchema": {"type": "object", "properties": {
             "target": {"type": "string"},
@@ -86,7 +88,7 @@ pub fn tools() -> Value {
             "depth": {"type": "integer", "description": "impact depth, default 2"},
             "budget": budget, "cursor": cursor}, "required": ["rel"]}},
         {"name": "fox_read",
-         "description": "Expand a handle or path: outline, signature, body, doc section, context, a handoff (h:) or session digest (x:). Use to read just one symbol or section instead of a whole file. A repeat returns a short 'already sent' line.",
+         "description": "What does X say? A symbol's body, a file's declarations with line ranges, a doc section, a handoff (h:) or a session digest (x:). Use it to read one symbol or section instead of a whole file. A repeat returns a short 'already sent' line.",
          "annotations": ro,
          "inputSchema": {"type": "object", "required": ["target"], "properties": {
             "target": {"type": "string", "description": "handle, symbol name or repo path"},
@@ -95,7 +97,7 @@ pub fn tools() -> Value {
             "fresh": {"type": "boolean", "description": "resend even if already sent this session"},
             "budget": budget, "cursor": cursor}}},
         {"name": "fox_memory",
-         "description": "Memory, agent handoffs and orchestration. brief; recall (notes, memory files, milestones, past sessions); note; post a finding/claim/request/decision; read the board (since=auto: only what is new to you); pickup or take (leased) a handoff once; packet: create one (text=goal) or render id=h:; agents: the agent tree; dispatch a codex/claude worker (text=task); wait for agents or h: (bounded, call again). Use to recall past decisions and to hand work between agents.",
+         "description": "What was decided or found before? recall searches notes, memory files, milestones and past sessions. Also: brief; note; post a finding/claim/request/decision; read the board (since=auto: only what is new to you); pickup or take (leased) a handoff; packet: create (text=goal) or render id=h:; agents: the agent tree; dispatch a codex/claude worker (text=task); wait for agents or h: (bounded, call again).",
          "inputSchema": {"type": "object", "required": ["op"], "properties": {
             "op": {"type": "string", "enum": ["brief", "recall", "note", "post", "read", "pickup", "take", "packet", "agents", "dispatch", "wait"]},
             "q": {"type": "string", "description": "recall or read filter"},

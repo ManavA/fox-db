@@ -106,7 +106,7 @@ fn mcp_tool_definitions_are_frozen() {
     assert_eq!(tools, mcp::tools().to_string());
 }
 
-const FROZEN_TOOLS_HASH: &str = "76df1de6db56f71f";
+const FROZEN_TOOLS_HASH: &str = "c1d3c01cfa006d8c";
 
 fn fnv_hex(s: &str) -> String {
     // FNV-1a 64: dependency-free and stable across platforms; collisions are irrelevant here.
@@ -352,5 +352,48 @@ fn brief_names_the_mcp_tools_even_when_cut() {
         for tool in ["fox_find", "fox_graph", "fox_read", "fox_memory"] {
             assert!(s.contains(tool), "{h:?} brief does not name {tool}:\n{s}");
         }
+    }
+}
+
+/// What the model reads before choosing a tool (server instructions, tool descriptions, the
+/// skill, the brief's tool line) leads with the question each tool answers, says to call it
+/// even when a grep looks quicker, and hands it no reason to skip foxdb.
+#[test]
+fn tool_wording_leads_with_the_question_and_offers_no_way_out() {
+    let _g = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    let (_home, repo) = setup();
+    let (c, p) = indexed(repo.path());
+    let tools = mcp::tools();
+    let desc = |n: &str| -> String {
+        tools.as_array().unwrap().iter().find(|t| t["name"] == n).unwrap()["description"].as_str().unwrap().to_string()
+    };
+    let skill = include_str!("../skill/SKILL.md");
+    let skill_desc = skill.lines().find_map(|l| l.strip_prefix("description: ")).unwrap();
+    let brief = query::brief(&c, &p, Some("main"), 400).unwrap();
+    let tool_line = brief.lines().nth(1).unwrap().to_string();
+    let mut texts = vec![("instructions", mcp::INSTRUCTIONS.to_string()), ("skill", skill.to_string()), ("brief", tool_line.clone())];
+    for n in ["fox_find", "fox_graph", "fox_read", "fox_memory"] {
+        let d = desc(n);
+        let first = d.split_inclusive(['?', '.']).next().unwrap_or("");
+        assert!(first.ends_with('?'), "{n} does not lead with its question: {d}");
+        texts.push((n, d));
+    }
+    for (what, t) in &texts {
+        let l = t.to_lowercase();
+        for bad in ["skip", "one grep", "already in context answers", "before grepping"] {
+            assert!(!l.contains(bad), "{what} says {bad:?}: {t}");
+        }
+    }
+    for (what, t) in [
+        ("instructions", mcp::INSTRUCTIONS.to_string()),
+        ("fox_find", desc("fox_find")),
+        ("fox_graph", desc("fox_graph")),
+        ("skill", skill_desc.to_string()),
+    ] {
+        assert!(t.contains("even when a grep looks quicker"), "{what}: {t}");
+    }
+    assert!(skill_desc.len() <= 1024, "skill description is {} chars", skill_desc.len());
+    for tool in ["fox_find", "fox_graph", "fox_read", "fox_memory"] {
+        assert!(tool_line.contains(tool), "{tool_line}");
     }
 }
