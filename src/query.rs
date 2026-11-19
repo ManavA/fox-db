@@ -340,7 +340,7 @@ pub fn brief(c: &Connection, p: &Project, branch: Option<&str>, budget: usize) -
         if n < 3 && !line_buf.is_empty() {
             out.line(&format!("  {line_buf}"));
         } else if n == 3 {
-            out.line("  … (fox find --kind milestone \"Current gate\")");
+            out.line("  … (fox_find q=\"Current gate\" kind=milestone)");
         }
     }
 

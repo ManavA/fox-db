@@ -106,7 +106,7 @@ fn mcp_tool_definitions_are_frozen() {
     assert_eq!(tools, mcp::tools().to_string());
 }
 
-const FROZEN_TOOLS_HASH: &str = "d41fff6761ad89c0";
+const FROZEN_TOOLS_HASH: &str = "4b5f4141e35fe470";
 
 fn fnv_hex(s: &str) -> String {
     // FNV-1a 64: dependency-free and stable across platforms; collisions are irrelevant here.
@@ -431,4 +431,34 @@ fn find_and_graph_are_always_loaded() {
     let (c, p) = indexed(repo.path());
     let brief = query::brief(&c, &p, Some("main"), 400).unwrap();
     assert_eq!(brief.lines().nth(1), Some(query::BRIEF_TOOLS_LINE));
+}
+
+/// Literal strings go to Grep (a content kind, not an effort call); past decisions to
+/// fox_memory; only tree-sitter graph rows carry code; `~` covers changed Swift files too.
+#[test]
+fn tool_wording_routes_literals_and_decisions() {
+    let tools = mcp::tools();
+    let desc = |n: &str| -> String {
+        tools.as_array().unwrap().iter().find(|t| t["name"] == n).unwrap()["description"].as_str().unwrap().to_string()
+    };
+    let skill = include_str!("../skill/SKILL.md");
+    let literal = "For a literal string, error message or config value, use Grep.";
+    for (what, t) in [("instructions", mcp::INSTRUCTIONS.to_string()), ("fox_find", desc("fox_find")), ("skill", skill.to_string())] {
+        assert!(t.contains(literal), "{what}: {t}");
+    }
+    assert!(!desc("fox_find").contains("past decision") && desc("fox_find").contains("fox_memory op=recall"), "{}", desc("fox_find"));
+    assert!(desc("fox_graph").contains("tree-sitter"), "{}", desc("fox_graph"));
+    assert!(desc("fox_find").contains("~ = not compiler-resolved (tree-sitter, or Swift changed since the build)"), "{}", desc("fox_find"));
+    assert!(!skill.contains("rg` command") && !skill.contains("Rows carry the code at each call site."), "{skill}");
+}
+
+/// A project still being indexed for the first time says so instead of answering from an
+/// empty index.
+#[test]
+fn first_index_answers_say_indexing() {
+    let p = project::Project { id: 1, name: "x".into(), root: "/nonexistent".into(), kind: "git".into(), indexed_at: None };
+    let out = mcp::while_indexing(Some(&p), "no matches for \"Foo\"\n".into());
+    assert!(out.contains("indexing this project now; use Grep and Read until it finishes"), "{out}");
+    let done = project::Project { indexed_at: Some(1), ..p };
+    assert_eq!(mcp::while_indexing(Some(&done), "no matches for \"Foo\"\n".into()), "no matches for \"Foo\"\n");
 }

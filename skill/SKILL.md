@@ -10,10 +10,12 @@ Every session starts with a `foxdb · <project> ...` brief. The index is local a
 ## The loop
 
 1. **Find.** `fox_find q=<name or words>` for where X is. A row ends in `path:line` and starts with a handle (`c:1f3`).
-2. **Trace.** `fox_graph target=<handle or name> rel=callers` for who calls X, `rel=impact` for what breaks if X changes, `rel=overrides` for subclass methods. Rows carry the code at each call site.
+2. **Trace.** `fox_graph target=<handle or name> rel=callers` for who calls X, `rel=impact` for what breaks if X changes, `rel=overrides` for subclass methods. In tree-sitter languages, callers, refs and impact rows carry the line of code.
 3. **Read.** `fox_read target=<handle>` returns that symbol's body; `fox_read target=<path>` returns the file's declarations with line ranges. Read a file whole only for lines these do not give you.
 
-Done when: every call site from `rel=callers` (or every `d1` row of `rel=impact`) is accounted for before you change a signature, and every `may be incomplete` or `partial` line is checked with the `rg` command it names.
+Done when: every call site from `rel=callers` (or every `d1` row of `rel=impact`) is accounted for before you change a signature, and every `may be incomplete` or `partial` line is checked against the unresolved mentions it lists.
+
+For a literal string, error message or config value, use Grep.
 
 For past decisions, handoffs and long logs: `fox_memory op=recall q=<words>`; `op=post` leaves a finding for other agents, `op=read since=auto` shows theirs.
 
@@ -23,7 +25,7 @@ For past decisions, handoffs and long logs: `fox_memory op=recall q=<words>`; `o
 |---|---|
 | A grep is enough | Grep misses aliased imports and package-qualified calls (`podutil.GetContainerStatus`) and returns same-name functions of other packages; `rel=callers` resolves them. |
 | I'll just Read the file | `fox_read` returns the one symbol, or the file's declarations with ranges to read next. |
-| The answer was empty, so foxdb cannot help | Try the handle from `fox_find`, or `Type.member` / `pkg.Name`; then follow the `rg` line it gives. |
+| The answer was empty, so foxdb cannot help | Try the handle from `fox_find`, or `Type.member` / `pkg.Name`; then check the unresolved mentions it lists. |
 
 ## Reference
 
@@ -38,6 +40,6 @@ For past decisions, handoffs and long logs: `fox_memory op=recall q=<words>`; `o
 
 - Handles: `s:`/`c:` symbol, `f:` file, `d:` doc, `m:` milestone, `a:` dir, `g:` memory, `x:` session, `h:` handoff.
 - Every tool takes `budget` (tokens, default 500). `+N more · cursor=K` means the answer is cut: pass `cursor=K` for the rest. `code left out to fit the budget; budget=N shows it` means call again with that budget for the code.
-- `~` = name-resolved (tree-sitter), not compiler-resolved; `guess 1 of N` marks a call resolved by name among N same-name definitions.
+- `~` = not compiler-resolved (tree-sitter, or Swift changed since the build); `guess 1 of N` marks a call resolved by name among N same-name definitions.
 - A repeated `fox_read` returns `= already sent ...`; pass `fresh=true` if that text is no longer in your context.
 - Secrets are never read or indexed. If a `fox` call errors, continue with your other tools. foxdb is read-only: edit with your editor tools.

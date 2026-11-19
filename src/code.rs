@@ -257,7 +257,7 @@ pub fn run(c: &Connection, p: &Project, sym: &str, o: &CodeOpts) -> Result<Strin
         return outline_file(c, p, rel, o);
     }
     if cands.is_empty() {
-        return Ok(format!("no symbol matches {sym:?} (try `fox find --kind symbol {sym}`)\n"));
+        return Ok(format!("no symbol matches {sym:?} (try fox_find q={sym} kind=symbol)\n"));
     }
     if std::env::var_os("FOXDB_TRACE").is_some() {
         eprintln!("resolved {:?}", t0.elapsed());

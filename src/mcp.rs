@@ -56,7 +56,8 @@ fn seen() -> &'static std::sync::Mutex<crate::spare::Seen> {
 pub const INSTRUCTIONS: &str = "foxdb answers code questions from an index of this repo. \
 Where is X: fox_find q=X. Who calls X, what breaks if X changes: fox_graph target=X rel=callers or impact. \
 X's body, or a file's declarations: fox_read target=X. A past decision or handoff: fox_memory op=recall. \
-Call them first, even when a grep looks quicker: they resolve qualified names and return the code at each site. \
+Call them first, even when a grep looks quicker: they resolve qualified names and show each call site. \
+For a literal string, error message or config value, use Grep. \
 Rows end in path:line; pass a row's handle to fox_read or fox_graph.";
 
 /// Protocol versions this server implements, newest first. `initialize` answers with the
@@ -75,7 +76,7 @@ pub fn tools() -> Value {
     let cursor = json!({"type": "integer", "description": "from a '+N more · cursor=K' footer"});
     json!([
         {"name": "fox_find", "_meta": always,
-         "description": "Where is X? Finds a function, type, field, file, doc section or past decision by name or words; ranked rows end in path:line. Use it for every where-is or which-file question, even when a grep looks quicker. Handles: s/c symbol, f file, d doc, m milestone, a dir, g memory, x session. ~ = name-resolved.",
+         "description": "Where is X? Finds a function, type, field, file or doc section by name or words; ranked rows end in path:line. Use it for every where-is or which-file question, even when a grep looks quicker. For a literal string, error message or config value, use Grep. Earlier decisions and handoffs: fox_memory op=recall. Handles: s/c symbol, f file, d doc, m milestone, a dir, g memory, x session. ~ = not compiler-resolved (tree-sitter, or Swift changed since the build).",
          "annotations": ro,
          "inputSchema": {"type": "object", "required": ["q"], "properties": {
             "q": {"type": "string", "description": "name, substring or words"},
@@ -83,7 +84,7 @@ pub fn tools() -> Value {
             "project": {"type": "string", "description": "project name or 'all'"},
             "budget": budget, "cursor": cursor}}},
         {"name": "fox_graph", "_meta": always,
-         "description": "Who calls X, and what breaks if X changes? Callers, callees, refs, overrides, conformers or impact of a symbol, with the code at each site. Use it before changing, renaming or deleting a function, field or type, even when a grep looks quicker: it follows qualified and aliased names. target: handle, name, Type.member or pkg.Name; impact without target = git diff.",
+         "description": "Who calls X, and what breaks if X changes? Callers, callees, refs, overrides, conformers or impact of a symbol; in tree-sitter languages callers, refs and impact rows carry the line of code. Use it before changing, renaming or deleting a function, field or type, even when a grep looks quicker: it follows qualified and aliased names. target: handle, name, Type.member or pkg.Name; impact without target = git diff.",
          "annotations": ro,
          "inputSchema": {"type": "object", "properties": {
             "target": {"type": "string"},
@@ -196,6 +197,16 @@ fn parse_range(s: &str) -> Option<(usize, usize)> {
     Some((a.trim().parse().ok()?, b.trim().parse().ok()?))
 }
 
+/// An empty answer from a project whose first index is still running says so: the index is
+/// filling in the background, so grep is the tool until it finishes.
+pub fn while_indexing(p: Option<&project::Project>, out: String) -> String {
+    let empty = out.starts_with("no matches for ") || out.starts_with("no symbol matches ");
+    if empty && p.is_some_and(|p| p.indexed_at.is_none()) {
+        return format!("foxdb is indexing this project now; use Grep and Read until it finishes ({})\n", out.trim_end());
+    }
+    out
+}
+
 pub fn call_tool(name: &str, a: &Value) -> Result<String> {
     let budget = arg_n(a, "budget").unwrap_or(DEFAULT_BUDGET);
     let cursor = arg_n(a, "cursor").unwrap_or(0);
@@ -215,14 +226,14 @@ pub fn call_tool(name: &str, a: &Value) -> Result<String> {
             let all = arg_s(a, "project") == Some("all") || cur.is_none();
             let o = query::FindOpts { kind: arg_s(a, "kind").unwrap_or("any"), all, budget, limit: FIND_ROWS, offset: cursor };
             let mut w = warm().lock().unwrap_or_else(|e| e.into_inner());
-            crate::search::find_warm(&mut w, &c, cur.as_ref(), q, &o)
+            Ok(while_indexing(cur.as_ref(), crate::search::find_warm(&mut w, &c, cur.as_ref(), q, &o)?))
         }
         "fox_graph" => {
             let Some(c) = ro else { bail!("no store yet; run `fox index`") };
             let Some(p) = current_project(Some(&c)) else { bail!("not in a project") };
             let rel = arg_s(a, "rel").unwrap_or("callers");
             let o = code::CodeOpts { rel, depth: arg_n(a, "depth").unwrap_or(2), budget, cursor, fallback: false };
-            code::run(&c, &p, arg_s(a, "target").unwrap_or(""), &o)
+            Ok(while_indexing(Some(&p), code::run(&c, &p, arg_s(a, "target").unwrap_or(""), &o)?))
         }
         "fox_read" => {
             let t = arg_s(a, "target").unwrap_or("").to_string();

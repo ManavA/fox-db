@@ -195,7 +195,7 @@ top: code callers ~15k/5, code outline ~11k/3, code callees ~6397/1, code impact
 | `fox_memory` | `op` (brief/recall/note/post/read/pickup/take/packet/agents/dispatch/wait), `q?`, `text?`, `kind?`, `topic?`, `since?`, `evidence?`, `next?`, `id?`, `harness?`, `writer?`, `reviewer?`, `any?`, `timeout?`, `budget?` | Session brief, recall, notes, the handoff board, packets, the agent tree, dispatch and bounded wait (see [multi-agent.md](multi-agent.md)) |
 
 Each description says when to use the tool, and `initialize` returns a short server
-instructions string (five short sentences: one question and tool per line, then "call them first, even when a grep looks quicker"). The definitions plus instructions are about 1,100 tokens,
+instructions string (six short sentences: one question and tool per line, "call them first, even when a grep looks quicker", and "for a literal string, error message or config value, use Grep"). The definitions plus instructions are about 1,100 tokens,
 and a test hashes them: they sit in every request's cached prefix, so they change only on purpose.
 Milestone 2 grew them by about 190 tokens (the multi-agent `fox_memory` ops and arguments) and
 milestone 3 by about 65 (the `readOnlyHint` annotations and the `any` and `reviewer` arguments);

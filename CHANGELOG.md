@@ -37,7 +37,13 @@ First answers that were empty, wrong or padded in agent benchmark transcripts ar
 - The server instructions, the four tool descriptions, the skill and the brief's tool line lead
   with the question each tool answers ("Where is X?", "Who calls X, and what breaks if X
   changes?"), say to call foxdb first even when a grep looks quicker, and no longer say to skip
-  it when one grep answers. The skill is a find, trace, read loop with a completion check.
+  it when one grep answers. The skill is a find, trace, read loop with a completion check. A
+  literal string, error message or config value goes to Grep (a kind of content, not a call on
+  effort); past decisions go to `fox_memory op=recall`, not `fox_find`. The descriptions say
+  that only tree-sitter graph rows carry code and that `~` also marks a Swift file changed since
+  the build. Empty-answer hints give the MCP call, not the CLI.
+- An empty answer while a project's first index is still running says that foxdb is indexing
+  it and to use Grep and Read until it finishes, instead of `no matches`.
 - `fox_find` and `fox_graph` carry `_meta: {"anthropic/alwaysLoad": true}`, so Claude Code loads
   them up front instead of deferring them behind tool search. `context-budget.json` now also pins
   the brief's tool line, the bytes every session pays before its first call (instructions, tool
