@@ -28,6 +28,11 @@ const CLAUDE_MD: &str = "# Notes
 - codesign fails with `errSecInternalComponent`; deploy with `--set-env-vars`.
 - There is no `src/old_parser.rs` any more; `Widget.render` replaced `paint_all`.
 - Search lives in `src/search.Searcher`; ship `com.example.app`; see `setup.py`.
+- Codesign of `src/lib.rs` fails with `errSecInternalComponent` on the build host.
+- TODO: wire `planned_helper` in `src/lib.rs`.
+- Pick a name such as `example_fn` in `src/lib.rs`.
+- Called `mistaken_fn` in `src/lib.rs` by mistake.
+- `filtered_rows` (src/lib.rs) builds the list; `src/lib.rs`: `prefixed_fn` too.
 
 ```sh
 ghost_fn --phantom
@@ -65,7 +70,7 @@ fn setup() -> Fx {
     let p = project::find(&c, &project::locate(repo.path())).unwrap().unwrap();
     let claude_note = claude.join(memcheck::claude_dir_name(&p.root)).join("memory/helpers.md");
     write(claude_note.parent().unwrap(), "helpers.md", "---\nname: helpers\n---\n`old_helper_fn` lives in `src/lib.rs`.\n");
-    mcp::save_note(&c, p.id, "Decided: `stale_note_fn` replaces `live_function`.").unwrap();
+    mcp::save_note(&c, p.id, "Decided: `stale_note_fn` in `src/lib.rs` replaces `live_function`.").unwrap();
     Fx { _home: home, repo, c, p, claude_note }
 }
 
@@ -112,10 +117,15 @@ fn flags_only_code_shaped_tokens_that_resolve_to_nothing() {
         "Searcher",
         "com.example",
         "setup.py",
+        "planned_helper",
+        "example_fn",
+        "mistaken_fn",
     ] {
         assert!(rows.iter().all(|r| !r.split(" | ").nth(2).unwrap_or("").contains(quiet)), "{quiet} flagged:\n{out}");
     }
-    assert_eq!(rows.len(), 6, "{out}");
+    // Attribution after a name in parentheses, and before it with a colon.
+    assert!(row("`filtered_rows`").contains("`filtered_rows` (not in the code), `prefixed_fn` (not in the code)"), "{out}");
+    assert_eq!(rows.len(), 7, "{out}");
     // Memory files are read, never written.
     assert_eq!(before, (fs::read(fx.repo.path().join("CLAUDE.md")).unwrap(), fs::read(&fx.claude_note).unwrap()));
 }
@@ -130,7 +140,7 @@ fn the_brief_names_the_count_only_when_something_is_stale() {
     assert_eq!(line(&fx.c, &fx.p), None, "nothing recorded yet");
     memcheck::record(&fx.c, &fx.p).unwrap();
     let l = line(&fx.c, &fx.p).expect("stale count in the brief");
-    assert_eq!(l, "stale memory: 6 lines cite code that is gone (fox mem check)");
+    assert_eq!(l, "stale memory: 7 lines cite code that is gone (fox mem check)");
     let a = query::brief(&fx.c, &fx.p, Some("main"), 400).unwrap();
     memcheck::record(&fx.c, &fx.p).unwrap();
     assert_eq!(a, query::brief(&fx.c, &fx.p, Some("main"), 400).unwrap(), "a second check changes no byte");
@@ -159,7 +169,7 @@ fn mcp_and_cli_run_the_same_check() {
     let text = r["result"]["content"][0]["text"].as_str().unwrap().to_string();
     let a = foxdb::cli::parse(vec!["mem".into(), "check".into()]).unwrap();
     assert_eq!(text, foxdb::cli::mem_check(&a, fx.repo.path()).unwrap());
-    assert_eq!(flagged(&text).len(), 6, "{text}");
+    assert_eq!(flagged(&text).len(), 7, "{text}");
 }
 
 /// A capped answer (MCP `budget`) never drops rows silently: a last line counts them and says how

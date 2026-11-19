@@ -9,12 +9,14 @@
 //! names one of the project's own commands, and paths with a `/` and a known extension. A token
 //! is flagged only when it resolves to nothing: no symbol of that name, no whole-word occurrence
 //! in the project's code and config files (Markdown and changelogs excluded, so docs that repeat
-//! a stale name do not hide it), no such file. Tokens that cannot be judged stay quiet: a lone
-//! name on a line with nothing else that resolves (more often an OS error code or an API field
-//! than this project's), a qualified name whose head is not an indexed symbol (another library,
-//! a bundle id), a path whose first directory is not in the project, bare file names, all-caps
-//! names without the project's prefix, lines that record an absence ("removed", "no `x`") and
-//! anything in fenced blocks.
+//! a stale name do not hide it), no such file. Each name must be anchored to this project on its
+//! own: a lone name by the project path the line attributes it to (`name` in `path`, `name`
+//! (path), `path`: `name`), a qualified name by an indexed symbol at its head. Tokens that
+//! cannot be judged stay quiet: unanchored names (an OS error code, an API field, a bundle id),
+//! paths whose first directory is not in the project, bare file names, all-caps names without the
+//! project's prefix, fenced blocks, and lines that are not claims about the code as it is:
+//! records of an absence ("removed", "no `x`"), planned work ("TODO", "will", "should") and
+//! hypotheticals or mistakes ("e.g.", "such as", "by mistake").
 
 use anyhow::Result;
 use rusqlite::{Connection, OptionalExtension, params};
@@ -57,7 +59,8 @@ struct Source {
 enum Cite {
     Path(String),
     Flag(String),
-    Ident(String),
+    /// A name, and the path the line attributes it to (`name` in `path`, `name` (path)).
+    Ident(String, Option<String>),
 }
 
 /// Claude Code's directory name for a project root: every non-alphanumeric character becomes `-`.
@@ -223,16 +226,19 @@ fn classify(span: &str, bins: &HashSet<String>, caps_prefix: &str, own_cmd: bool
     if path_like(p) {
         out.push(Cite::Path(p.trim_start_matches("./").to_string()));
     } else if !s.contains('/') && crate::docref::is_ident(s) && code_shaped(s, caps_prefix) {
-        out.push(Cite::Ident(s.to_string()));
+        out.push(Cite::Ident(s.to_string(), None));
     }
 }
 
 const PATH_EXTS: &[&str] = &["md", "json", "toml", "yaml", "yml", "sh", "txt", "lock", "cfg", "ini", "xml", "gradle", "plist"];
 
-/// Words that say a line records an absence or a change: its cites are history, not claims.
-fn records_absence(line: &str) -> bool {
+/// Lines whose cites are not claims about the code as it is: records of an absence or a change
+/// ("removed", "no `x`"), planned work ("TODO", "will", "should add") and hypotheticals or
+/// mistakes ("e.g.", "such as", "by mistake").
+fn not_a_claim(line: &str) -> bool {
     let l = line.to_ascii_lowercase();
     const WORDS: &[&str] = &[
+        // An absence or a change.
         "removed",
         "deleted",
         "dropped",
@@ -247,6 +253,34 @@ fn records_absence(line: &str) -> bool {
         "used to",
         "formerly",
         "previously",
+        // Planned work.
+        "todo",
+        "to do",
+        "planned",
+        "plan",
+        "will",
+        "add",
+        "should",
+        "proposal",
+        "proposed",
+        "asked for",
+        "want",
+        "could",
+        "would",
+        "idea",
+        "consider",
+        "maybe",
+        "might",
+        // Hypotheticals and mistakes.
+        "e.g.",
+        "such as",
+        "for example",
+        "for instance",
+        "by mistake",
+        "mistakenly",
+        "hypothetical",
+        "imagine",
+        "suppose",
     ];
     // Whole words in the prose, not inside a cited name (`removed_function`, `gone.rs`).
     let prose: String = l.split('`').step_by(2).collect::<Vec<_>>().join(" ` ");
@@ -266,7 +300,37 @@ fn records_absence(line: &str) -> bool {
     WORDS.iter().any(|w| in_prose(w)) || ["no `", "not `", "without `", "never `"].iter().any(|w| l.contains(w))
 }
 
-/// Code-shaped citations per line, outside fenced blocks and lines that record an absence.
+/// Connectives that attribute a name to the path after it: `name` in `path`, `name` (path).
+const AFTER: &[&str] = &["lives in", "is in", "defined in", "declared in", "inside", "under", "from", "in", "at", "of"];
+
+/// The path a name is attributed to by the text that follows it (`after`, then the next
+/// backticked span, if any).
+fn attributed_after(after: &str, next_span: Option<&str>) -> Option<String> {
+    let mut t = after.trim_start();
+    let lower = t.to_ascii_lowercase();
+    if let Some(w) = AFTER.iter().find(|w| lower.starts_with(*w) && !lower[w.len()..].starts_with(char::is_alphanumeric)) {
+        t = t[w.len()..].trim_start();
+    }
+    let t = t.trim_start_matches('(').trim_start();
+    let cand = if t.is_empty() {
+        next_span?.trim()
+    } else {
+        t.split(|c: char| c.is_whitespace() || c == ')' || c == ',' || c == ';').next()?.trim_end_matches(['.', ':'])
+    };
+    let p = strip_anchor(cand);
+    path_like(p).then(|| p.trim_start_matches("./").to_string())
+}
+
+/// The path a name is attributed to by the text before it: `path`: `name`, `path`'s `name`.
+fn attributed_before(before: &str, prev_span: Option<&str>) -> Option<String> {
+    let t = before.trim_end();
+    let t = t.strip_suffix(':').or_else(|| t.strip_suffix("'s")).or_else(|| t.strip_suffix('#'))?.trim_end();
+    let cand = if t.is_empty() { prev_span?.trim() } else { t.rsplit(char::is_whitespace).next()? };
+    let p = strip_anchor(cand);
+    path_like(p).then(|| p.trim_start_matches("./").to_string())
+}
+
+/// Code-shaped citations per line, outside fenced blocks and lines that are not claims.
 fn cites(text: &str, bins: &HashSet<String>, caps_prefix: &str) -> Vec<(usize, String, Vec<Cite>)> {
     let bare = regex::Regex::new(r"(?:^|[\s(\[<])(/?[A-Za-z0-9_@+.\-]+(?:/[A-Za-z0-9_@+.\-]+)+)").unwrap();
     let mut out = vec![];
@@ -277,7 +341,7 @@ fn cites(text: &str, bins: &HashSet<String>, caps_prefix: &str) -> Vec<(usize, S
             fence = !fence;
             continue;
         }
-        if fence || records_absence(l) {
+        if fence || not_a_claim(l) {
             continue;
         }
         let own_cmd = l.split(|c: char| !(c.is_alphanumeric() || c == '-' || c == '_')).any(|w| bins.contains(w));
@@ -286,7 +350,16 @@ fn cites(text: &str, bins: &HashSet<String>, caps_prefix: &str) -> Vec<(usize, S
         let mut prose = String::new();
         for (k, part) in parts.iter().enumerate() {
             if k % 2 == 1 && k + 1 < parts.len() {
+                let from = v.len();
                 classify(part, bins, caps_prefix, own_cmd, &mut v);
+                if let Some(Cite::Ident(name, near)) = v.get_mut(from)
+                    && segments(name).len() == 1
+                {
+                    let span = |i: usize| (i % 2 == 1 && i + 1 < parts.len()).then(|| parts[i]);
+                    *near = attributed_after(parts[k + 1], span(k + 2))
+                        .or_else(|| k.checked_sub(2).and_then(|p| attributed_before(parts[k - 1], span(p))))
+                        .or_else(|| (k == 1).then(|| attributed_before(parts[0], None)).flatten());
+                }
                 prose.push(' ');
             } else {
                 prose.push_str(part);
@@ -446,7 +519,7 @@ pub fn check(c: &Connection, p: &crate::project::Project) -> Result<Report> {
     let mut needles = HashSet::new();
     for c in per.iter().flatten().flat_map(|x| &x.2) {
         match c {
-            Cite::Ident(s) => {
+            Cite::Ident(s, _) => {
                 for seg in segments(s) {
                     let sym = *words.entry(seg.clone()).or_insert_with(|| pr.symbol(&seg));
                     if !sym {
@@ -465,21 +538,10 @@ pub fn check(c: &Connection, p: &crate::project::Project) -> Result<Report> {
     let (found, partial) = scan(&pr, &needles, &skip);
     // Unreached by a capped scan: unknown, so treated as present.
     let known = |w: &str| words.get(w).copied().unwrap_or(false) || found.contains(w) || (partial && needles.contains(w));
-    // A line is about this project when one of its cites resolves: an existing project path or
-    // an indexed symbol. A lone unknown name on a line with no such anchor is more likely another
-    // system's (an OS error code, an API field) than this project's, so it is not judged.
-    let anchored = |s: &Source, cs: &[Cite]| {
-        cs.iter().any(|c| match c {
-            Cite::Path(raw) => pr.path(raw, s.base.as_deref()) == Some(true),
-            Cite::Ident(id) => segments(id).first().is_some_and(|g| words.get(g).copied().unwrap_or(false)),
-            Cite::Flag(_) => false,
-        })
-    };
     let mut stale = vec![];
     for (s, lines) in srcs.iter().zip(per) {
         for (line, text, cs) in lines {
             let mut missing = vec![];
-            let anchor = anchored(s, &cs);
             for c in cs {
                 match c {
                     Cite::Path(raw) => {
@@ -493,12 +555,16 @@ pub fn check(c: &Connection, p: &crate::project::Project) -> Result<Report> {
                             missing.push(format!("`--{f}` (no such flag)"));
                         }
                     }
-                    Cite::Ident(id) => {
+                    Cite::Ident(id, near) => {
                         let segs = segments(&id);
-                        // A qualified name is judged only when its head is an indexed symbol.
+                        // Each name is judged only when it is anchored to this project itself: a
+                        // qualified name by an indexed symbol at its head, a lone name by the
+                        // project path the line attributes it to. Anything else is more likely
+                        // another system's (an OS error code, an API field) than this project's.
                         let head_sym = words.get(&segs[0]).copied().unwrap_or(false);
                         if segs.len() == 1 {
-                            if anchor && !known(&segs[0]) {
+                            let anchored = near.as_deref().is_some_and(|n| pr.path(n, s.base.as_deref()).is_some());
+                            if anchored && !known(&segs[0]) {
                                 missing.push(format!("`{id}` (not in the code)"));
                             }
                         } else if head_sym {
@@ -516,9 +582,10 @@ pub fn check(c: &Connection, p: &crate::project::Project) -> Result<Report> {
             }
         }
     }
-    let memory_dir = stale.iter().any(|x| x.source.starts_with("memory/")).then(|| {
-        display_path(&crate::inventory::claude_projects_root().join(claude_dir_name(&p.root)).join("memory"))
-    });
+    let memory_dir = stale
+        .iter()
+        .any(|x| x.source.starts_with("memory/"))
+        .then(|| display_path(&crate::inventory::claude_projects_root().join(claude_dir_name(&p.root)).join("memory")));
     Ok(Report { sources: srcs.len(), stale, partial, memory_dir })
 }
 

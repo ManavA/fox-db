@@ -343,18 +343,20 @@ To find or trace code, run `~/.foxdb/bin/fox` first, even when a grep looks quic
   `--flags` on a line that names one of the project's own commands, and paths with a `/` and a
   known extension, and flags one only when it resolves to nothing: no symbol of that name, no
   whole-word occurrence in the project's code and config files (Markdown and changelogs are not
-  searched), no such file. A lone name is judged only on a line where something else resolves
-  (a project path or symbol), and a qualified name only when its head is a project symbol, so
-  OS error codes, API fields, other tools' flags and bundle ids stay quiet; so do paths outside
-  the project, bare file names, lines that record an absence ("removed", "no `x`") and fenced
-  blocks. Each index run records the count; while it is above zero the session brief carries
+  searched), no such file. Each name must be anchored to the project on its own: a lone name by
+  the project path the line attributes it to (`name` in `path`, `name` (path), `path`: `name`),
+  a qualified name by a project symbol at its head. So OS error codes, API fields, other tools'
+  flags and bundle ids stay quiet; so do paths outside the project, bare file names, lines that
+  are not claims about the code as it is (records of an absence such as "removed" or "no `x`",
+  planned work such as "TODO", "will" or "should", hypotheticals such as "e.g." or "by
+  mistake") and fenced blocks. Each index run records the count; while it is above zero the session brief carries
   one line, `stale memory: N lines cite code that is gone (fox mem check)`, and otherwise nothing.
 
 ```
 $ fox mem check
 2 memory lines cite code that is gone (4 sources checked):
 memory/ = ~/.claude/projects/-src-my-app/memory
-CLAUDE.md:12 | Call `load_legacy()` before `Store.open`. | `load_legacy()` (not in the code)
+CLAUDE.md:12 | Call `load_legacy()` in `src/store.rs` first. | `load_legacy()` (not in the code)
 memory/cli.md:5 | Preview with `my-app sync --dry-run`. | `--dry-run` (no such flag)
 ```
 
