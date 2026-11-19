@@ -22,7 +22,7 @@ replace. `scripts/docs-test.sh` runs these same blocks in a scratch home, so the
 ## 1. Prerequisites
 
 ```sh runnable
-uname -sm                                   # Linux x86_64 gets a prebuilt binary; anything else builds from source
+uname -sm                                   # a prebuilt binary if the release has one for this machine, else a source build
 git --version
 command -v curl >/dev/null || command -v wget >/dev/null && echo "download: ok" || echo "no curl or wget (source build)"
 command -v cargo >/dev/null && cargo --version || echo "cargo: missing (needed only for a source build)"
@@ -30,10 +30,10 @@ for h in claude codex opencode jq; do command -v "$h" >/dev/null && echo "found 
 [ -z "${FOXDB_HOME:-}" ] || [ "$FOXDB_HOME" = "$HOME/.foxdb" ] || echo "FOXDB_HOME=$FOXDB_HOME is not ~/.foxdb: read the note below before going on"
 ```
 
-The repository is public; no GitHub login is needed. You need either curl or wget on Linux
-x86_64 (for the prebuilt release asset) or `cargo` 1.88 or newer for a source build (install
-from https://rustup.rs if missing, after asking). `jq` is needed only for the Claude Code hooks
-step. Note which harnesses were found: you will set up only those.
+The repository is public; no GitHub login is needed. You need either curl or wget (for a
+prebuilt release asset, where the release has one for this machine) or `cargo` 1.88 or newer for
+a source build (install from https://rustup.rs if missing, after asking). `jq` is needed only
+for the Claude Code hooks step. Note which harnesses were found: you will set up only those.
 
 This guide uses the default data directory `~/.foxdb`. If `FOXDB_HOME` is set to anything else,
 ask the user to unset it for foxdb (simplest). Otherwise replace `~/.foxdb` and `$HOME/.foxdb`
@@ -44,7 +44,7 @@ with that directory in every command and snippet below, and make sure each harne
 
 If the user named a local checkout (for example "set up foxdb from ~/foxdb"), `cd` into it and
 run `scripts/install.sh --source` instead of the block below, so that checkout is what gets built
-(without `--source` the installer prefers the v0.2.2 release asset on Linux x86_64).
+(without `--source` the installer prefers the v0.2.2 release asset where there is one).
 Otherwise clone the repository and run the installer from inside the clone:
 
 ```sh
@@ -57,14 +57,15 @@ export PATH="$HOME/.foxdb/bin:$PATH"
 fox --version
 ```
 
-On Linux x86_64 `scripts/install.sh` downloads the v0.2.2 release tarball and its `.sha256` from
-the GitHub release with curl or wget (no login) and checks the checksum; otherwise it builds `fox`
-and `foxd` from source with cargo (cloning tag v0.2.2 when run outside a checkout).
+`scripts/install.sh` picks the release asset for this machine (`uname`: Linux or macOS, x86_64 or
+arm64; v0.2.2 has only Linux x86_64, later releases have all four), downloads it and its `.sha256`
+from the GitHub release with curl or wget (no login) and checks the checksum; without an asset it
+builds `fox` and `foxd` from source with cargo (cloning tag v0.2.2 when run outside a checkout).
 `FOXDB_RELEASE_URL` overrides where the asset is downloaded from.
 It copies them to `~/.foxdb/bin` (or `$FOXDB_HOME/bin`) and the skill to `~/.foxdb/skill/`, and
 touches nothing else. `--source` forces a source build; `--tarball FILE` installs a tarball you
-already downloaded. The prebuilt binary needs glibc 2.39 or newer; on an older system the
-installer falls back to a source build. Expected last line: `fox 0.2.2`.
+already downloaded. The prebuilt Linux binary needs glibc 2.35 or newer (2.39 for v0.2.2); on an
+older system the installer falls back to a source build. Expected last line: `fox 0.2.2`.
 
 A source build takes several minutes (over 5 on a busy machine). If your tool calls have a time
 limit, run `scripts/install.sh` in the background with its output going to a log file, and poll
@@ -112,7 +113,27 @@ background and poll.
 
 ## 5. MCP registration
 
-The server is `<home>/.foxdb/bin/fox mcp` over stdio. Use the absolute path; the commands
+### Plugin (Claude Code and Codex)
+
+For Claude Code and Codex, the foxdb plugin in this repository does steps 5 to 7 in one go,
+without editing any settings file: it brings the MCP server, the four hooks of step 6 and the
+skill of step 7, and in Claude Code it also puts `fox` on the agent's PATH. It runs the `fox`
+installed in step 2 (`~/.foxdb/bin/fox`, or `$FOXDB_HOME/bin/fox`); without one, the tools fail and
+the session-start hook says how to install it. Ask the user whether they want the plugin or the
+manual steps; for each harness use one or the other, never both, or every tool and hook runs twice.
+
+```sh
+claude plugin marketplace add ManavA/foxdb && claude plugin install foxdb@foxdb
+codex plugin marketplace add ManavA/foxdb && codex plugin add foxdb@foxdb
+```
+
+In Claude Code the tools are named `mcp__plugin_foxdb_foxdb__fox_find` and so on, and the skill
+`foxdb:foxdb`. Codex asks the user to review the plugin's hooks in `/hooks` before they run.
+If you used the plugin for a harness, skip that harness in steps 5 to 7 and go on to step 8. To
+remove it: `claude plugin uninstall foxdb@foxdb` and `claude plugin marketplace remove foxdb`, or
+`codex plugin remove foxdb@foxdb` and `codex plugin marketplace remove foxdb`.
+
+Without the plugin: the server is `<home>/.foxdb/bin/fox mcp` over stdio. Use the absolute path; the commands
 below fill it in from `$HOME`.
 
 ### Claude Code
@@ -234,10 +255,11 @@ The uninstall step below removes these too (their commands contain `.foxdb/bin/f
 ### Codex hooks
 
 Codex hooks take the same commands with `--harness codex` (output capped at about 2,200 tokens).
-The file shape below mirrors Claude's and is not verified against Codex; Codex asks the user to
-trust each hook, and `/hooks` in Codex shows whether they loaded. Write it to
-`~/.codex/hooks.json` only if that file does not exist yet; otherwise show it to the user. Replace
-`/path/to/home` with the user's home (absolute paths, so the hooks work whatever `PATH` Codex sees):
+Codex reads `~/.codex/hooks.json` (`$CODEX_HOME/hooks.json`) in the same shape as Claude Code's
+hooks; hooks are on by default, and Codex skips each new or changed hook until the user has
+reviewed and trusted it in `/hooks`. Write the file only if it does not exist yet; otherwise show
+it to the user. Replace `/path/to/home` with the user's home (absolute paths, so the hooks work
+whatever `PATH` Codex sees):
 
 ```json
 {"hooks": {

@@ -1,0 +1,51 @@
+# The release gate on every push to main and every pull request: build, test, clippy, fmt and
+# the docs test, on Linux and macOS. Actions are pinned to commit SHAs (the tag is in the comment).
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  # A new push to a pull request supersedes its running check; runs on main always finish.
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
+jobs:
+  gate:
+    name: gate (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Rust toolchain
+        run: |
+          rustup toolchain install stable --profile minimal --component clippy,rustfmt
+          rustup default stable
+          rustc --version
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+      - name: cargo build --release
+        run: cargo build --release --locked
+      - name: cargo test --release
+        run: cargo test --release --locked
+      - name: cargo clippy
+        run: cargo clippy --release --locked --all-targets -- -D warnings
+      - name: cargo fmt --check
+        run: cargo fmt --check
+      - name: docs test
+        run: bash scripts/docs-test.sh

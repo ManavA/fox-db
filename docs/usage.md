@@ -480,6 +480,8 @@ answers are already ranked and budgeted (headroom's default exclusions do not co
 export HEADROOM_EXCLUDE_TOOLS='mcp__foxdb__*'   # add it to any list you already set
 ```
 
+With the Claude Code plugin the tools are named `mcp__plugin_foxdb_foxdb__*`; exclude that pattern instead.
+
 foxdb output never contains headroom's markers (`hash=`, "compressed", `<<ccr:`, "same as msg");
 a test checks the tool list, instructions, briefs, answers and the report schema.
 

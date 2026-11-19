@@ -3,7 +3,8 @@
 # AGENTS-SETUP.md, in order, as one bash script per file (set -euo pipefail), each in its own
 # scratch HOME with FOXDB_HOME=$HOME/.foxdb and a small fixture project at ~/src/my-app.
 # A block tagged "needs=<cmd>" is skipped (and reported) when <cmd> is not installed.
-# Then, when dist/ holds the release tarball, it installs that with scripts/install.sh --tarball
+# scripts/install-test.sh checks that install.sh picks and verifies each platform's asset.
+# Then, when dist/ holds this machine's release tarball, it installs that with scripts/install.sh --tarball
 # and through the download path (curl against a file:// URL). Nothing here uses the network: the
 # doc runs point FOXDB_RELEASE_URL at a missing file:// directory, so they build from source.
 #
@@ -26,7 +27,7 @@ rustup_home=${RUSTUP_HOME:-$real_home/.rustup}
 
 # Fingerprints of the user's harness settings, checked again at the end.
 watched=("$real_home/.claude/settings.json" "$real_home/.codex/config.toml" "$real_home/.codex/hooks.json")
-fingerprint() { for f in "${watched[@]}"; do [ -f "$f" ] && sha256sum "$f" || echo "absent $f"; done; }
+fingerprint() { for f in "${watched[@]}"; do [ -f "$f" ] && cksum "$f" || echo "absent $f"; done; }
 before=$(fingerprint)
 
 cleanup() {
@@ -106,6 +107,7 @@ expect() {
 }
 
 status=0
+bash "$repo/scripts/install-test.sh" || status=1
 run_doc readme README.md || status=1
 if [ $status = 0 ]; then
     expect readme "fox $version" && expect readme "function load_config  app.py:4" \
@@ -123,8 +125,34 @@ if [ $status = 0 ]; then
     [ ! -e "$scratch/agents/home/.foxdb" ] || { echo "FAIL AGENTS-SETUP.md: uninstall left ~/.foxdb"; status=1; }
 fi
 
-# The release tarball, when one has been built.
-tarball=$repo/dist/foxdb-$version-x86_64-unknown-linux-gnu.tar.gz
+# The plugin: each installed harness accepts it from this checkout (offline, in a scratch home).
+if command -v claude >/dev/null 2>&1; then
+    home=$scratch/plugin-claude/home
+    mkdir -p "$home"
+    if out=$(cd "$repo" && env -i HOME="$home" PATH="$clean_path" claude plugin validate plugin 2>&1 \
+        && env -i HOME="$home" PATH="$clean_path" claude plugin validate . 2>&1) \
+        && [ "$(printf '%s' "$out" | grep -c 'Validation passed')" = 2 ]; then
+        echo "PASS claude plugin validate (plugin and marketplace)"
+    else
+        echo "FAIL claude plugin validate: $out"
+        status=1
+    fi
+fi
+if command -v codex >/dev/null 2>&1; then
+    home=$scratch/plugin-codex/home
+    mkdir -p "$home/.codex"
+    cx() { env -i HOME="$home" CODEX_HOME="$home/.codex" PATH="$clean_path" codex "$@" 2>&1; }
+    if out=$(cx plugin marketplace add "$repo" && cx plugin add foxdb@foxdb && cx mcp get foxdb --json) \
+        && printf '%s' "$out" | tr -d ' \n' | grep -q '"env_vars":\["FOXDB_AGENT","FOXDB_PARENT","FOXDB_HOME","FOXDB_SESSION"\]'; then
+        echo "PASS codex plugin add foxdb@foxdb"
+    else
+        echo "FAIL codex plugin: $out"
+        status=1
+    fi
+fi
+
+# This machine's release tarball, when scripts/dist.sh has built one.
+tarball=$repo/dist/foxdb-$version-$(rustc -vV | sed -n 's/^host: //p').tar.gz
 if [ -f "$tarball" ]; then
     home=$scratch/tarball/home
     mkdir -p "$home"

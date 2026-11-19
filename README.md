@@ -24,6 +24,24 @@ The agent checks prerequisites, installs `fox` and `foxd` into `~/.foxdb/bin` (n
 your projects, registers the MCP server and skill for each harness it finds, backs up every
 settings file first, verifies the result and tells you how to undo it. No GitHub login is needed.
 
+## Install as a plugin (Claude Code or Codex)
+
+Install `fox` and `foxd` into `~/.foxdb/bin` (no root; a prebuilt binary where the release has
+one for your machine, else a source build with cargo), then add the plugin. It brings the four
+MCP tools, the session and subagent hooks and the skill; in Claude Code it also puts `fox` on the
+agent's PATH. Your settings files are not edited.
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/ManavA/foxdb/main/scripts/install.sh | sh
+claude plugin marketplace add ManavA/foxdb && claude plugin install foxdb@foxdb   # Claude Code
+codex plugin marketplace add ManavA/foxdb && codex plugin add foxdb@foxdb         # Codex
+```
+
+Index a project with `~/.foxdb/bin/fox index .` (step 2 below), start a new session there and
+ask the agent to "use fox_find to find <a function>". Codex asks you to review the plugin's hooks
+(`/hooks`) before they run. Use either the plugin or the manual setup for a harness, not both, or
+the tools and hooks run twice.
+
 ## What it can do
 
 - **Search**: ranked search over symbols, files, doc sections, milestones and memory in milliseconds; plain questions also search doc comments and function bodies.
@@ -35,9 +53,12 @@ settings file first, verifies the result and tells you how to undo it. No GitHub
 
 ## Manual install (5 minutes)
 
-You need Linux or macOS and git. On Linux x86_64 the installer downloads the prebuilt binary
-with curl (or wget); elsewhere you need a Rust toolchain (`cargo`) to build from source, which
-takes several minutes. No GitHub login is needed.
+You need Linux or macOS and git. Where the release has a prebuilt binary for your machine (v0.2.2:
+Linux x86_64; later releases: Linux and macOS, x86_64 and arm64), the installer downloads it with
+curl (or wget) and checks its sha256; elsewhere you need a Rust toolchain (`cargo`) to build from
+source, which takes several minutes. No GitHub login is needed. Release tarballs after v0.2.2
+also carry a GitHub build provenance attestation; to check a downloaded one, run
+`gh attestation verify foxdb-<version>-<target>.tar.gz --repo ManavA/foxdb`.
 
 1. Get the code and install `fox` and `foxd` into `~/.foxdb/bin` (no root):
 

@@ -1,0 +1,117 @@
+# On a version tag (v0.2.3), build the release tarballs with scripts/dist.sh for Linux and macOS
+# on x86_64 and arm64, check each one runs where it can, and attach them with their .sha256 files
+# to a draft GitHub release. Publishing the draft stays a manual step.
+# Actions are pinned to commit SHAs (the tag is in the comment); no build cache, so a release is
+# built from the tagged source alone.
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build:
+    name: build (${{ matrix.target }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # Ubuntu 22.04 (glibc 2.35) so the Linux binaries also run on older distributions.
+          - target: x86_64-unknown-linux-gnu
+            os: ubuntu-22.04
+            runs: true
+          - target: aarch64-unknown-linux-gnu
+            os: ubuntu-22.04-arm
+            runs: true
+          - target: aarch64-apple-darwin
+            os: macos-latest
+            runs: true
+          # Cross-compiled on Apple silicon; it cannot be run there.
+          - target: x86_64-apple-darwin
+            os: macos-latest
+            runs: false
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 60
+    env:
+      TARGET: ${{ matrix.target }}
+      MACOSX_DEPLOYMENT_TARGET: "11.0"
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Tag matches Cargo.toml
+        env:
+          TAG: ${{ github.ref_name }}
+        run: |
+          version=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -n1)
+          echo "tag $TAG, Cargo.toml $version"
+          [ "$TAG" = "v$version" ]
+      - name: Rust toolchain
+        run: |
+          rustup toolchain install stable --profile minimal --target "$TARGET"
+          rustup default stable
+          rustc --version
+      - name: Build the tarball
+        run: sh scripts/dist.sh "$TARGET"
+      - name: Install it with install.sh and run it
+        if: matrix.runs
+        run: |
+          version=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -n1)
+          home=$(mktemp -d)
+          HOME=$home sh scripts/install.sh --tarball "dist/foxdb-$version-$TARGET.tar.gz"
+          [ "$("$home/.foxdb/bin/fox" --version)" = "fox $version" ]
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: dist-${{ matrix.target }}
+          path: dist/
+          if-no-files-found: error
+
+  release:
+    name: draft release
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      # For the build provenance attestation only.
+      id-token: write
+      attestations: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          pattern: dist-*
+          path: dist
+          merge-multiple: true
+      - name: Check the tarballs
+        run: |
+          cd dist
+          ls -l
+          set -- ./*.tar.gz
+          [ $# -eq 4 ]
+          sha256sum -c ./*.sha256
+      # Signed provenance for each tarball: `gh attestation verify FILE --repo ManavA/foxdb`.
+      - uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-path: dist/*.tar.gz
+      - name: Create the draft release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          version=${TAG#v}
+          # The release notes are the CHANGELOG section for this version.
+          awk -v v="$version" '
+            /^## / { if (inside) exit; if ($2 == v) { inside = 1; next } }
+            inside { print }
+          ' CHANGELOG.md >notes.md
+          [ -s notes.md ] || echo "See CHANGELOG.md." >notes.md
+          gh release create "$TAG" --repo "$GITHUB_REPOSITORY" --draft --verify-tag \
+            --title "foxdb $version" --notes-file notes.md dist/*

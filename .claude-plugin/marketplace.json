@@ -1,0 +1,16 @@
+{
+  "name": "foxdb",
+  "description": "foxdb: a local code graph, index and shared agent context for Claude Code.",
+  "owner": {
+    "name": "ManavA",
+    "url": "https://github.com/ManavA"
+  },
+  "plugins": [
+    {
+      "name": "foxdb",
+      "source": "./plugin",
+      "description": "The fox_* MCP tools, session and subagent brief hooks, the foxdb skill and the fox CLI. Needs fox installed in ~/.foxdb (scripts/install.sh).",
+      "category": "development"
+    }
+  ]
+}
