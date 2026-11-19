@@ -56,7 +56,9 @@ the tools and hooks run twice.
 You need Linux or macOS and git. Where the release has a prebuilt binary for your machine (v0.2.2:
 Linux x86_64; later releases: Linux and macOS, x86_64 and arm64), the installer downloads it with
 curl (or wget) and checks its sha256; elsewhere you need a Rust toolchain (`cargo`) to build from
-source, which takes several minutes. No GitHub login is needed.
+source, which takes several minutes. No GitHub login is needed. Release tarballs after v0.2.2
+also carry a GitHub build provenance attestation; to check a downloaded one, run
+`gh attestation verify foxdb-<version>-<target>.tar.gz --repo ManavA/foxdb`.
 
 1. Get the code and install `fox` and `foxd` into `~/.foxdb/bin` (no root):
 

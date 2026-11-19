@@ -44,15 +44,16 @@ run() {
     # shellcheck disable=SC2016 # $1 belongs to the stub
     printf '#!/bin/sh\ncase "$1" in -s) echo %s ;; -m) echo %s ;; *) echo %s ;; esac\n' "$1" "$2" "$1" >"$stub/uname"
     printf '#!/bin/sh\necho %s\n' "$3" >"$stub/sysctl"
-    printf '#!/bin/sh\necho "cargo stub: no source builds here" >&2\nexit 1\n' >"$stub/cargo"
+    printf '#!/bin/sh\ntouch "%s/cargo-ran"\necho "cargo stub: no source builds here" >&2\nexit 1\n' "$stub" >"$stub/cargo"
     chmod 755 "$stub/uname" "$stub/sysctl" "$stub/cargo"
     if [ "${piped:-}" = 1 ]; then
         # As `curl -fsSL .../install.sh | sh` runs it: from stdin, outside any checkout.
         (cd "$home" && env -i HOME="$home" PATH="$stub:$base_path" FOXDB_RELEASE_URL="file://${4:-$release}" \
             sh <"$repo/scripts/install.sh" 2>&1)
     else
-        env -i HOME="$home" PATH="$stub:$base_path" FOXDB_RELEASE_URL="file://${4:-$release}" \
-            sh "$repo/scripts/install.sh" 2>&1
+        # In $cwd when set (the directory the user runs it from).
+        (cd "${cwd:-.}" && env -i HOME="$home" PATH="$stub:$base_path" FOXDB_RELEASE_URL="file://${4:-$release}" \
+            sh "$repo/scripts/install.sh" 2>&1)
     fi
 }
 
@@ -89,7 +90,7 @@ else
     printf '%s' "$out" | grep -qF 'no prebuilt binary for FreeBSD-amd64' || fail "FreeBSD amd64: $out"
 fi
 
-# A tarball whose sha256 does not match is refused.
+# A tarball whose sha256 does not match is refused, and the install stops there: no source build.
 bad=$scratch/bad
 mkdir -p "$bad"
 cp "$release"/* "$bad/"
@@ -101,7 +102,44 @@ if out=$(run Linux aarch64 0 "$bad"); then
 else
     printf '%s' "$out" | grep -qF "sha256 mismatch" || fail "bad sha256: $out"
     [ ! -e "$scratch/home-$n/.foxdb/bin/fox" ] || fail "bad sha256: fox was installed"
+    [ ! -e "$scratch/stub-$n/cargo-ran" ] || fail "bad sha256: fell back to a source build"
 fi
+
+# A tarball that does not unpack (its sha256 matches) installs nothing, not even the fox and
+# foxd of the directory install.sh runs in.
+corrupt=$scratch/corrupt
+mkdir -p "$corrupt" "$scratch/cwd"
+cp "$release"/* "$corrupt/"
+name=foxdb-$version-x86_64-unknown-linux-gnu.tar.gz
+echo "not a tarball" >"$corrupt/$name"
+(cd "$corrupt" && sha256 "$name" >"$name.sha256")
+for b in fox foxd; do printf '#!/bin/sh\necho "%s from the working directory"\n' "$b" >"$scratch/cwd/$b"; done
+chmod 755 "$scratch/cwd/fox" "$scratch/cwd/foxd"
+n=$((n + 1))
+if out=$(cwd=$scratch/cwd run Linux x86_64 0 "$corrupt"); then
+    fail "a tarball that does not unpack was installed: $out"
+else
+    [ ! -e "$scratch/home-$n/.foxdb/bin/fox" ] || fail "corrupt tarball: installed $("$scratch/home-$n/.foxdb/bin/fox")"
+fi
+
+# A tarball without fox installs nothing either.
+empty=$scratch/empty
+mkdir -p "$empty" "$scratch/stage-empty/skill"
+cp "$release"/* "$empty/"
+echo skill >"$scratch/stage-empty/skill/SKILL.md"
+tar -C "$scratch/stage-empty" -czf "$empty/$name" .
+(cd "$empty" && sha256 "$name" >"$name.sha256")
+n=$((n + 1))
+if out=$(cwd=$scratch/cwd run Linux x86_64 0 "$empty"); then
+    fail "a tarball without fox was installed: $out"
+else
+    printf '%s' "$out" | grep -qF "tarball has no fox/foxd" || fail "no fox: $out"
+    [ ! -e "$scratch/home-$n/.foxdb/bin/fox" ] || fail "no fox: installed $("$scratch/home-$n/.foxdb/bin/fox")"
+fi
+
+# -h works when piped into sh, where $0 is the shell, not the script.
+help=$(sh -s -- -h <"$repo/scripts/install.sh" 2>&1) || true
+printf '%s' "$help" | grep -qF -- "--tarball FILE" || fail "piped -h: $help"
 
 [ $status = 0 ] && echo "PASS install.sh: picks and checks the asset for 4 targets ($n runs)"
 exit $status
