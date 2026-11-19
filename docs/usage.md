@@ -353,8 +353,9 @@ To find or trace code, run `~/.foxdb/bin/fox` first, even when a grep looks quic
 ```
 $ fox mem check
 2 memory lines cite code that is gone (4 sources checked):
+memory/ = ~/.claude/projects/-src-my-app/memory
 CLAUDE.md:12 | Call `load_legacy()` before `Store.open`. | `load_legacy()` (not in the code)
-~/.claude/projects/-src-my-app/memory/cli.md:5 | Preview with `my-app sync --dry-run`. | `--dry-run` (no such flag)
+memory/cli.md:5 | Preview with `my-app sync --dry-run`. | `--dry-run` (no such flag)
 ```
 
 - `fox drift [doc.md]` lists the backticked symbols and paths a Markdown doc cites that changed,

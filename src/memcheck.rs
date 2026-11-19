@@ -25,7 +25,8 @@ use std::path::{Path, PathBuf};
 /// One memory line with what it cites that is gone.
 #[derive(Debug, Clone)]
 pub struct Stale {
-    /// File path (repo-relative, or `~/…` for Claude memory) or a note handle.
+    /// Repo-relative path, `memory/<file>` for Claude memory ([`Report::memory_dir`]), or a
+    /// note handle.
     pub source: String,
     /// 1-based.
     pub line: usize,
@@ -39,6 +40,8 @@ pub struct Report {
     pub stale: Vec<Stale>,
     /// The code scan stopped at its byte cap: names it did not reach were not flagged.
     pub partial: bool,
+    /// Where `memory/` rows live: the project's Claude Code memory directory, `~`-shortened.
+    pub memory_dir: Option<String>,
 }
 
 struct Source {
@@ -91,7 +94,7 @@ fn sources(c: &Connection, p: &crate::project::Project) -> Result<Vec<Source>> {
         for f in files {
             let name = f.file_name().unwrap_or_default().to_string_lossy().into_owned();
             if let Some(text) = crate::guard::read_text(&f, &name, 1 << 20, false) {
-                out.push(Source { label: display_path(&f), text, own: None, base: None });
+                out.push(Source { label: format!("memory/{name}"), text, own: None, base: None });
             }
         }
     }
@@ -513,7 +516,10 @@ pub fn check(c: &Connection, p: &crate::project::Project) -> Result<Report> {
             }
         }
     }
-    Ok(Report { sources: srcs.len(), stale, partial })
+    let memory_dir = stale.iter().any(|x| x.source.starts_with("memory/")).then(|| {
+        display_path(&crate::inventory::claude_projects_root().join(claude_dir_name(&p.root)).join("memory"))
+    });
+    Ok(Report { sources: srcs.len(), stale, partial, memory_dir })
 }
 
 fn clip(s: &str, n: usize) -> String {
@@ -525,19 +531,36 @@ fn clip(s: &str, n: usize) -> String {
     t
 }
 
-/// `path:line | the line | what is missing`, one row per stale line.
+/// `path:line | the line | what is missing`, one row per stale line, all of them (the CLI).
 pub fn render(r: &Report) -> String {
+    render_capped(r, usize::MAX)
+}
+
+/// [`render`] within `max` characters: rows that do not fit are counted in a last line that says
+/// how to see them. The scan-stopped note, when there is one, comes first.
+pub fn render_capped(r: &Report, max: usize) -> String {
     let mut s = String::new();
-    if r.stale.is_empty() {
-        let _ = writeln!(s, "no stale code references in {} memory sources", r.sources);
-    } else {
-        let _ = writeln!(s, "{} memory lines cite code that is gone ({} sources checked):", r.stale.len(), r.sources);
-        for x in &r.stale {
-            let _ = writeln!(s, "{}:{} | {} | {}", x.source, x.line, clip(&x.text, 140), x.missing.join(", "));
-        }
-    }
     if r.partial {
         let _ = writeln!(s, "code scan stopped at {} MB: names it did not reach were not flagged", SCAN_CAP >> 20);
+    }
+    if r.stale.is_empty() {
+        let _ = writeln!(s, "no stale code references in {} memory sources", r.sources);
+        return s;
+    }
+    let _ = writeln!(s, "{} memory lines cite code that is gone ({} sources checked):", r.stale.len(), r.sources);
+    if let Some(d) = &r.memory_dir {
+        let _ = writeln!(s, "memory/ = {d}");
+    }
+    // Room for the footer.
+    let room = max.saturating_sub(120);
+    for (i, x) in r.stale.iter().enumerate() {
+        let row = format!("{}:{} | {} | {}\n", x.source, x.line, clip(&x.text, 140), x.missing.join(", "));
+        if s.chars().count() + row.chars().count() > room {
+            let rest = r.stale.len() - i;
+            let _ = writeln!(s, "+{rest} more of {} · raise budget (max 4000) or run `fox mem check` for all", r.stale.len());
+            break;
+        }
+        s.push_str(&row);
     }
     s
 }

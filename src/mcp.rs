@@ -365,8 +365,7 @@ fn memory_tool(ro: Option<Connection>, a: &Value, budget: usize, cursor: usize) 
             "check" => {
                 let Some(c) = ro else { bail!("no store yet") };
                 let Some(p) = current_project(Some(&c)) else { bail!("not in a project") };
-                let out = crate::memcheck::render(&crate::memcheck::check(&c, &p)?);
-                Ok(crate::hook::cap_lines(&out, budget * 4))
+                Ok(crate::memcheck::render_capped(&crate::memcheck::check(&c, &p)?, budget * 4))
             }
             "note" => {
                 let text = arg_s(a, "text").ok_or_else(|| anyhow::anyhow!("text is required for note"))?;

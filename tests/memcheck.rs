@@ -85,7 +85,9 @@ fn flags_only_code_shaped_tokens_that_resolve_to_nothing() {
     assert!(row("src/gone.rs").starts_with("CLAUDE.md:5 | "), "{out}");
     assert!(row("`--dry-run`").starts_with("CLAUDE.md:6 | "), "{out}");
     assert!(row("`Widget.paint`").starts_with("CLAUDE.md:7 | "), "{out}");
-    assert!(row("`old_helper_fn`").starts_with(&format!("{}:4 | ", memcheck::display_path(&fx.claude_note))), "{out}");
+    assert!(row("`old_helper_fn`").starts_with("memory/helpers.md:4 | "), "{out}");
+    let dir = memcheck::display_path(fx.claude_note.parent().unwrap());
+    assert!(out.lines().nth(1) == Some(&format!("memory/ = {dir}")[..]), "the memory dir is named once:\n{out}");
     assert!(row("`stale_note_fn`").contains(":1 | Decided:"), "{out}");
     // What exists, what is foreign and what is prose stays quiet.
     for quiet in [
@@ -158,4 +160,24 @@ fn mcp_and_cli_run_the_same_check() {
     let a = foxdb::cli::parse(vec!["mem".into(), "check".into()]).unwrap();
     assert_eq!(text, foxdb::cli::mem_check(&a, fx.repo.path()).unwrap());
     assert_eq!(flagged(&text).len(), 6, "{text}");
+}
+
+/// A capped answer (MCP `budget`) never drops rows silently: a last line counts them and says how
+/// to see them, and the scan-stopped note leads.
+#[test]
+fn a_capped_answer_counts_what_it_left_out() {
+    let row = |i: usize| memcheck::Stale {
+        source: "CLAUDE.md".into(),
+        line: i,
+        text: format!("- `gone_function_{i}` in `src/lib.rs` handles a long description of retries and backoff"),
+        missing: vec![format!("`gone_function_{i}` (not in the code)")],
+    };
+    let r = memcheck::Report { sources: 2, stale: (1..=40).map(row).collect(), partial: true, memory_dir: None };
+    let out = memcheck::render_capped(&r, 1200);
+    assert!(out.starts_with("code scan stopped at"), "{out}");
+    assert!(out.chars().count() <= 1200, "{}", out.chars().count());
+    let shown = out.lines().filter(|l| l.contains(" | ")).count();
+    let last = out.lines().last().unwrap();
+    assert!(shown > 0 && last == format!("+{} more of 40 · raise budget (max 4000) or run `fox mem check` for all", 40 - shown), "{out}");
+    assert_eq!(memcheck::render(&r).lines().filter(|l| l.contains(" | ")).count(), 40, "the CLI lists all");
 }
