@@ -193,6 +193,12 @@ fn set_mode(dir: &Path, mode: u32) {
 }
 
 #[cfg(unix)]
+fn mode(dir: &Path) -> u32 {
+    use std::os::unix::fs::PermissionsExt;
+    fs::metadata(dir).unwrap().permissions().mode() & 0o777
+}
+
+#[cfg(unix)]
 fn fox_find(home: &Path, repo: &Path) -> std::process::Output {
     std::process::Command::new(env!("CARGO_BIN_EXE_fox"))
         .args(["find", "sandbox_reader_target"])
@@ -227,12 +233,23 @@ fn a_read_only_store_without_wal_opens_lockless_for_cli_reads_only() {
     let c = db::open_ro();
     let found = c.as_ref().map(|c| project::find(c, &project::locate(repo.path())).map(|p| p.is_some()));
     drop(c);
-    // Checked before the CLI runs: its savings ledger opens the store read-write, and `open_rw`
-    // restores the store dir's 0700 mode, which a real sandbox would refuse.
-    let shm_after = home.path().join("fox.db-shm").exists();
     db::reset_lockless();
+    let list = || {
+        let mut v: Vec<String> =
+            fs::read_dir(home.path()).unwrap().flatten().map(|e| e.file_name().to_string_lossy().into_owned()).collect();
+        v.sort();
+        v
+    };
+    let before = list();
     let out = fox_find(home.path(), repo.path());
+    // The CLI never opens the store read-write after a lockless read (no savings record, no
+    // registration): the dir keeps its mode and gains no file, as a real sandbox would require.
+    let mode_after = mode(home.path());
+    let shm_after = home.path().join("fox.db-shm").exists();
+    let after = list();
     set_mode(home.path(), 0o700);
+    assert_eq!(mode_after, 0o555, "the CLI changed the store dir's mode");
+    assert_eq!(after, before, "the CLI wrote into the store dir");
     assert!(plain != Some(true) && !plain_lockless, "a long-lived holder got a lockless connection");
     assert!(matches!(found, Some(Ok(true))), "lockless open of a store in an unwritable dir: {found:?}");
     let stdout = String::from_utf8_lossy(&out.stdout);
@@ -307,9 +324,10 @@ fn a_lockless_read_of_an_older_store_is_refused_clearly() {
     }
     set_mode(home.path(), 0o555);
     let out = fox_find(home.path(), repo.path());
+    let mode_after = mode(home.path());
     set_mode(home.path(), 0o700);
-    // The message comes from the lockless open. (Here the CLI's read-write fallback then restores
-    // the dir's mode and migrates, which a real sandbox would refuse.)
     let err = String::from_utf8_lossy(&out.stderr);
+    assert!(!out.status.success(), "an older store was read: {}", String::from_utf8_lossy(&out.stdout));
     assert!(err.contains("older build") && err.contains("outside the sandbox"), "{err}");
+    assert_eq!(mode_after, 0o555, "the CLI tried to open the store read-write");
 }

@@ -779,6 +779,14 @@ pub fn lockless_changed() -> bool {
     snap.is_some_and(|s| file_snap(&db_path()) != Some(s))
 }
 
+/// Must this process stay off read-write connections? True after a lockless read, and whenever a
+/// CLI read that may go lockless meets an existing store in a directory it cannot write (a
+/// read-only sandbox): [`open_rw`] would try to chmod and write there. Callers skip their
+/// optional writes (savings, registration, "already sent") instead.
+pub fn rw_forbidden() -> bool {
+    lockless_in_use() || (LOCKLESS_OK.load(std::sync::atomic::Ordering::SeqCst) && db_path().exists() && !dir_writable(&home()))
+}
+
 /// Forget the lockless snapshot, so the next [`open_ro`] decides afresh.
 pub fn reset_lockless() {
     *LOCKLESS_SNAP.lock().unwrap_or_else(|e| e.into_inner()) = None;

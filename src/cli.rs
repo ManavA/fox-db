@@ -557,13 +557,16 @@ pub fn find(a: &Args, cwd: &Path, served: Option<Served>) -> anyhow::Result<Stri
         None => {
             owned = match db::open_ro() {
                 Some(c) => c,
+                // A store this read-only process cannot open (an older schema in a sandbox: the
+                // lockless open said why on stderr) is not created or migrated from here.
+                None if db::rw_forbidden() => anyhow::bail!("cannot read the store at {}", db::db_path().display()),
                 None => db::open_rw()?,
             };
             &owned
         }
     };
     let cur = project::find(c, &loc)?;
-    if cur.is_none() && loc.kind != "huge" {
+    if cur.is_none() && loc.kind != "huge" && !db::rw_forbidden() {
         // Auto-register and index in the background; this query searches everything known.
         if let Ok(w) = db::open_rw()
             && let Ok(p) = project::ensure(&w, &loc)
@@ -610,6 +613,7 @@ pub fn code(a: &Args, cwd: &Path, served: Option<Served>) -> anyhow::Result<Stri
     let out = match (a.rel.as_str(), a.session.as_deref()) {
         ("src" | "outline", Some(session)) => match served.as_ref().and_then(|s| s.rw) {
             Some(w) => crate::spare::filter_db(w, Some(session), &sym, out, a.fresh),
+            None if db::rw_forbidden() => out,
             None => match db::open_rw() {
                 Ok(w) => crate::spare::filter_db(&w, Some(session), &sym, out, a.fresh),
                 Err(_) => out,

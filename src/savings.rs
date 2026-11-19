@@ -93,6 +93,10 @@ pub fn record(w: &Connection, tool: &str, saved: i64) -> Result<()> {
 
 /// Estimate and record in one go, fail-open. Returns `out` unchanged.
 pub fn account(pid: Option<i64>, tool: &str, out: String) -> String {
+    // Optional bookkeeping: never in a read-only store, and a failed write is silent.
+    if crate::db::rw_forbidden() {
+        return out;
+    }
     let Ok(w) = crate::db::open_rw() else { return out };
     account_with(&w, pid, tool, out)
 }
