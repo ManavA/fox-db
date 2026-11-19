@@ -396,17 +396,16 @@ impl<'a> Code<'a> {
         Ok(Code { c, p, files, exts })
     }
 
+    /// Is `name` (exact case) a symbol of the project? The lookup goes through the case-folded
+    /// symbol-name index (`node_sym_name`); an exact-case `name =` cannot use it and scans every
+    /// node, about 40 ms a name on a big project.
     fn symbol(&self, name: &str) -> bool {
-        self.c
-            .query_row(
-                "SELECT 1 FROM node WHERE project_id = ?1 AND kind = 'symbol' AND name = ?2 LIMIT 1",
-                params![self.p.id, name],
-                |_| Ok(()),
-            )
-            .optional()
-            .ok()
-            .flatten()
-            .is_some()
+        let Ok(mut q) =
+            self.c.prepare_cached("SELECT name FROM node WHERE project_id = ?1 AND kind = 'symbol' AND name = ?2 COLLATE NOCASE")
+        else {
+            return false;
+        };
+        q.query_map(params![self.p.id, name], |r| r.get::<_, String>(0)).map(|rows| rows.flatten().any(|n| n == name)).unwrap_or(false)
     }
 
     fn file_exists(&self, rel: &str) -> bool {
@@ -458,16 +457,63 @@ fn scan_excluded(path: &str) -> bool {
         || name.starts_with("history")
 }
 
-/// Which `needles` occur in the project's code and config text (not docs, not `skip`).
-/// Returns the found set and whether the scan stopped at its cap.
-fn scan(pr: &Code, needles: &HashSet<String>, skip: &HashSet<String>) -> (HashSet<String>, bool) {
-    let mut found = HashSet::new();
-    if needles.is_empty() {
+/// What the memory cites and the code scan looks for: identifier words that are not symbols,
+/// and flag names (without dashes).
+#[derive(Default)]
+struct Needles {
+    words: HashSet<String>,
+    flags: HashSet<String>,
+}
+
+/// What the code scan found.
+#[derive(Default)]
+struct Found {
+    words: HashSet<String>,
+    flags: HashSet<String>,
+}
+
+impl Found {
+    fn all(&self, n: &Needles) -> bool {
+        self.words.len() == n.words.len() && self.flags.len() == n.flags.len()
+    }
+}
+
+/// One pass over `text`: every run of word characters and dashes is a token. A token `--x` or
+/// `x` names flag `x` (`#[arg(long)] dry_run` names `--dry-run` too); each dash-separated part
+/// is an identifier word. Whole-word matching for every needle at once, in time linear in `text`.
+fn scan_text(text: &str, n: &Needles, found: &mut Found) {
+    let tok = |c: char| c.is_alphanumeric() || c == '_' || c == '-';
+    for t in text.split(|c: char| !tok(c)).filter(|t| !t.is_empty()) {
+        if !n.flags.is_empty() {
+            let bare = t.trim_start_matches('-');
+            if n.flags.contains(bare) {
+                found.flags.insert(bare.to_string());
+            }
+            if bare.contains('_') {
+                let dashed = bare.replace('_', "-");
+                if n.flags.contains(&dashed) {
+                    found.flags.insert(dashed);
+                }
+            }
+        }
+        for w in t.split('-').filter(|w| !w.is_empty()) {
+            if n.words.contains(w) && !found.words.contains(w) {
+                found.words.insert(w.to_string());
+            }
+        }
+    }
+}
+
+/// Which needles occur in the project's code and config text (not docs, not `skip`), and whether
+/// the scan stopped at its cap.
+fn scan(pr: &Code, needles: &Needles, skip: &HashSet<String>) -> (Found, bool) {
+    let mut found = Found::default();
+    if needles.words.is_empty() && needles.flags.is_empty() {
         return (found, false);
     }
     let mut total = 0usize;
     for f in &pr.files {
-        if found.len() == needles.len() {
+        if found.all(needles) {
             break;
         }
         if scan_excluded(f) || skip.contains(f) {
@@ -483,20 +529,9 @@ fn scan(pr: &Code, needles: &HashSet<String>, skip: &HashSet<String>) -> (HashSe
         }
         total += md.len() as usize;
         let Some(text) = crate::guard::read_text(&abs, f, SCAN_FILE_MAX as usize, false) else { continue };
-        for n in needles {
-            if !found.contains(n) && has_word(&text, n) {
-                found.insert(n.clone());
-            }
-        }
+        scan_text(&text, needles, &mut found);
     }
     (found, false)
-}
-
-/// `needle` occurs in `text` as a whole word: not inside a longer identifier (or flag).
-fn has_word(text: &str, needle: &str) -> bool {
-    let word = |c: char| c.is_alphanumeric() || c == '_' || (needle.starts_with('-') && c == '-');
-    text.match_indices(needle)
-        .any(|(i, _)| !text[..i].chars().next_back().is_some_and(word) && !text[i + needle.len()..].chars().next().is_some_and(word))
 }
 
 fn segments(ident: &str) -> Vec<String> {
@@ -516,20 +551,19 @@ pub fn check(c: &Connection, p: &crate::project::Project) -> Result<Report> {
     let per: Vec<Vec<(usize, String, Vec<Cite>)>> = srcs.iter().map(|s| cites(&s.text, &bins, &caps_prefix)).collect();
     // Words to look for in the code text: identifier segments that are not symbols, and flags.
     let mut words: HashMap<String, bool> = HashMap::new();
-    let mut needles = HashSet::new();
+    let mut needles = Needles::default();
     for c in per.iter().flatten().flat_map(|x| &x.2) {
         match c {
             Cite::Ident(s, _) => {
                 for seg in segments(s) {
                     let sym = *words.entry(seg.clone()).or_insert_with(|| pr.symbol(&seg));
                     if !sym {
-                        needles.insert(seg);
+                        needles.words.insert(seg);
                     }
                 }
             }
             Cite::Flag(f) => {
-                needles.insert(format!("--{f}"));
-                needles.insert(format!("\"{f}\""));
+                needles.flags.insert(f.clone());
             }
             Cite::Path(_) => {}
         }
@@ -537,7 +571,7 @@ pub fn check(c: &Connection, p: &crate::project::Project) -> Result<Report> {
     let skip: HashSet<String> = srcs.iter().filter_map(|s| s.own.clone()).collect();
     let (found, partial) = scan(&pr, &needles, &skip);
     // Unreached by a capped scan: unknown, so treated as present.
-    let known = |w: &str| words.get(w).copied().unwrap_or(false) || found.contains(w) || (partial && needles.contains(w));
+    let known = |w: &str| words.get(w).copied().unwrap_or(false) || found.words.contains(w) || (partial && needles.words.contains(w));
     let mut stale = vec![];
     for (s, lines) in srcs.iter().zip(per) {
         for (line, text, cs) in lines {
@@ -550,7 +584,7 @@ pub fn check(c: &Connection, p: &crate::project::Project) -> Result<Report> {
                         }
                     }
                     Cite::Flag(f) => {
-                        let gone = !(found.contains(&format!("--{f}")) || found.contains(&format!("\"{f}\"")) || partial);
+                        let gone = !(found.flags.contains(&f) || partial);
                         if gone {
                             missing.push(format!("`--{f}` (no such flag)"));
                         }

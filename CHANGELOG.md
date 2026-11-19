@@ -88,8 +88,12 @@ First answers that were empty, wrong or padded in agent benchmark transcripts ar
   flags that no longer exist, as `path:line | the line | what is missing`, from the project's
   Claude Code auto-memory, `AGENTS.md` / `CLAUDE.md` files and `op=note` notes. Only
   code-shaped tokens that resolve to nothing in the index, the code text or the file system are
-  flagged; memory files are never written. Each index run records the count, and while it is
-  above zero the session brief carries one `stale memory: N lines … (fox mem check)` line.
+  flagged, and each name only when it is anchored to the project on its own (attributed to a
+  project path, or qualified by a project symbol); lines recording an absence, planned work or a
+  hypothetical are skipped. Memory files are never written. A capped MCP answer counts the rows
+  it left out. Each index run records the count (one pass over the code text, about 0.3 s on a
+  28 MB project), and while it is above zero the session brief carries one
+  `stale memory: N lines … (fox mem check)` line.
 
 ## 0.2.2 (2026-11-18)
 

@@ -191,3 +191,20 @@ fn a_capped_answer_counts_what_it_left_out() {
     assert!(shown > 0 && last == format!("+{} more of 40 · raise budget (max 4000) or run `fox mem check` for all", 40 - shown), "{out}");
     assert_eq!(memcheck::render(&r).lines().filter(|l| l.contains(" | ")).count(), 40, "the CLI lists all");
 }
+
+/// The code scan matches whole words only, every needle in one pass: `gone_fn` is not found
+/// inside `gone_fn_v2`, and a flag counts when the code names it as `--x`, `"x"` or a `x_y` field.
+#[test]
+fn the_code_scan_matches_whole_words() {
+    let _g = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    let fx = setup();
+    write(fx.repo.path(), "src/extra.rs", "pub fn gone_fn_v2() {}\n#[arg(long)]\npub dry_run: bool,\n");
+    write(fx.repo.path(), "CLAUDE.md", "# Notes\n\n- `gone_fn` in `src/extra.rs` was split.\n- Run `demo sync --dry-run`.\n");
+    let mut c = db::open_rw().unwrap();
+    inventory::index_project(&mut c, &fx.p).unwrap();
+    tsindex::index_project(&mut c, &fx.p).unwrap();
+    let out = memcheck::render(&memcheck::check(&c, &fx.p).unwrap());
+    let rows = flagged(&out);
+    assert!(rows.iter().any(|r| r.contains("`gone_fn` (not in the code)")), "{out}");
+    assert!(rows.iter().all(|r| !r.contains("dry-run")), "a dry_run field names --dry-run:\n{out}");
+}
