@@ -2,22 +2,21 @@
 # Install fox and foxd into ${FOXDB_HOME:-$HOME/.foxdb}/bin (and the agent skill into
 # ${FOXDB_HOME:-$HOME/.foxdb}/skill), without root.
 #
-#   scripts/install.sh                 download the release asset (curl or wget, no login), else build from source
+#   scripts/install.sh                 download this machine's release asset (curl or wget, no login),
+#                                      check its sha256, else build from source
 #   scripts/install.sh --source        always build from source (needs cargo)
 #   scripts/install.sh --tarball FILE  install from a downloaded release tarball (checks FILE.sha256 if present)
 #
-# Environment: FOXDB_HOME (default ~/.foxdb), FOXDB_VERSION (default 0.2.2),
-# FOXDB_REPO (default ManavA/foxdb), FOXDB_RELEASE_URL (default
-# https://github.com/$FOXDB_REPO/releases/download/v$FOXDB_VERSION). No GitHub login is
-# needed. It never edits any harness setting (Claude Code, Codex, opencode, T3 Code):
-# registering the MCP server and hooks is a separate, explicit step.
+# Prebuilt assets: Linux (glibc) and macOS, each on x86_64 and arm64. Environment: FOXDB_HOME
+# (default ~/.foxdb), FOXDB_VERSION (default 0.2.2), FOXDB_REPO (default ManavA/foxdb),
+# FOXDB_RELEASE_URL (default https://github.com/$FOXDB_REPO/releases/download/v$FOXDB_VERSION).
+# No GitHub login is needed. It never edits any harness setting (Claude Code, Codex, opencode,
+# T3 Code): registering the MCP server and hooks is a separate, explicit step.
 set -eu
 
 VERSION=${FOXDB_VERSION:-0.2.2}
 REPO=${FOXDB_REPO:-ManavA/foxdb}
 DEST=${FOXDB_HOME:-$HOME/.foxdb}/bin
-TARGET=x86_64-unknown-linux-gnu
-ASSET=foxdb-$VERSION-$TARGET.tar.gz
 RELEASE_URL=${FOXDB_RELEASE_URL:-https://github.com/$REPO/releases/download/v$VERSION}
 
 mode=auto
@@ -27,7 +26,7 @@ while [ $# -gt 0 ]; do
     case $1 in
         --source) mode=source ;;
         --tarball) mode=tarball; tarball=${2:?--tarball needs a file}; shift ;;
-        -h|--help) sed -n '2,13p' "$0"; exit 0 ;;
+        -h|--help) sed -n '2,14p' "$0"; exit 0 ;;
         *) echo "install.sh: unknown argument $1" >&2; exit 2 ;;
     esac
     shift
@@ -43,11 +42,31 @@ trap 'rm -rf "$work"' EXIT
 
 say() { echo "install.sh: $*" >&2; }
 
+# The release target for this machine; empty when there is no prebuilt binary for it.
+host_target() {
+    os=$(uname -s)
+    arch=$(uname -m)
+    # A shell under Rosetta on Apple silicon reports x86_64; install the native arm64 build.
+    if [ "$os-$arch" = Darwin-x86_64 ] && [ "$(sysctl -n hw.optional.arm64 2>/dev/null)" = 1 ]; then
+        arch=arm64
+    fi
+    case $os-$arch in
+        Linux-x86_64 | Linux-amd64) echo x86_64-unknown-linux-gnu ;;
+        Linux-aarch64 | Linux-arm64) echo aarch64-unknown-linux-gnu ;;
+        Darwin-x86_64) echo x86_64-apple-darwin ;;
+        Darwin-arm64 | Darwin-aarch64) echo aarch64-apple-darwin ;;
+    esac
+}
+
+sha256() {
+    if command -v sha256sum >/dev/null 2>&1; then sha256sum "$1"; else shasum -a 256 "$1"; fi | cut -d' ' -f1
+}
+
 # Unpack a release tarball (after checking its .sha256 when one sits beside it) into $work/out.
 from_tarball() {
     if [ -f "$1.sha256" ]; then
         want=$(cut -d' ' -f1 <"$1.sha256")
-        got=$(sha256sum "$1" | cut -d' ' -f1)
+        got=$(sha256 "$1")
         [ "$want" = "$got" ] || { say "sha256 mismatch for $1"; return 1; }
         say "sha256 ok"
     fi
@@ -56,7 +75,7 @@ from_tarball() {
     src=$(dirname "$(find "$work/out" -type f -name fox | head -n1)")
     [ -x "$src/fox" ] && [ -x "$src/foxd" ] || { say "tarball has no fox/foxd"; return 1; }
     skill=$src/skill/SKILL.md
-    "$src/fox" --version >/dev/null 2>&1 || { say "the prebuilt fox does not run here (it needs glibc 2.39 or newer)"; return 1; }
+    "$src/fox" --version >/dev/null 2>&1 || { say "the prebuilt fox does not run here (on Linux it needs glibc 2.35 or newer)"; return 1; }
 }
 
 # fetch URL FILE: anonymous download with curl, else wget.
@@ -69,7 +88,9 @@ fetch() {
 }
 
 from_release() {
-    [ "$(uname -s)-$(uname -m)" = Linux-x86_64 ] || { say "no prebuilt binary for $(uname -s)-$(uname -m)"; return 1; }
+    target=$(host_target)
+    [ -n "$target" ] || { say "no prebuilt binary for $(uname -s)-$(uname -m)"; return 1; }
+    ASSET=foxdb-$VERSION-$target.tar.gz
     say "downloading v$VERSION from $RELEASE_URL"
     if command -v curl >/dev/null 2>&1 || command -v wget >/dev/null 2>&1; then
         { fetch "$RELEASE_URL/$ASSET" "$work/$ASSET" && fetch "$RELEASE_URL/$ASSET.sha256" "$work/$ASSET.sha256"; } \
