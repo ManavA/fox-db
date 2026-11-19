@@ -171,3 +171,48 @@ fn concurrent_openers_of_a_v4_store_migrate_once_and_keep_every_match() {
     assert_eq!(matches(&c, "fts_node", "quokka"), N, "tokens lost in a concurrent migration");
     assert_eq!(matches(&c, "fts_trigram", "\"src/w\""), N);
 }
+
+/// A read-only sandbox (`codex sandbox`, workspace profiles) cannot create the `-shm` file a WAL
+/// store needs, so a plain read-only open fails with "unable to open database file". With no
+/// `-wal` holding pending pages, the store opens immutable instead, and `fox find` answers
+/// directly when the daemon socket cannot be reached.
+#[test]
+#[cfg(unix)]
+fn a_read_only_store_without_wal_opens_immutable() {
+    use std::os::unix::fs::PermissionsExt;
+    let _g = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    let (home, repo) = setup();
+    write(repo.path(), "src/lib.rs", "pub fn sandbox_reader_target() {}\n");
+    {
+        let mut c = db::open_rw().unwrap();
+        let p = project::ensure(&c, &project::locate(repo.path())).unwrap();
+        inventory::index_project(&mut c, &p).unwrap();
+        foxdb::tsindex::index_project(&mut c, &p).unwrap();
+    }
+    let side = |ext: &str| home.path().join(format!("fox.db-{ext}"));
+    assert!(!side("wal").exists() && !side("shm").exists(), "closing the last connection leaves no -wal or -shm");
+    // A socket path the sandbox cannot use: the CLI must fall back to answering directly.
+    fs::write(home.path().join("foxd.sock"), "").unwrap();
+    fs::set_permissions(home.path(), fs::Permissions::from_mode(0o555)).unwrap();
+    let c = db::open_ro();
+    let found = c.as_ref().map(|c| project::find(c, &project::locate(repo.path())).map(|p| p.is_some()));
+    drop(c);
+    let out = std::process::Command::new(env!("CARGO_BIN_EXE_fox"))
+        .args(["find", "sandbox_reader_target"])
+        .current_dir(repo.path())
+        .env("FOXDB_HOME", home.path())
+        .env("FOXDB_CLAUDE_PROJECTS", home.path().join("no-claude"))
+        .env_remove("FOXDB_NO_DAEMON")
+        .output()
+        .unwrap();
+    let shm_after = side("shm").exists();
+    fs::set_permissions(home.path(), fs::Permissions::from_mode(0o700)).unwrap();
+    assert!(matches!(found, Some(Ok(true))), "read-only open of a store in an unwritable dir: {found:?}");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        out.status.success() && stdout.contains("src/lib.rs"),
+        "fox find in a read-only store: {stdout}{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(!shm_after, "an immutable reader writes nothing");
+}

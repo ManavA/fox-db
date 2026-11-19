@@ -63,6 +63,10 @@ First answers that were empty, wrong or padded in agent benchmark transcripts ar
 - `fox_read` with no mode returns a symbol's body, and for a file its declarations with the last
   line of each (`..N`) and how to read one. File outlines count fields instead of listing them;
   a type's own outline lists its fields.
+- In a read-only sandbox (`codex sandbox` read-only and workspace profiles) `fox find` no longer
+  fails with "unable to open database file": when the store's directory cannot hold the `-shm`
+  file and no `-wal` holds unmerged pages, the store opens `immutable=1`. A daemon socket the
+  sandbox cannot reach falls back to answering directly, as before.
 
 ## 0.2.2 (2026-11-18)
 

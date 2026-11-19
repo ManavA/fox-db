@@ -727,6 +727,20 @@ pub fn open_ro() -> Option<Connection> {
     }
     let ro = || Connection::open_with_flags(&p, OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX).ok();
     let mut c = ro()?;
+    // A WAL store needs a `-shm` file even to read. In a read-only sandbox (Codex's read-only and
+    // workspace profiles) the store's directory is not writable, so when no `-shm` exists the
+    // first read fails with "unable to open database file". With no `-wal` holding pages that
+    // are not yet in the main file, the main file is the whole store: open it immutable, which
+    // needs neither file. Never with a non-empty `-wal`: those pages would be invisible.
+    if c.query_row("SELECT COUNT(*) FROM sqlite_master", [], |r| r.get::<_, i64>(0)).is_err() {
+        let wal = std::fs::metadata(home().join("fox.db-wal")).map(|m| m.len()).unwrap_or(0);
+        if wal > 0 {
+            return None;
+        }
+        c = open_immutable(&p)?;
+        let _ = c.pragma_update(None, "temp_store", "MEMORY");
+        return Some(c);
+    }
     // A store from an older build: read-only callers (MCP-only harnesses have no hook that would
     // open it read-write) migrate it once, then read.
     if c.pragma_query_value(None, "user_version", |r| r.get::<_, i64>(0)).is_ok_and(|v| v < LATEST) && open_rw().is_ok() {
@@ -738,6 +752,25 @@ pub fn open_ro() -> Option<Connection> {
     // instead of being copied into each connection's private cache.
     let _ = c.pragma_update(None, "mmap_size", 1i64 << 30);
     let _ = c.pragma_update(None, "temp_store", "MEMORY");
+    Some(c)
+}
+
+/// `path` opened `immutable=1`: SQLite reads the main file only, with no locks, `-shm` or `-wal`.
+fn open_immutable(path: &std::path::Path) -> Option<Connection> {
+    let mut uri = String::from("file:");
+    for ch in path.to_string_lossy().chars() {
+        match ch {
+            '%' => uri.push_str("%25"),
+            '?' => uri.push_str("%3f"),
+            '#' => uri.push_str("%23"),
+            c => uri.push(c),
+        }
+    }
+    uri.push_str("?mode=ro&immutable=1");
+    let c =
+        Connection::open_with_flags(uri, OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_URI | OpenFlags::SQLITE_OPEN_NO_MUTEX)
+            .ok()?;
+    c.query_row("SELECT COUNT(*) FROM sqlite_master", [], |r| r.get::<_, i64>(0)).ok()?;
     Some(c)
 }
 
