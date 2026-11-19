@@ -388,6 +388,10 @@ pub fn brief(c: &Connection, p: &Project, branch: Option<&str>, budget: usize) -
         )
         .unwrap_or(0);
     out.line(&format!("fox_find also covers {mem} global memory notes (kind=memory); fox status lists indexed projects."));
+    // Recorded by the last index run; absent (silent) when no memory line cites gone code.
+    if let Some(l) = crate::memcheck::brief_line(c, p.id) {
+        out.line(&l);
+    }
     // Volatile part last, so a change here only invalidates the cache from this line on.
     if let Some(l) = crate::savings::brief_line(c) {
         out.line(&l);

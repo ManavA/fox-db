@@ -644,12 +644,17 @@ pub fn split_ident(s: &str) -> String {
     out
 }
 
+/// Claude Code's per-project directories: `~/.claude/projects` (or `FOXDB_CLAUDE_PROJECTS`).
+pub fn claude_projects_root() -> PathBuf {
+    std::env::var_os("FOXDB_CLAUDE_PROJECTS")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from(std::env::var_os("HOME").unwrap_or_default()).join(".claude/projects"))
+}
+
 /// Global memory: ~/.claude/projects/*/memory/*.md (override root with FOXDB_CLAUDE_PROJECTS).
 pub fn index_global(c: &mut Connection) -> Result<usize> {
     let g = crate::project::global(c)?;
-    let root = std::env::var_os("FOXDB_CLAUDE_PROJECTS")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from(std::env::var_os("HOME").unwrap_or_default()).join(".claude/projects"));
+    let root = claude_projects_root();
     let mut files = Vec::new();
     if let Ok(rd) = std::fs::read_dir(&root) {
         for proj in rd.flatten() {

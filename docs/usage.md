@@ -106,6 +106,7 @@ fox mem brief [--budget TOKENS] [--harness claude|codex]
 fox mem post <text> [--kind finding|claim|request|decision|report] [--title T] [--evidence E]
 fox mem read [query|h:ID] [--kind K]
 fox mem pickup h:ID [--by NAME]
+fox mem check
 fox hook session-start|subagent-start|subagent-stop|pre-compact [--harness claude|codex]
 fox drift [doc.md]
 fox pack <doc.md> [--budget TOKENS]
@@ -192,7 +193,7 @@ top: code callers ~1800/5, code outline ~1300/3, code callees ~700/1, code impac
 | `fox_find` | `q`, `kind?` (any/symbol/file/dir/doc/milestone/memory), `project?` (name or `all`), `budget?`, `cursor?` | Ranked search |
 | `fox_graph` | `target?`, `rel` (callers/callees/refs/conforms/subtypes/extensions/overrides/impact), `depth?`, `budget?`, `cursor?` | Code graph of a symbol |
 | `fox_read` | `target`, `mode?` (outline/signature/body/section/context), `lines?` (`a-b`), `budget?`, `cursor?` | Read a handle or path compactly; `h:` handoffs and `x:` session digests too |
-| `fox_memory` | `op` (brief/recall/note/post/read/pickup/take/packet/agents/dispatch/wait), `q?`, `text?`, `kind?`, `topic?`, `since?`, `evidence?`, `next?`, `id?`, `harness?`, `writer?`, `reviewer?`, `any?`, `timeout?`, `budget?` | Session brief, recall, notes, the handoff board, packets, the agent tree, dispatch and bounded wait (see [multi-agent.md](multi-agent.md)) |
+| `fox_memory` | `op` (brief/recall/note/check/post/read/pickup/take/packet/agents/dispatch/wait), `q?`, `text?`, `kind?`, `topic?`, `since?`, `evidence?`, `next?`, `id?`, `harness?`, `writer?`, `reviewer?`, `any?`, `timeout?`, `budget?` | Session brief, recall, notes, the handoff board, packets, the agent tree, dispatch and bounded wait (see [multi-agent.md](multi-agent.md)) |
 
 Each description says when to use the tool, and `initialize` returns a short server
 instructions string (six short sentences: one question and tool per line, "call them first, even when a grep looks quicker", and "for a literal string, error message or config value, use Grep"). The definitions plus instructions are about 1,100 tokens,
@@ -333,6 +334,28 @@ To find or trace code, run `~/.foxdb/bin/fox` first, even when a grep looks quic
 ```
 
 ## Docs anchored to code
+
+- `fox mem check` (MCP: `fox_memory op=check`) lists memory lines that cite code which no
+  longer exists, as `path:line | the line | what is missing`. It reads the project's Claude Code
+  auto-memory files (`~/.claude/projects/<root>/memory/*.md`), its `AGENTS.md`, `CLAUDE.md` and
+  `CLAUDE.local.md` files, and `fox_memory op=note` notes, and never writes them. Precision over
+  recall: it checks backticked identifiers with `_`, `::`, `.`, `()` or a camelCase hump,
+  `--flags` on a line that names one of the project's own commands, and paths with a `/` and a
+  known extension, and flags one only when it resolves to nothing: no symbol of that name, no
+  whole-word occurrence in the project's code and config files (Markdown and changelogs are not
+  searched), no such file. A lone name is judged only on a line where something else resolves
+  (a project path or symbol), and a qualified name only when its head is a project symbol, so
+  OS error codes, API fields, other tools' flags and bundle ids stay quiet; so do paths outside
+  the project, bare file names, lines that record an absence ("removed", "no `x`") and fenced
+  blocks. Each index run records the count; while it is above zero the session brief carries
+  one line, `stale memory: N lines cite code that is gone (fox mem check)`, and otherwise nothing.
+
+```
+$ fox mem check
+2 memory lines cite code that is gone (4 sources checked):
+CLAUDE.md:12 | Call `load_legacy()` before `Store.open`. | `load_legacy()` (not in the code)
+~/.claude/projects/-src-my-app/memory/cli.md:5 | Preview with `my-app sync --dry-run`. | `--dry-run` (no such flag)
+```
 
 - `fox drift [doc.md]` lists the backticked symbols and paths a Markdown doc cites that changed,
   moved or vanished since the doc's last commit, grouped by section. It uses only git and the

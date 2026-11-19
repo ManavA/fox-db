@@ -59,7 +59,7 @@ First answers that were empty, wrong or padded in agent benchmark transcripts ar
 - `fox_find` and `fox_graph` carry `_meta: {"anthropic/alwaysLoad": true}`, so Claude Code loads
   them up front instead of deferring them behind tool search. `context-budget.json` now also pins
   the brief's tool line, the bytes every session pays before its first call (instructions, tool
-  list and brief line: 4,935) and the list of always-loaded tools.
+  list and brief line: 5,171) and the list of always-loaded tools.
 - `fox_read` with no mode returns a symbol's body, and for a file its declarations with the last
   line of each (`..N`) and how to read one. File outlines count fields instead of listing them;
   a type's own outline lists its fields.
@@ -79,6 +79,12 @@ First answers that were empty, wrong or padded in agent benchmark transcripts ar
   compaction summariser as instructions: keep the `path:line` anchors of files being read or
   edited, the symbols being changed, leads already ruled out, and the packet handle `h:…` the
   hook just saved. The text depends only on that handle; Codex gets nothing.
+- `fox mem check` (MCP: `fox_memory op=check`) lists memory lines that cite symbols, paths or
+  flags that no longer exist, as `path:line | the line | what is missing`, from the project's
+  Claude Code auto-memory, `AGENTS.md` / `CLAUDE.md` files and `op=note` notes. Only
+  code-shaped tokens that resolve to nothing in the index, the code text or the file system are
+  flagged; memory files are never written. Each index run records the count, and while it is
+  above zero the session brief carries one `stale memory: N lines … (fox mem check)` line.
 
 ## 0.2.2 (2026-11-18)
 

@@ -230,8 +230,8 @@ fn subagent_start(input: &Value, h: Harness) -> Result<String> {
     let Some(p) = project::find(&c, &loc)? else { return Ok(String::new()) };
     let branch = loc.git_dir.as_deref().and_then(project::branch);
     let mut text = query::brief(&c, &p, branch.as_deref(), SUBAGENT_BRIEF_TOKENS)?;
-    // The savings line is volatile and of no use to a helper.
-    text = text.lines().filter(|l| !l.starts_with("fox saved")).map(|l| format!("{l}\n")).collect();
+    // The savings and stale-memory lines are of no use to a helper.
+    text = text.lines().filter(|l| !l.starts_with("fox saved") && !l.starts_with("stale memory:")).map(|l| format!("{l}\n")).collect();
     // A pointer to the parent's frozen board snapshot, not the live board: siblings started
     // before and after a post still get the same bytes.
     if let Ok(w) = db::open_rw()

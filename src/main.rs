@@ -136,6 +136,8 @@ fn index_once(a: &Args, c: &mut rusqlite::Connection, p: &project::Project) -> a
         }
     };
     let vx = vectors_after_index(c, p);
+    // Count memory lines that cite gone code, for the brief. Best effort.
+    let _ = foxdb::memcheck::record(c, p);
     let cn = if !config::get().codanna || a.no_codanna || p.kind == "huge" || !codanna::available() || !codanna::needed(c, p) {
         String::new()
     } else {
@@ -328,6 +330,7 @@ fn main() -> ExitCode {
         Some("swarm") => cli::swarm(&a, &cwd()),
         Some("code") => cmd_code(&a),
         Some("mem") if matches!(a.pos.get(1).map(String::as_str), Some("post" | "read" | "pickup")) => cli::board(&a, &cwd()),
+        Some("mem") if a.pos.get(1).map(String::as_str) == Some("check") => cli::mem_check(&a, &cwd()),
         Some("drift" | "pack") => cli::docref(&a, &cwd()),
         Some("scip") => cli::scip(&a, &cwd()),
         Some("vectors") => cli::vectors(&a, &cwd()),

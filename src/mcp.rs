@@ -94,9 +94,9 @@ pub fn tools() -> Value {
             "lines": {"type": "string", "description": "a-b, for files"},
             "budget": budget, "cursor": cursor}}},
         {"name": "fox_memory",
-         "description": "What was decided or found before? recall searches notes, memory files, milestones and past sessions. Also: brief; note; post a finding/claim/request/decision; read the board (since=auto: only what is new to you); pickup or take (leased) a handoff; packet: create (text=goal) or render id=h:; agents: the agent tree; dispatch a codex/claude worker (text=task); wait for agents or h: (bounded, call again).",
+         "description": "What was decided or found before? recall searches notes, memory files, milestones and past sessions. Also: brief; note; check (memory lines citing code that is gone); post a finding/claim/request/decision; read the board (since=auto: only what is new to you); pickup or take (leased) a handoff; packet: create (text=goal) or render id=h:; agents: the agent tree; dispatch a codex/claude worker (text=task); wait for agents or h: (bounded, call again).",
          "inputSchema": {"type": "object", "required": ["op"], "properties": {
-            "op": {"type": "string", "enum": ["brief", "recall", "note", "post", "read", "pickup", "take", "packet", "agents", "dispatch", "wait"]},
+            "op": {"type": "string", "enum": ["brief", "recall", "note", "check", "post", "read", "pickup", "take", "packet", "agents", "dispatch", "wait"]},
             "q": {"type": "string", "description": "recall or read filter"},
             "text": {"type": "string", "description": "note/post text, packet goal, dispatch task"},
             "kind": {"type": "string", "enum": ["finding", "claim", "request", "decision", "report", "packet"]},
@@ -361,6 +361,12 @@ fn memory_tool(ro: Option<Connection>, a: &Value, budget: usize, cursor: usize) 
                 let o = query::FindOpts { kind: "recall", all: false, budget, limit: FIND_ROWS, offset: cursor };
                 let mut w = warm().lock().unwrap_or_else(|e| e.into_inner());
                 crate::search::find_warm(&mut w, &c, cur.as_ref(), q, &o)
+            }
+            "check" => {
+                let Some(c) = ro else { bail!("no store yet") };
+                let Some(p) = current_project(Some(&c)) else { bail!("not in a project") };
+                let out = crate::memcheck::render(&crate::memcheck::check(&c, &p)?);
+                Ok(crate::hook::cap_lines(&out, budget * 4))
             }
             "note" => {
                 let text = arg_s(a, "text").ok_or_else(|| anyhow::anyhow!("text is required for note"))?;

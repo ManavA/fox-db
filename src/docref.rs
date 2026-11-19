@@ -23,7 +23,7 @@ pub struct Cite {
     pub section_line: usize,
 }
 
-fn is_ident(s: &str) -> bool {
+pub(crate) fn is_ident(s: &str) -> bool {
     let s = s.strip_suffix("()").unwrap_or(s);
     !s.is_empty()
         && s.split("::").flat_map(|p| p.split('.')).all(|seg| {
@@ -32,14 +32,14 @@ fn is_ident(s: &str) -> bool {
         })
 }
 
-fn path_part(s: &str) -> &str {
+pub(crate) fn path_part(s: &str) -> &str {
     match s.rsplit_once(':') {
         Some((p, n)) if !n.is_empty() && n.chars().all(|c| c.is_ascii_digit()) => p,
         _ => s,
     }
 }
 
-fn is_path(s: &str) -> bool {
+pub(crate) fn is_path(s: &str) -> bool {
     let p = path_part(s);
     !p.contains(char::is_whitespace)
         && (p.contains('/')

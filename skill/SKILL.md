@@ -34,7 +34,7 @@ For past decisions, handoffs and long logs: `fox_memory op=recall q=<words>`; `o
 | Where is a symbol, file, doc section, milestone, memory, session | `fox_find(q, kind?)` | `fox find <q> [--kind ...]` |
 | Callers / refs / overrides / conformers / impact | `fox_graph(target, rel)` | `fox code <sym> --rel callers\|...\|impact` |
 | Body, outline, doc section, handoff, session digest | `fox_read(target, mode?)` | `fox code <sym> --rel src\|outline` |
-| Recall, note, board, handoffs | `fox_memory(op)` | `fox mem brief\|post\|read\|pickup` |
+| Recall, note, board, handoffs, stale memory | `fox_memory(op)` | `fox mem brief\|post\|read\|pickup\|check` |
 | What a design doc cites that changed | | `fox drift [doc.md]` |
 | Minimal context for a fresh reviewer | | `fox pack <doc.md>` |
 

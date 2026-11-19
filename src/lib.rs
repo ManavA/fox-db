@@ -19,6 +19,7 @@ pub mod inventory;
 pub mod lang;
 pub mod markdown;
 pub mod mcp;
+pub mod memcheck;
 pub mod orch;
 pub mod outbox;
 pub mod packet;

@@ -21,6 +21,7 @@ pub const USAGE: &str = "usage:
   fox mem brief [--budget TOKENS] [--harness claude|codex]
   fox mem post <text> [--kind finding|claim|request|decision|report] [--title T] [--evidence E]
   fox mem read [query] [--kind K]          fox mem pickup h:ID [--by NAME]
+  fox mem check                            memory lines citing symbols, paths or flags that are gone
   fox drift [doc.md]                       cited symbols/paths changed, moved or vanished since the doc's last commit
   fox pack <doc.md> [--budget TOKENS]      the doc plus skeletons of the code it cites (for a fresh reviewer)
   fox scip import <index.scip> [--project P] [--trust-mtime]   precise tier from a SCIP index your own build produced
@@ -405,6 +406,13 @@ pub fn switch(a: &Args, cwd: &Path) -> anyhow::Result<crate::orch::SwitchCmd> {
         exec: a.flags.contains("exec") && !for_t3,
         for_t3,
     })
+}
+
+/// `fox mem check`: memory lines that cite code which no longer exists (read-only).
+pub fn mem_check(_a: &Args, cwd: &Path) -> anyhow::Result<String> {
+    let Some(c) = db::open_ro() else { anyhow::bail!("no store yet; run `fox index`") };
+    let Some(p) = project::find(&c, &project::locate(cwd))? else { anyhow::bail!("project not indexed; run `fox index`") };
+    Ok(crate::memcheck::render(&crate::memcheck::check(&c, &p)?))
 }
 
 /// `fox drift [doc]` and `fox pack <doc>`.
