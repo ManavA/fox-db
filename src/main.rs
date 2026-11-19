@@ -306,60 +306,78 @@ fn main() -> ExitCode {
             }
         };
     }
-    let r = match verb.first().copied() {
-        Some("find") => cmd_find(&a),
-        Some("status") if a.flags.contains("agents") => db::open_rw().and_then(|w| {
-            foxdb::agents::refresh(&w)?;
-            foxdb::agents::live(&w)
-        }),
-        Some("status") => cmd_status(),
-        Some("agents" | "agent") => cli::agent(&a),
-        Some("handoff") => cli::handoff_cmd(&a, &cwd()),
-        Some("lease") => cli::lease(&a, &cwd()),
-        Some("dispatch") => cli::dispatch(&a, &cwd()),
-        Some("_supervise") => match a.pos.get(1) {
-            Some(id) => foxdb::orch::supervise(id).map(|_| String::new()),
-            None => Ok(String::new()),
-        },
-        Some("stats") => match db::open_ro() {
-            Some(c) => savings::stats(&c),
-            None => Ok("no store yet".into()),
-        },
-        Some("index") => cmd_index(&a),
-        Some("eval") => cli::eval(&a, &cwd()),
-        Some("swarm") => cli::swarm(&a, &cwd()),
-        Some("code") => cmd_code(&a),
-        Some("mem") if matches!(a.pos.get(1).map(String::as_str), Some("post" | "read" | "pickup")) => cli::board(&a, &cwd()),
-        Some("mem") if a.pos.get(1).map(String::as_str) == Some("check") => cli::mem_check(&a, &cwd()),
-        Some("drift" | "pack") => cli::docref(&a, &cwd()),
-        Some("scip") => cli::scip(&a, &cwd()),
-        Some("vectors") => cli::vectors(&a, &cwd()),
-        Some("ingest") if a.pos.get(1).map(String::as_str) == Some("sessions") => cli::ingest(&a),
-        Some("mcp") => foxdb::mcp::serve().map(|_| String::new()),
-        Some("daemon") => match a.pos.get(1).map(String::as_str) {
-            Some("status") => Ok(if foxdb::daemon::ping() {
-                format!("foxd running at {}", foxdb::daemon::socket_path().display())
-            } else {
-                "foxd not running".into()
+    // Short read verbs may open the store lockless in a read-only sandbox (see db::open_ro).
+    let lockless =
+        matches!(verb.first().copied(), Some("find" | "code" | "status" | "stats" | "drift" | "pack")) || verb == ["mem", "check"];
+    if lockless {
+        db::allow_lockless_reads();
+    }
+    let run = || -> Option<anyhow::Result<String>> {
+        Some(match verb.first().copied() {
+            Some("find") => cmd_find(&a),
+            Some("status") if a.flags.contains("agents") => db::open_rw().and_then(|w| {
+                foxdb::agents::refresh(&w)?;
+                foxdb::agents::live(&w)
             }),
-            Some("stop") => Ok(if foxdb::daemon::ping() {
-                foxdb::daemon::shutdown();
-                "foxd stopped".into()
-            } else {
-                "foxd not running".into()
-            }),
-            _ => Ok("usage: fox daemon status|stop   (start it by running foxd)".into()),
-        },
-        Some("watch") => {
-            let target = a.pos.get(1).map(PathBuf::from).unwrap_or_else(cwd);
-            let loc = project::locate(&target);
-            db::open_rw().and_then(|c| project::ensure(&c, &loc)).and_then(|p| watch::run(&p)).map(|_| String::new())
-        }
-        _ => {
-            println!("{USAGE}");
-            return ExitCode::from(2);
-        }
+            Some("status") => cmd_status(),
+            Some("agents" | "agent") => cli::agent(&a),
+            Some("handoff") => cli::handoff_cmd(&a, &cwd()),
+            Some("lease") => cli::lease(&a, &cwd()),
+            Some("dispatch") => cli::dispatch(&a, &cwd()),
+            Some("_supervise") => match a.pos.get(1) {
+                Some(id) => foxdb::orch::supervise(id).map(|_| String::new()),
+                None => Ok(String::new()),
+            },
+            Some("stats") => match db::open_ro() {
+                Some(c) => savings::stats(&c),
+                None => Ok("no store yet".into()),
+            },
+            Some("index") => cmd_index(&a),
+            Some("eval") => cli::eval(&a, &cwd()),
+            Some("swarm") => cli::swarm(&a, &cwd()),
+            Some("code") => cmd_code(&a),
+            Some("mem") if matches!(a.pos.get(1).map(String::as_str), Some("post" | "read" | "pickup")) => cli::board(&a, &cwd()),
+            Some("mem") if a.pos.get(1).map(String::as_str) == Some("check") => cli::mem_check(&a, &cwd()),
+            Some("drift" | "pack") => cli::docref(&a, &cwd()),
+            Some("scip") => cli::scip(&a, &cwd()),
+            Some("vectors") => cli::vectors(&a, &cwd()),
+            Some("ingest") if a.pos.get(1).map(String::as_str) == Some("sessions") => cli::ingest(&a),
+            Some("mcp") => foxdb::mcp::serve().map(|_| String::new()),
+            Some("daemon") => match a.pos.get(1).map(String::as_str) {
+                Some("status") => Ok(if foxdb::daemon::ping() {
+                    format!("foxd running at {}", foxdb::daemon::socket_path().display())
+                } else {
+                    "foxd not running".into()
+                }),
+                Some("stop") => Ok(if foxdb::daemon::ping() {
+                    foxdb::daemon::shutdown();
+                    "foxd stopped".into()
+                } else {
+                    "foxd not running".into()
+                }),
+                _ => Ok("usage: fox daemon status|stop   (start it by running foxd)".into()),
+            },
+            Some("watch") => {
+                let target = a.pos.get(1).map(PathBuf::from).unwrap_or_else(cwd);
+                let loc = project::locate(&target);
+                db::open_rw().and_then(|c| project::ensure(&c, &loc)).and_then(|p| watch::run(&p)).map(|_| String::new())
+            }
+            _ => return None,
+        })
     };
+    let Some(mut r) = run() else {
+        println!("{USAGE}");
+        return ExitCode::from(2);
+    };
+    // A writer checkpointed into the store while a lockless read was under way: what was read may
+    // mix old and new pages. Read once more; if it moves again, say so rather than guess.
+    if db::lockless_changed() {
+        db::reset_lockless();
+        r = run().unwrap_or_else(|| Ok(String::new()));
+        if db::lockless_changed() {
+            r = Err(anyhow::anyhow!("the store changed while being read without locks (read-only sandbox); run the command again"));
+        }
+    }
     match r {
         Ok(s) => {
             if !(s.is_empty() || a.quiet && verb.first() == Some(&"index")) {

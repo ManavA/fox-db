@@ -727,27 +727,21 @@ pub fn open_ro() -> Option<Connection> {
     }
     let ro = || Connection::open_with_flags(&p, OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX).ok();
     let mut c = ro()?;
+    // Agents share this store: a reader may meet a writer's checkpoint, so wait a little.
+    c.busy_timeout(std::time::Duration::from_millis(500)).ok()?;
     // A WAL store needs a `-shm` file even to read. In a read-only sandbox (Codex's read-only and
-    // workspace profiles) the store's directory is not writable, so when no `-shm` exists the
-    // first read fails with "unable to open database file". With no `-wal` holding pages that
-    // are not yet in the main file, the main file is the whole store: open it immutable, which
-    // needs neither file. Never with a non-empty `-wal`: those pages would be invisible.
-    if c.query_row("SELECT COUNT(*) FROM sqlite_master", [], |r| r.get::<_, i64>(0)).is_err() {
-        let wal = std::fs::metadata(home().join("fox.db-wal")).map(|m| m.len()).unwrap_or(0);
-        if wal > 0 {
-            return None;
-        }
-        c = open_immutable(&p)?;
-        let _ = c.pragma_update(None, "temp_store", "MEMORY");
-        return Some(c);
+    // workspace profiles) the first read then fails with "unable to open database file".
+    if let Err(e) = c.query_row("SELECT COUNT(*) FROM sqlite_master", [], |r| r.get::<_, i64>(0))
+        && lockless_applies(&e)
+    {
+        return open_lockless(&p);
     }
     // A store from an older build: read-only callers (MCP-only harnesses have no hook that would
     // open it read-write) migrate it once, then read.
     if c.pragma_query_value(None, "user_version", |r| r.get::<_, i64>(0)).is_ok_and(|v| v < LATEST) && open_rw().is_ok() {
         c = ro()?;
+        c.busy_timeout(std::time::Duration::from_millis(500)).ok()?;
     }
-    // Agents share this store: a reader may meet a writer's checkpoint, so wait a little.
-    c.busy_timeout(std::time::Duration::from_millis(500)).ok()?;
     // Map the file: pages come straight from the OS page cache, shared by every reader process,
     // instead of being copied into each connection's private cache.
     let _ = c.pragma_update(None, "mmap_size", 1i64 << 30);
@@ -755,8 +749,77 @@ pub fn open_ro() -> Option<Connection> {
     Some(c)
 }
 
+static LOCKLESS_OK: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+/// The main file as the first lockless connection of this read found it.
+static LOCKLESS_SNAP: std::sync::Mutex<Option<FileSnap>> = std::sync::Mutex::new(None);
+
+type FileSnap = (u64, Option<std::time::SystemTime>, [u8; 4]);
+
+/// Let [`open_ro`] fall back to a lockless (`immutable=1`) connection. Only a short-lived CLI
+/// read calls this: a lockless connection is a snapshot of the main file, so foxd and the MCP
+/// server, which keep connections for their lifetime, never get one.
+pub fn allow_lockless_reads() {
+    LOCKLESS_OK.store(true, std::sync::atomic::Ordering::SeqCst);
+}
+
+/// Undo [`allow_lockless_reads`].
+pub fn forbid_lockless_reads() {
+    LOCKLESS_OK.store(false, std::sync::atomic::Ordering::SeqCst);
+}
+
+/// Did this process open a lockless connection since the last [`reset_lockless`]?
+pub fn lockless_in_use() -> bool {
+    LOCKLESS_SNAP.lock().unwrap_or_else(|e| e.into_inner()).is_some()
+}
+
+/// Has the main file changed since the first lockless connection opened (a writer started after
+/// the `-wal` check and checkpointed)? Then what was read may mix old and new pages.
+pub fn lockless_changed() -> bool {
+    let snap = *LOCKLESS_SNAP.lock().unwrap_or_else(|e| e.into_inner());
+    snap.is_some_and(|s| file_snap(&db_path()) != Some(s))
+}
+
+/// Forget the lockless snapshot, so the next [`open_ro`] decides afresh.
+pub fn reset_lockless() {
+    *LOCKLESS_SNAP.lock().unwrap_or_else(|e| e.into_inner()) = None;
+}
+
+/// Size, mtime and the header's file change counter (offset 24) of the main file.
+fn file_snap(p: &std::path::Path) -> Option<FileSnap> {
+    use std::io::{Read, Seek, SeekFrom};
+    let mut f = std::fs::File::open(p).ok()?;
+    let md = f.metadata().ok()?;
+    let mut counter = [0u8; 4];
+    f.seek(SeekFrom::Start(24)).ok()?;
+    f.read_exact(&mut counter).ok()?;
+    Some((md.len(), md.modified().ok(), counter))
+}
+
+/// The lockless fallback applies only when all hold: the caller allowed it, SQLite could not open
+/// the store's side files (SQLITE_CANTOPEN), the store's directory is not writable, and no
+/// `-wal` holds pages that are not yet in the main file (a lockless reader would not see them).
+fn lockless_applies(e: &rusqlite::Error) -> bool {
+    let cant_open = matches!(e, rusqlite::Error::SqliteFailure(f, _) if f.code == rusqlite::ErrorCode::CannotOpen);
+    let wal = std::fs::metadata(home().join("fox.db-wal")).map(|m| m.len()).unwrap_or(0);
+    LOCKLESS_OK.load(std::sync::atomic::Ordering::SeqCst) && cant_open && wal == 0 && !dir_writable(&home())
+}
+
+/// Can this process create a file in `dir`? Tried, not inferred from mode bits: a sandbox denies
+/// writes the permissions allow.
+fn dir_writable(dir: &std::path::Path) -> bool {
+    let probe = dir.join(format!(".fox-write-probe-{}", std::process::id()));
+    match std::fs::OpenOptions::new().write(true).create_new(true).open(&probe) {
+        Ok(_) => {
+            let _ = std::fs::remove_file(&probe);
+            true
+        }
+        Err(e) => e.kind() == std::io::ErrorKind::AlreadyExists,
+    }
+}
+
 /// `path` opened `immutable=1`: SQLite reads the main file only, with no locks, `-shm` or `-wal`.
-fn open_immutable(path: &std::path::Path) -> Option<Connection> {
+/// It cannot migrate, so a store from an older build is refused with a message saying so.
+fn open_lockless(path: &std::path::Path) -> Option<Connection> {
     let mut uri = String::from("file:");
     for ch in path.to_string_lossy().chars() {
         match ch {
@@ -767,10 +830,24 @@ fn open_immutable(path: &std::path::Path) -> Option<Connection> {
         }
     }
     uri.push_str("?mode=ro&immutable=1");
+    let snap = file_snap(path)?;
     let c =
         Connection::open_with_flags(uri, OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_URI | OpenFlags::SQLITE_OPEN_NO_MUTEX)
             .ok()?;
-    c.query_row("SELECT COUNT(*) FROM sqlite_master", [], |r| r.get::<_, i64>(0)).ok()?;
+    let v: i64 = c.pragma_query_value(None, "user_version", |r| r.get(0)).ok()?;
+    if v < LATEST {
+        static SAID: std::sync::Once = std::sync::Once::new();
+        SAID.call_once(|| {
+            eprintln!(
+                "fox: the store at {} is from an older build (schema {v}, this build needs {LATEST}) and cannot be upgraded \
+                 from a read-only sandbox; run any fox command outside the sandbox once",
+                path.display()
+            )
+        });
+        return None;
+    }
+    let _ = c.pragma_update(None, "temp_store", "MEMORY");
+    LOCKLESS_SNAP.lock().unwrap_or_else(|e| e.into_inner()).get_or_insert(snap);
     Some(c)
 }
 

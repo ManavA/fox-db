@@ -172,47 +172,141 @@ fn concurrent_openers_of_a_v4_store_migrate_once_and_keep_every_match() {
     assert_eq!(matches(&c, "fts_trigram", "\"src/w\""), N);
 }
 
-/// A read-only sandbox (`codex sandbox`, workspace profiles) cannot create the `-shm` file a WAL
-/// store needs, so a plain read-only open fails with "unable to open database file". With no
-/// `-wal` holding pending pages, the store opens immutable instead, and `fox find` answers
-/// directly when the daemon socket cannot be reached.
-#[test]
+/// A store indexed under `home`, closed, so no `-wal` or `-shm` remains.
 #[cfg(unix)]
-fn a_read_only_store_without_wal_opens_immutable() {
-    use std::os::unix::fs::PermissionsExt;
-    let _g = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
-    let (home, repo) = setup();
-    write(repo.path(), "src/lib.rs", "pub fn sandbox_reader_target() {}\n");
+fn closed_store(home: &Path, repo: &Path) {
+    write(repo, "src/lib.rs", "pub fn sandbox_reader_target() {}\n");
     {
         let mut c = db::open_rw().unwrap();
-        let p = project::ensure(&c, &project::locate(repo.path())).unwrap();
+        let p = project::ensure(&c, &project::locate(repo)).unwrap();
         inventory::index_project(&mut c, &p).unwrap();
         foxdb::tsindex::index_project(&mut c, &p).unwrap();
     }
-    let side = |ext: &str| home.path().join(format!("fox.db-{ext}"));
+    let side = |ext: &str| home.join(format!("fox.db-{ext}"));
     assert!(!side("wal").exists() && !side("shm").exists(), "closing the last connection leaves no -wal or -shm");
-    // A socket path the sandbox cannot use: the CLI must fall back to answering directly.
+}
+
+#[cfg(unix)]
+fn set_mode(dir: &Path, mode: u32) {
+    use std::os::unix::fs::PermissionsExt;
+    fs::set_permissions(dir, fs::Permissions::from_mode(mode)).unwrap();
+}
+
+#[cfg(unix)]
+fn fox_find(home: &Path, repo: &Path) -> std::process::Output {
+    std::process::Command::new(env!("CARGO_BIN_EXE_fox"))
+        .args(["find", "sandbox_reader_target"])
+        .current_dir(repo)
+        .env("FOXDB_HOME", home)
+        .env("FOXDB_CLAUDE_PROJECTS", home.join("no-claude"))
+        .env_remove("FOXDB_NO_DAEMON")
+        .output()
+        .unwrap()
+}
+
+/// A read-only sandbox (`codex sandbox`, workspace profiles) cannot create the `-shm` file a WAL
+/// store needs, so a plain read-only open fails with "unable to open database file". A
+/// short-lived CLI read with no `-wal` holding pending pages opens the store lockless
+/// (`immutable=1`) instead, and `fox find` answers directly when the daemon socket cannot be
+/// reached. Long-lived holders (foxd, the MCP server) never get a lockless connection: it would
+/// keep a frozen snapshot past the next checkpoint.
+#[test]
+#[cfg(unix)]
+fn a_read_only_store_without_wal_opens_lockless_for_cli_reads_only() {
+    let _g = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    let (home, repo) = setup();
+    closed_store(home.path(), repo.path());
     fs::write(home.path().join("foxd.sock"), "").unwrap();
-    fs::set_permissions(home.path(), fs::Permissions::from_mode(0o555)).unwrap();
+    set_mode(home.path(), 0o555);
+    // Without the CLI's opt-in (the daemon, the MCP server): no lockless fallback.
+    db::reset_lockless();
+    db::forbid_lockless_reads();
+    let plain = db::open_ro().map(|c| project::find(&c, &project::locate(repo.path())).is_ok());
+    let plain_lockless = db::lockless_in_use();
+    db::allow_lockless_reads();
     let c = db::open_ro();
     let found = c.as_ref().map(|c| project::find(c, &project::locate(repo.path())).map(|p| p.is_some()));
     drop(c);
-    let out = std::process::Command::new(env!("CARGO_BIN_EXE_fox"))
-        .args(["find", "sandbox_reader_target"])
-        .current_dir(repo.path())
-        .env("FOXDB_HOME", home.path())
-        .env("FOXDB_CLAUDE_PROJECTS", home.path().join("no-claude"))
-        .env_remove("FOXDB_NO_DAEMON")
-        .output()
-        .unwrap();
-    let shm_after = side("shm").exists();
-    fs::set_permissions(home.path(), fs::Permissions::from_mode(0o700)).unwrap();
-    assert!(matches!(found, Some(Ok(true))), "read-only open of a store in an unwritable dir: {found:?}");
+    db::reset_lockless();
+    let out = fox_find(home.path(), repo.path());
+    let shm_after = home.path().join("fox.db-shm").exists();
+    set_mode(home.path(), 0o700);
+    assert!(plain != Some(true) && !plain_lockless, "a long-lived holder got a lockless connection");
+    assert!(matches!(found, Some(Ok(true))), "lockless open of a store in an unwritable dir: {found:?}");
     let stdout = String::from_utf8_lossy(&out.stdout);
     assert!(
         out.status.success() && stdout.contains("src/lib.rs"),
         "fox find in a read-only store: {stdout}{}",
         String::from_utf8_lossy(&out.stderr)
     );
-    assert!(!shm_after, "an immutable reader writes nothing");
+    assert!(!shm_after, "a lockless reader writes nothing");
+}
+
+/// A writable store directory never falls back, whatever the first read says.
+#[test]
+#[cfg(unix)]
+fn a_writable_store_never_opens_lockless() {
+    let _g = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    let (home, repo) = setup();
+    closed_store(home.path(), repo.path());
+    db::reset_lockless();
+    db::allow_lockless_reads();
+    let c = db::open_ro().unwrap();
+    assert!(!db::lockless_in_use(), "lockless connection for a writable store");
+    // It sees writes made after it opened: not a frozen snapshot.
+    let n = |c: &Connection| c.query_row("SELECT COUNT(*) FROM project", [], |r| r.get::<_, i64>(0)).unwrap();
+    let before = n(&c);
+    let other = tempfile::tempdir().unwrap();
+    let w = db::open_rw().unwrap();
+    project::ensure(&w, &project::locate(other.path())).unwrap();
+    assert_eq!(n(&c), before + 1);
+}
+
+/// The main file changing under a lockless read (a writer checkpointing after the `-wal` check)
+/// is detected, so the CLI reads again instead of answering from torn pages.
+#[test]
+#[cfg(unix)]
+fn a_store_that_changes_under_a_lockless_read_is_detected() {
+    let _g = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    let (home, repo) = setup();
+    closed_store(home.path(), repo.path());
+    set_mode(home.path(), 0o555);
+    db::reset_lockless();
+    db::allow_lockless_reads();
+    let c = db::open_ro();
+    let in_use = db::lockless_in_use();
+    let unchanged = !db::lockless_changed();
+    set_mode(home.path(), 0o700);
+    assert!(c.is_some() && in_use && unchanged);
+    drop(c);
+    std::thread::sleep(std::time::Duration::from_millis(20));
+    {
+        let other = tempfile::tempdir().unwrap();
+        let w = db::open_rw().unwrap();
+        project::ensure(&w, &project::locate(other.path())).unwrap();
+        w.execute_batch("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
+    }
+    assert!(db::lockless_changed(), "a checkpoint into the main file went unnoticed");
+    db::reset_lockless();
+    assert!(!db::lockless_in_use() && !db::lockless_changed());
+}
+
+/// A lockless reader cannot migrate: a store from an older build is refused with a clear
+/// message, never read with the wrong schema.
+#[test]
+#[cfg(unix)]
+fn a_lockless_read_of_an_older_store_is_refused_clearly() {
+    let _g = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    let (home, repo) = setup();
+    closed_store(home.path(), repo.path());
+    {
+        let c = Connection::open(db::db_path()).unwrap();
+        c.pragma_update(None, "user_version", db::LATEST - 1).unwrap();
+    }
+    set_mode(home.path(), 0o555);
+    let out = fox_find(home.path(), repo.path());
+    set_mode(home.path(), 0o700);
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(!out.status.success(), "{}", String::from_utf8_lossy(&out.stdout));
+    assert!(err.contains("older build") && err.contains("outside the sandbox"), "{err}");
 }

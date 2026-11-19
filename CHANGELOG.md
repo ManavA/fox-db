@@ -63,10 +63,15 @@ First answers that were empty, wrong or padded in agent benchmark transcripts ar
 - `fox_read` with no mode returns a symbol's body, and for a file its declarations with the last
   line of each (`..N`) and how to read one. File outlines count fields instead of listing them;
   a type's own outline lists its fields.
-- In a read-only sandbox (`codex sandbox` read-only and workspace profiles) `fox find` no longer
-  fails with "unable to open database file": when the store's directory cannot hold the `-shm`
-  file and no `-wal` holds unmerged pages, the store opens `immutable=1`. A daemon socket the
-  sandbox cannot reach falls back to answering directly, as before.
+- In a read-only sandbox (`codex sandbox` read-only and workspace profiles) `fox find`, `fox code`,
+  `status`, `stats`, `drift`, `pack` and `mem check` no longer fail with "unable to open database
+  file". When SQLite cannot open the store's side files, the store's directory is not writable
+  and no `-wal` holds unmerged pages, these short CLI reads open the store `immutable=1`. If the
+  main file changes during the read (a writer outside the sandbox checkpointed), the command reads
+  once more, then says so instead of answering from mixed pages. A store from an older build is
+  refused with a message to run fox once outside the sandbox. foxd and the MCP server, which keep
+  connections open, never use this mode. A daemon socket the sandbox cannot reach falls back to
+  answering directly, as before.
 - `fox_read` no longer answers a repeat with `= already sent in this session`. One `fox mcp`
   process serves a Claude Code session and all its subagents (tool calls carry no agent
   identity) and outlives compactions, so the reference pointed subagents and compacted sessions
