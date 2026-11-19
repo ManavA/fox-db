@@ -18,6 +18,12 @@ First answers that were empty, wrong or padded in agent benchmark transcripts ar
   files or docs that hold it; rows that only share one of its words (docs matching `contains` for
   `IContains`) or only neighbour it in the call graph (the callees of `exec_simple_query`) are
   left out.
+- Answers carry code. `callers` and `refs` rows end in the call site's line (`  :338 Caller c:1f | return f(x)`),
+  or list one `   :line | code` row per site for a caller with several; `impact` rows end in the
+  dependent's definition line. When the code would push an answer past its budget and the
+  locations alone fit, the code is left out with a line saying which budget shows it.
+- `fox_read` with no mode returns a symbol's body, and for a file its declarations with the last
+  line of each (`..N`) and how to read one.
 
 ## 0.2.2 (2026-11-18)
 

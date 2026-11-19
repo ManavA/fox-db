@@ -1090,7 +1090,7 @@ fn nested_definitions_locals_and_outside_imports_do_not_claim_calls() {
     ]);
     let out = fox_code(&p, "py4/m.py", "outline", 800);
     let id = |out: &str, line: &str| -> String {
-        out.lines().find(|l| l.starts_with(line)).unwrap().split_whitespace().last().unwrap().to_string()
+        out.lines().find(|l| l.starts_with(line)).unwrap().split_whitespace().find(|w| w.starts_with("c:")).unwrap().to_string()
     };
     let parse = id(&out, "1 function parse");
     let out = fox_code(&p, &parse, "callers", 800);
@@ -1276,4 +1276,57 @@ fn find_by_exact_name_drops_padding() {
     let out = foxdb::query::find(&c, Some(&p), "exec_simple_query", &o).unwrap();
     assert!(out.lines().next().unwrap_or("").contains("function exec_simple_query  postgres.c:3"), "{out}");
     assert!(!out.contains("helper_a") && !out.contains("helper_b"), "{out}");
+}
+
+// ---- answers carry code ----
+
+/// Each caller row carries its call site's code: inline after ` | ` for one site, one
+/// `   :line | code` row per site for several. An answer whose code would not fit the budget
+/// drops the code (and says so) when the locations alone fit.
+#[test]
+fn callers_rows_carry_the_call_site_code() {
+    let _g = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    let (_h, _r, p) = inline_project(&[
+        (
+            "kernel/core.c",
+            "int wake_task(int p) { return p; }\nint run(void) {\n    int a = wake_task(1);\n    return wake_task(a) + 1;\n}\n",
+        ),
+        ("kernel/kthread.c", "int kthread_start(void)\n{\n\treturn   wake_task(0);\n}\n"),
+    ]);
+    let out = fox_code(&p, "wake_task", "callers", 800);
+    assert!(out.contains("  :3 kthread_start c:") && out.contains(" | return   wake_task(0);"), "{out}");
+    assert!(out.contains("  :3,4 run c:"), "{out}");
+    assert!(out.contains("\n   :3 | int a = wake_task(1);\n   :4 | return wake_task(a) + 1;\n"), "{out}");
+    // Impact rows carry the dependent's definition line.
+    let out = fox_code(&p, "wake_task", "impact", 800);
+    assert!(out.contains(":2 run c:") && out.contains(" | int run(void) {"), "{out}");
+    // A budget the code does not fit in: locations only, and a note.
+    let out = fox_code(&p, "wake_task", "callers", 66);
+    assert!(out.len() <= 66 * 4 + 80, "{} bytes: {out}", out.len());
+    assert!(out.contains("kthread_start") && !out.contains(" | ") && out.contains("code left out to fit the budget"), "{out}");
+}
+
+/// `fox_read` of a symbol name returns its body; of a file, its declarations with the line
+/// range of each and how to read one.
+#[test]
+fn fox_read_returns_bodies_and_outlines_with_ranges() {
+    let _g = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    let (_h, r, _p) = inline_project(&[(
+        "pkg/shapes.py",
+        "class Circle:\n    radius = 1\n\n    def area(self):\n        return 3 * self.radius ** 2\n\n\ndef unit():\n    return Circle()\n",
+    )]);
+    std::env::set_current_dir(r.path()).unwrap();
+    let call = |args: serde_json::Value| -> String {
+        let r = foxdb::mcp::handle(
+            &serde_json::json!({"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"fox_read","arguments":args}}),
+        )
+        .unwrap();
+        r["result"]["content"][0]["text"].as_str().unwrap().to_string()
+    };
+    let out = call(serde_json::json!({"target": "Circle.area", "fresh": true}));
+    assert!(out.contains("pkg/shapes.py:4-5") && out.contains("return 3 * self.radius ** 2"), "{out}");
+    let out = call(serde_json::json!({"target": "pkg/shapes.py", "fresh": true}));
+    assert!(out.contains("1 class Circle c:") && out.contains(" ..5"), "{out}");
+    assert!(out.contains(" 4 method area c:") && out.contains("8 function unit c:"), "{out}");
+    assert!(out.contains("fox_read target=<handle> for one body, or lines=a-b"), "{out}");
 }

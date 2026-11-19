@@ -141,7 +141,13 @@ pub fn qual_matches_at(path: &str, parent: Option<&str>, qual: &str) -> Option<b
 /// A site whose target was guessed by name among several same-name definitions ends in
 /// `guess 1 of N`; one guessed among more than [`WEAK_GUESS`] is only counted. Returns (sites,
 /// their files, guessed sites, weak guesses left out).
-fn sites(c: &Connection, targets: &[i64], calls_only: bool, lines: &mut Vec<String>) -> Result<(usize, HashSet<String>, usize, usize)> {
+fn sites(
+    c: &Connection,
+    root: &std::path::Path,
+    targets: &[i64],
+    calls_only: bool,
+    lines: &mut Vec<String>,
+) -> Result<(usize, HashSet<String>, usize, usize)> {
     let ids = targets.iter().map(i64::to_string).collect::<Vec<_>>().join(",");
     let kind = if calls_only { "AND r.kind = 'call'" } else { "" };
     let sql = format!(
@@ -203,20 +209,88 @@ fn sites(c: &Connection, targets: &[i64], calls_only: bool, lines: &mut Vec<Stri
         }
     }
     let files: HashSet<String> = by.keys().cloned().collect();
+    let mut src = SrcLines::new(root, n <= CODE_SITES_MAX);
     group_by_dir(
         by.into_iter().map(|(path, v)| {
             let count: usize = v.iter().map(|x| x.1.len()).sum();
-            let rows = v
-                .into_iter()
-                .map(|(who, ls, amb)| {
-                    format!("  :{} {who}{}", ls.iter().map(i64::to_string).collect::<Vec<_>>().join(","), guess_note(amb))
-                })
-                .collect();
+            let mut rows = vec![];
+            for (who, ls, amb) in v {
+                let head = format!("  :{} {who}{}", ls.iter().map(i64::to_string).collect::<Vec<_>>().join(","), guess_note(amb));
+                match ls.as_slice() {
+                    [one] => rows.push(src.with_code(head, &path, *one)),
+                    _ => {
+                        rows.push(head);
+                        rows.extend(ls.iter().filter_map(|l| src.line(&path, *l).map(|code| format!("   :{l} | {code}"))));
+                    }
+                }
+            }
             (path, count, rows)
         }),
         lines,
     );
     Ok((n, files, guessed, weak))
+}
+
+/// Most sites or dependents whose code an answer carries; past this, rows are locations only.
+const CODE_SITES_MAX: usize = 400;
+/// Longest code shown on a row.
+const CODE_CHARS: usize = 140;
+
+/// Source lines of the files an answer cites, each file read once.
+struct SrcLines<'a> {
+    root: &'a std::path::Path,
+    on: bool,
+    files: HashMap<String, Option<Vec<String>>>,
+}
+
+impl<'a> SrcLines<'a> {
+    fn new(root: &'a std::path::Path, on: bool) -> Self {
+        SrcLines { root, on, files: HashMap::new() }
+    }
+
+    /// Line `n` of `path`, trimmed and clipped; None when off, unreadable or blank.
+    fn line(&mut self, path: &str, n: i64) -> Option<String> {
+        if !self.on || n < 1 {
+            return None;
+        }
+        let root = self.root;
+        let f = self.files.entry(path.to_string()).or_insert_with(|| {
+            crate::guard::read_text(&root.join(path), path, 4 << 20, false).map(|t| t.lines().map(str::to_string).collect())
+        });
+        let l = f.as_ref()?.get(n as usize - 1)?.trim();
+        (!l.is_empty()).then(|| clip(l, CODE_CHARS))
+    }
+
+    /// `row | code` when line `n` of `path` has code, else `row`.
+    fn with_code(&mut self, row: String, path: &str, n: i64) -> String {
+        match self.line(path, n) {
+            Some(code) => format!("{row} | {code}"),
+            None => row,
+        }
+    }
+}
+
+/// Code rows (`   :line | code`) and inline code (`  :line Caller c:h | code`) make an answer
+/// longer. When the answer with code exceeds the budget but its locations alone fit, send the
+/// locations and say how much budget the code needs; otherwise keep the code and page.
+fn fit_code(lines: &mut Vec<String>, budget: usize) {
+    let room = budget.clamp(32, 4000) * 4 - 64;
+    let size = |v: &[String]| v.iter().map(|l| l.len() + 1).sum::<usize>();
+    let full = size(lines);
+    if full <= room {
+        return;
+    }
+    let mut plain: Vec<String> = lines.iter().filter(|l| !(l.starts_with("   :") && l.contains(" | "))).cloned().collect();
+    for l in plain.iter_mut().filter(|l| l.starts_with("  :")) {
+        if let Some((a, _)) = l.split_once(" | ") {
+            *l = a.to_string();
+        }
+    }
+    if size(&plain) < full && size(&plain) <= room {
+        let need = (full + 64).div_ceil(4).min(4000);
+        plain.push(format!("code left out to fit the budget; budget={need} shows it"));
+        *lines = plain;
+    }
 }
 
 /// A guess among more same-name definitions than this says nothing about which one is meant
@@ -406,7 +480,7 @@ pub fn run(c: &Connection, p: &Project, sym: &str, rel: &str, depth: usize, curs
             let calls = rel == "callers" && is_callable_kind(&top.kind);
             lines.push(format!("{rel} of {}", top.row()));
             let at = lines.len();
-            let (n, files, guessed, weak) = sites(c, &[top.id], calls, &mut lines)?;
+            let (n, files, guessed, weak) = sites(c, &p.root, &[top.id], calls, &mut lines)?;
             let g = if guessed > 0 { format!(", {guessed} guessed by name") } else { String::new() } + &weak_note(weak);
             lines.insert(at, format!("{n} {} in {} files{g}", if calls { "call sites" } else { "refs" }, files.len()));
             if let Some(l) = completeness(c, p.id, top, &files, calls, "may be incomplete")? {
@@ -468,7 +542,7 @@ pub fn run(c: &Connection, p: &Project, sym: &str, rel: &str, depth: usize, curs
                 lines.push(format!("{}\t{}", i + 1, clip(l, 220)));
             }
         }
-        "impact" => impact(c, p.id, top, depth, &mut lines)?,
+        "impact" => impact(c, p.id, &p.root, top, depth, &mut lines)?,
         "overrides" if is_callable_kind(&top.kind) => method_overrides(c, p.id, top, &mut lines)?,
         "conforms" | "subtypes" | "extensions" | "overrides" => {
             // Supertype references (`reference.implementation` / `reference.class`) resolved to this type.
@@ -483,6 +557,9 @@ pub fn run(c: &Connection, p: &Project, sym: &str, rel: &str, depth: usize, curs
         _ => bail!("unsupported --rel {rel}"),
     }
     lines.push("~ tree-sitter, name-resolved".into());
+    if matches!(rel, "callers" | "refs" | "impact") {
+        fit_code(&mut lines, budget);
+    }
     Ok(Some(page(&lines, cursor, budget)))
 }
 
@@ -581,7 +658,7 @@ fn merge_disp(a: &mut Disp, b: Disp) {
 /// makes its file a dependent; it has no symbol to expand further. Lines starting `partial` say
 /// where the answer may be missing something: names used in files it does not list, dependents
 /// found only through name guesses, or a walk that stopped early.
-fn impact(c: &Connection, pid: i64, top: &TSym, depth: usize, lines: &mut Vec<String>) -> Result<()> {
+fn impact(c: &Connection, pid: i64, root: &std::path::Path, top: &TSym, depth: usize, lines: &mut Vec<String>) -> Result<()> {
     let mut guess: HashMap<i64, Guess> = HashMap::from([(top.id, None)]);
     let mut top_seen: HashSet<String> = HashSet::new();
     let mut frontier = vec![top.id];
@@ -771,12 +848,14 @@ fn impact(c: &Connection, pid: i64, top: &TSym, depth: usize, lines: &mut Vec<St
     if let Some(d) = weak.iter().min() {
         lines.push(format!("partial at d{}: {}", d + 1, weak_left_out(weak_n)));
     }
+    let mut src = SrcLines::new(root, nsyms <= CODE_SITES_MAX);
     for (d, (lvl, v)) in levels.iter().zip(syms).enumerate() {
         lines.push(format!("d{}", d + 1));
         let mut by: BTreeMap<String, Vec<(i64, String)>> = BTreeMap::new();
         for s in v {
             let mark = guess_mark(guess.get(&s.id).copied().flatten()) + disp.get(&s.id).cloned().flatten().as_deref().unwrap_or("");
-            by.entry(s.path.clone()).or_default().push((s.line, format!("  :{} {} {}{mark}", s.line, s.qname(), s.h())));
+            let row = src.with_code(format!("  :{} {} {}{mark}", s.line, s.qname(), s.h()), &s.path, s.line);
+            by.entry(s.path.clone()).or_default().push((s.line, row));
         }
         for (path, (ls, g)) in &lvl.tops {
             let at = ls.iter().map(i64::to_string).collect::<Vec<_>>().join(",");
@@ -1169,10 +1248,12 @@ fn outline_file(c: &Connection, p: &Project, rel: &str, cursor: usize, budget: u
     if v.is_empty() {
         return Ok(None);
     }
-    let mut lines = vec![format!("~outline {rel} ({} symbols)", v.len())];
+    let mut lines =
+        vec![format!("~outline {rel} ({} symbols; ..N = last line; fox_read target=<handle> for one body, or lines=a-b)", v.len())];
     for s in &v {
         let depth = s.parent.as_deref().map(|x| x.matches('.').count() + 1).unwrap_or(0);
-        lines.push(format!("{}{} {} {} {}", " ".repeat(depth), s.line, s.kind, s.name, s.h()));
+        let end = if s.end_line > s.line { format!(" ..{}", s.end_line) } else { String::new() };
+        lines.push(format!("{}{} {} {} {}{end}", " ".repeat(depth), s.line, s.kind, s.name, s.h()));
     }
     Ok(Some(page(&lines, cursor, budget)))
 }

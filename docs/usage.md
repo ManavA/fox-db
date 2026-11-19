@@ -124,26 +124,23 @@ $ fox index .
 foxdb: 166 files seen, 166 changed, 0 removed, 123 sections (0 milestone), 0 summary dirs in 71 ms; global memory notes: 0; tree-sitter: 99 files, 99 parsed, 0 unchanged, 0 removed, 1437 symbols, 16278 refs (16257 scored, 4642 resolved), 1027 ms
 
 $ fox code name_of --rel callers --budget 120
-callers of ~c:33e function name_of  src/tiers.rs:144
-2 call sites in 1 files
+callers of ~c:65e function name_of  src/tiers.rs:143
+3 call sites in 1 files
 src/
- tiers.rs (2)
-  :190 classify_dir c:344
-  :213 classify_file c:345
+ tiers.rs (3)
+  :193 is_build_output c:668 | if name_of(rel) != "target" {
+  :227 classify_dir c:66b | let name = name_of(rel);
+  :250 classify_file c:66c | let name = name_of(rel);
 ~ tree-sitter, name-resolved
 
 $ fox code src/tiers.rs --rel outline --budget 70     # a path outlines the whole file
-~outline src/tiers.rs (15 symbols)
-11 enum Tier c:33c
-90 function is_secret_name c:33d
-144 function name_of c:33e
-151 struct Overrides c:33f
-157 struct OverrideFile c:340
- 165 method load c:341
- 170 method hit c:342
-175 function build c:343
-189 function classify_dir c:344
-+6 more (answer cut) · cursor=10
+~outline src/tiers.rs (23 symbols; ..N = last line; fox_read target=<handle> for one body, or lines=a-b)
+11 enum Tier c:65c ..20
+89 function is_secret_name c:65d ..141
+143 function name_of c:65e ..145
+150 struct Overrides c:65f ..153
+ 151 field skip c:660
++18 more (answer cut) · cursor=6
 
 $ fox code c:345 --rel callees
 callees of ~c:345 function classify_file  src/tiers.rs:212
@@ -157,11 +154,12 @@ src/
 ~ tree-sitter, name-resolved
 
 $ fox code is_secret_name --rel impact   # transitive dependents, grouped by depth and file
-impact of ~c:33d function is_secret_name  src/tiers.rs:90: 2 symbols; per depth 2/0
+impact of ~c:65d function is_secret_name  src/tiers.rs:89: 2 symbols; per depth 2/0
+partial at d1: `is_secret_name` also appears in 3 other files; confirm with: rg -nw is_secret_name
 d1
  src/tiers.rs
-  :212 classify_file c:345
-  :239 is_denied_path c:346
+  :249 classify_file c:66c | pub fn classify_file(rel: &str, size: u64, ov: &Overrides) -> Tier {
+  :276 is_denied_path c:66d | pub fn is_denied_path(rel: &str) -> bool {
 d2
 ~ tree-sitter, name-resolved
 
@@ -221,7 +219,9 @@ Example exchange:
 
 - Every row starts with a handle: `s:` symbol (index store), `c:` tree-sitter symbol, `f:` file, `d:` doc section, `m:` milestone, `a:` summarized dir, `g:` memory, `x:` session, `h:` handoff. Every row ends in an exact `path:line`. Pass a handle (or a `Type.member` name) to `fox_graph` / `fox_read` / `fox code`.
 - `budget` is in tokens (default 500, max 4000). Search answers shrink gracefully: a page that fits as full rows is sent whole; otherwise the top five rows are sent in the richest form they fit (full, else skeleton: handle, kind, name, `path:line`, else ids: handle, `path:line`), with a `cursor` for the rest. A shorter form says so in the footer, and `fox_read <handle>` expands a row. A tight budget never trades the best rows' detail for a long tail of ids.
-- A large `fox_read` answer this session already received comes back as one line, `= already sent in this session: <handle> ...`; `fresh=true` resends it. The CLI does the same for `fox code --rel src|outline` when `FOXDB_SESSION` is set (`--fresh` resends); through `foxd` the client sends its own session with each request. This covers foxdb's own answers only. Rows are terse: relative paths, each directory and file printed once as a header, line numbers instead of code (ask `src` for code).
+- A large `fox_read` answer this session already received comes back as one line, `= already sent in this session: <handle> ...`; `fresh=true` resends it. The CLI does the same for `fox code --rel src|outline` when `FOXDB_SESSION` is set (`--fresh` resends); through `foxd` the client sends its own session with each request. This covers foxdb's own answers only. Rows are terse: relative paths, each directory and file printed once as a header.
+- Graph answers carry code. A `callers` or `refs` row with one site ends in ` | ` and that line's code; a caller with several sites is followed by one `   :line | code` row per site. An `impact` row ends in the dependent's definition line. Code is trimmed to 140 characters. When the answer with code exceeds the budget but its locations alone fit, the locations are sent with a last line `code left out to fit the budget; budget=N shows it`; otherwise the code stays and the answer pages. Answers with more than 400 sites or dependents carry no code.
+- `fox_read` with no `mode`: a path returns its declarations (`line kind name handle ..last line`, a header saying how to read one), a symbol name or handle returns its body.
 - A footer `+N more · cursor=K` or `+N more (answer cut) · cursor=K` means the answer is incomplete as shown: call again with `cursor=K` for the next page. Narrow the query before raising the budget.
 - `~` on a row means not compiler-resolved: a tree-sitter result, or a Swift symbol whose file changed since the last build (lines may have drifted; `src` relocates by name).
 

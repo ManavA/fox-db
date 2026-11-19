@@ -294,8 +294,12 @@ fn read_tool(ro: Option<Connection>, a: &Value, budget: usize, cursor: usize) ->
             {
                 return file_lines(&p.root, t, f, e, a, "file".into());
             }
+            // No mode: a path's declarations, a symbol's body.
+            let is_path = t.contains('/') && crate::lang::for_path(t).is_some() || p.root.join(t).is_file();
             let rel = match mode {
-                "outline" | "" => "outline",
+                "" if is_path => "outline",
+                "" => "src",
+                "outline" => "outline",
                 "body" | "signature" => "src",
                 "section" => "src",
                 "context" => "callers",
