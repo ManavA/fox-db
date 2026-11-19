@@ -6,21 +6,32 @@ First answers that were empty, wrong or padded in agent benchmark transcripts ar
 
 - A Go target qualified by its package resolves: `pod.GetContainerStatus`, the repo path
   `pkg/api/v1/pod.GetContainerStatus` or the full import path. `fox_find` takes the same names.
-  A qualifier may also be a dotted Python or JS module (`pkg.fields.json.JSONField`).
+  A qualifier may also be a dotted Python or JS module (`pkg.fields.json.JSONField`). Every
+  segment must match (`pkga.Server.Start` is pkga's, Java `p.A.run` is p/A's), an import path
+  prefers the longest directory match (`vendor/github.com/acme/pod` over a lone `pod/`), and a
+  Go file stem is never a package.
 - `overrides` of a method lists the same-name methods of its subtypes at any depth, and the
   methods it overrides, instead of the types that reference it (`Field.get_db_prep_value` said 0;
   it now lists 16).
 - Struct and class fields are symbols of kind `field` in Go, C, C++, Rust, Java, C#, TypeScript,
   JavaScript and Python, so `fox_find ContainerLogMaxWorkers` finds the struct field first.
-  Fields are never call or reference targets, so callers of a same-name function stay certain.
-  Files of those grammars parse again once (store schema 20).
+  Fields are never call or reference targets, so callers of a same-name function stay certain;
+  `callers`, `refs` and `impact` of a field say its uses are not tracked and list the files that
+  name it. A JS/TS class field holding an arrow function is a method. Files of those grammars
+  and PHP parse again once (store schema 20), and when that is most of a project the full-text
+  tables are merged at the end, so an upgraded store is no larger than a fresh one.
 - When an identifier names a symbol, `fox_find` returns that symbol, names that contain it and
   files or docs that hold it; rows that only share one of its words (docs matching `contains` for
   `IContains`) or only neighbour it in the call graph (the callees of `exec_simple_query`) are
-  left out.
+  left out. Doc sections holding a snake_case name (`get_user`) stay. One lookup checks all
+  rows at once.
+- When the name occurs in files an answer could not resolve, `callers`, `refs` and `impact` no
+  longer ask for `rg`: up to 15 such files are listed at the end as `unresolved mentions`
+  (`path:line | code`); more are counted.
 - Answers carry code. `callers` and `refs` rows end in the call site's line (`  :338 Caller c:1f | return f(x)`),
   or list one `   :line | code` row per site for a caller with several; `impact` rows end in the
-  dependent's definition line. When the code would push an answer past its budget and the
+  dependent's definition line. The code is shown only when the line still names the target
+  (a file changed since indexing shows none), clipped around the name. When the code would push an answer past its budget and the
   locations alone fit, the code is left out with a line saying which budget shows it.
 - The server instructions, the four tool descriptions, the skill and the brief's tool line lead
   with the question each tool answers ("Where is X?", "Who calls X, and what breaks if X

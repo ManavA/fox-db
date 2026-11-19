@@ -83,58 +83,99 @@ pub fn resolve(c: &Connection, pid: i64, q: &str) -> Result<Vec<TSym>> {
         _ => (None, q),
     };
     let mut s = c.prepare_cached(&resolve_sql())?;
-    // (symbol, inbound references, prototype, qualifier matched as typed)
-    let mut v: Vec<(TSym, i64, bool, bool)> = s
+    // (symbol, inbound references, prototype, qualifier matched as typed, qualifier score)
+    let mut v: Vec<(TSym, i64, bool, bool, usize)> = s
         .query_map(params![pid, name], |r| Ok((map(r)?, r.get::<_, i64>(7)?, r.get::<_, Option<i64>>(8)?.is_some())))?
         .flatten()
         .filter_map(|(t, n, decl)| {
-            let exact = match qual {
-                None => true,
-                Some(w) => match qual_matches(&t, w) {
-                    Some(exact) => exact,
-                    None => return None,
-                },
+            let (exact, score) = match qual {
+                None => (true, 0),
+                Some(w) => qual_matches(&t, w)?,
             };
-            Some((t, n, decl, exact))
+            Some((t, n, decl, exact, score))
         })
         .collect();
     // The name as typed (and its type as typed) beats a same-name symbol in another case
     // (`render` the method, not `Render` the class); a definition beats its C prototype.
-    v.sort_by_key(|(t, n, decl, exact)| {
+    v.sort_by_key(|(t, n, decl, exact, score)| {
         let rank = if is_callable_kind(&t.kind) || is_type_kind(&t.kind) { 0 } else { 1 };
-        (t.name != name || !exact, rank, *decl, is_test(&t.path) as u8, std::cmp::Reverse(*n), t.id)
+        (t.name != name || !exact, std::cmp::Reverse(*score), rank, *decl, is_test(&t.path) as u8, std::cmp::Reverse(*n), t.id)
     });
     Ok(v.into_iter().map(|x| x.0).collect())
 }
 
-/// Whether `t` sits where `qual` (a target's text before its last `.`) points, and whether as
-/// typed (`Some(true)`) or in another case (`Some(false)`). A qualifier names the container
-/// (`Type.member`, `Outer.Inner.member`), or the package or module of the symbol: its last
-/// directory (`pod.GetContainerStatus`), a repo path or an import path that ends in its directory
-/// (`pkg/api/v1/pod.GetContainerStatus`, `k8s.io/kubernetes/pkg/api/v1/pod.GetContainerStatus`),
-/// or a dotted module (`pkg.fields.json.JSONField`).
-pub fn qual_matches(t: &TSym, qual: &str) -> Option<bool> {
+/// How well `t` sits where `qual` (a target's text before its last `.`) points: None when it
+/// does not, else (case as typed, score; higher is a closer match). Every segment must match.
+/// A qualifier ends in the symbol's containers (`Type`, `Outer.Inner`), and what comes before
+/// them names its package or module: a directory (`pod`, `pkg/api/v1/pod`), an import path that
+/// ends in it (`k8s.io/kubernetes/pkg/api/v1/pod`; the longest match wins, and a one-segment
+/// directory only weakly matches a longer path), or a dotted module (`pkg.fields.json`). A Go
+/// file stem is never a package.
+pub fn qual_matches(t: &TSym, qual: &str) -> Option<(bool, usize)> {
     qual_matches_at(&t.path, t.parent.as_deref(), qual)
 }
 
 /// [`qual_matches`] for a symbol at `path` inside `parent`.
-pub fn qual_matches_at(path: &str, parent: Option<&str>, qual: &str) -> Option<bool> {
-    let last = qual.rsplit(['.', '/']).next().unwrap_or(qual);
-    if let Some(p) = parent.filter(|p| !p.is_empty()) {
-        let p = p.rsplit('.').next().unwrap_or(p);
-        if p == last {
-            return Some(true);
+pub fn qual_matches_at(path: &str, parent: Option<&str>, qual: &str) -> Option<(bool, usize)> {
+    let qual = qual.trim_start_matches('.');
+    // (location segments, container segments); an import path's location ends at its last `/`
+    // plus one segment, and only what follows is a container.
+    let (loc_fixed, conts): (Option<Vec<&str>>, Vec<&str>) = match qual.rsplit_once('/') {
+        Some((head, tail)) => {
+            let mut it = tail.split('.');
+            let first = it.next().unwrap_or("");
+            let mut loc: Vec<&str> = head.split('/').filter(|x| !x.is_empty()).collect();
+            loc.push(first);
+            (Some(loc), it.collect())
         }
-        if p.eq_ignore_ascii_case(last) {
-            return Some(false);
+        None => (None, qual.split('.').filter(|x| !x.is_empty()).collect()),
+    };
+    let ps: Vec<&str> = parent.unwrap_or("").split('.').filter(|x| !x.is_empty()).collect();
+    let go = crate::lang::for_path(path).is_some_and(|l| l.family == "go");
+    let dir: Vec<&str> = crate::tsindex::dir_of(path).split('/').filter(|x| !x.is_empty()).collect();
+    let module: Vec<&str> = path.rsplit_once('.').map_or(path, |x| x.0).split('/').filter(|x| !x.is_empty()).collect();
+    // Score of `loc` as the symbol's location: segments matched, or None.
+    let place = |loc: &[&str]| -> Option<usize> {
+        if loc.is_empty() {
+            return Some(0);
+        }
+        let suffix = |have: &[&str]| have.len() >= loc.len() && have[have.len() - loc.len()..] == *loc;
+        if suffix(&dir) || !go && suffix(&module) {
+            return Some(loc.len());
+        }
+        // An import path longer than the directory: the directory ends it. A one-segment
+        // directory says little about a longer path.
+        if loc_fixed.is_some() && !dir.is_empty() && loc.len() > dir.len() && loc[loc.len() - dir.len()..] == *dir {
+            return Some(if dir.len() == 1 { 0 } else { dir.len() });
+        }
+        None
+    };
+    let mut best: Option<(bool, usize)> = None;
+    let ks: Vec<usize> = match &loc_fixed {
+        Some(_) => vec![conts.len()],
+        None => (0..=conts.len().min(ps.len())).rev().collect(),
+    };
+    for k in ks {
+        if k > ps.len() {
+            continue;
+        }
+        let (want, have) = (&conts[conts.len() - k..], &ps[ps.len() - k..]);
+        if !want.iter().zip(have).all(|(a, b)| a.eq_ignore_ascii_case(b)) {
+            continue;
+        }
+        let exact = want.iter().zip(have).all(|(a, b)| a == b);
+        let loc: Vec<&str> = match &loc_fixed {
+            Some(l) => l.clone(),
+            None => conts[..conts.len() - k].to_vec(),
+        };
+        if let Some(sc) = place(&loc) {
+            let cand = (exact, k * 2 + sc);
+            if best.is_none_or(|b| cand > b) {
+                best = Some(cand);
+            }
         }
     }
-    let want = if qual.contains('/') { qual.to_string() } else { qual.trim_start_matches('.').replace('.', "/") };
-    let ends = |a: &str, b: &str| !b.is_empty() && (a == b || a.ends_with(b) && a[..a.len() - b.len()].ends_with('/'));
-    let dir = crate::tsindex::dir_of(path);
-    let module = path.rsplit_once('.').map_or(path, |x| x.0);
-    let hit = ends(dir, &want) || ends(module, &want) || qual.contains('/') && ends(&want, dir);
-    hit.then_some(true)
+    best
 }
 
 /// Call or reference sites of `targets`, grouped by file: `path (n)` then `  :line Caller c:h`.
@@ -144,6 +185,7 @@ pub fn qual_matches_at(path: &str, parent: Option<&str>, qual: &str) -> Option<b
 fn sites(
     c: &Connection,
     root: &std::path::Path,
+    name: &str,
     targets: &[i64],
     calls_only: bool,
     lines: &mut Vec<String>,
@@ -217,10 +259,10 @@ fn sites(
             for (who, ls, amb) in v {
                 let head = format!("  :{} {who}{}", ls.iter().map(i64::to_string).collect::<Vec<_>>().join(","), guess_note(amb));
                 match ls.as_slice() {
-                    [one] => rows.push(src.with_code(head, &path, *one)),
+                    [one] => rows.push(src.with_code(head, &path, *one, name)),
                     _ => {
                         rows.push(head);
-                        rows.extend(ls.iter().filter_map(|l| src.line(&path, *l).map(|code| format!("   :{l} | {code}"))));
+                        rows.extend(ls.iter().filter_map(|l| src.line(&path, *l, name).map(|code| format!("   :{l} | {code}"))));
                     }
                 }
             }
@@ -248,26 +290,81 @@ impl<'a> SrcLines<'a> {
         SrcLines { root, on, files: HashMap::new() }
     }
 
-    /// Line `n` of `path`, trimmed and clipped; None when off, unreadable or blank.
-    fn line(&mut self, path: &str, n: i64) -> Option<String> {
+    /// Line `n` of `path`, trimmed and clipped around `name`; None when off or unreadable, or
+    /// when the line no longer names `name` (the file changed since it was indexed).
+    fn line(&mut self, path: &str, n: i64, name: &str) -> Option<String> {
         if !self.on || n < 1 {
             return None;
         }
-        let root = self.root;
-        let f = self.files.entry(path.to_string()).or_insert_with(|| {
-            crate::guard::read_text(&root.join(path), path, 4 << 20, false).map(|t| t.lines().map(str::to_string).collect())
-        });
-        let l = f.as_ref()?.get(n as usize - 1)?.trim();
-        (!l.is_empty()).then(|| clip(l, CODE_CHARS))
+        let l = self.text(path)?.get(n as usize - 1)?.trim();
+        clip_around(l, name)
     }
 
-    /// `row | code` when line `n` of `path` has code, else `row`.
-    fn with_code(&mut self, row: String, path: &str, n: i64) -> String {
-        match self.line(path, n) {
+    /// `path`'s lines, read once.
+    fn text(&mut self, path: &str) -> Option<&Vec<String>> {
+        let root = self.root;
+        self.files
+            .entry(path.to_string())
+            .or_insert_with(|| {
+                crate::guard::read_text(&root.join(path), path, 4 << 20, false).map(|t| t.lines().map(str::to_string).collect())
+            })
+            .as_ref()
+    }
+
+    /// `row | code` when line `n` of `path` names `name`, else `row`.
+    fn with_code(&mut self, row: String, path: &str, n: i64, name: &str) -> String {
+        match self.line(path, n, name) {
             Some(code) => format!("{row} | {code}"),
             None => row,
         }
     }
+}
+
+/// `line` when it names `name`, clipped to [`CODE_CHARS`] around the first mention; else None.
+fn clip_around(line: &str, name: &str) -> Option<String> {
+    let at = word_at(line, name)?;
+    let chars: Vec<char> = line.chars().collect();
+    if chars.len() <= CODE_CHARS {
+        return Some(line.to_string());
+    }
+    let pos = line[..at].chars().count();
+    let start = pos.saturating_sub(40).min(chars.len().saturating_sub(CODE_CHARS - 1));
+    let end = (start + CODE_CHARS - 2).min(chars.len());
+    let mut out: String = if start > 0 { "…".into() } else { String::new() };
+    out.extend(&chars[start..end]);
+    if end < chars.len() {
+        out.push('…');
+    }
+    Some(out)
+}
+
+/// Byte offset of `name` in `line` as a whole word.
+fn word_at(line: &str, name: &str) -> Option<usize> {
+    let w = |ch: Option<char>| ch.is_some_and(|ch| ch.is_alphanumeric() || ch == '_');
+    let mut from = 0;
+    while let Some(i) = line[from..].find(name).map(|i| i + from) {
+        if !w(line[..i].chars().next_back()) && !w(line[i + name.len()..].chars().next()) {
+            return Some(i);
+        }
+        from = i + name.len();
+    }
+    None
+}
+
+/// Most files listed by path:line when an answer names files it could not resolve.
+const MENTION_FILES: usize = 15;
+
+/// `  path:line | code` for the lines (two per file at most) of `files` naming `name`.
+fn mention_rows(root: &std::path::Path, files: &[String], name: &str) -> Vec<String> {
+    let mut src = SrcLines::new(root, true);
+    let mut out = vec![];
+    for f in files {
+        let Some(text) = src.text(f) else { continue };
+        let hits: Vec<(usize, String)> =
+            text.iter().enumerate().filter_map(|(i, l)| clip_around(l.trim(), name).map(|c| (i + 1, c))).take(2).collect();
+        out.extend(hits.into_iter().map(|(n, code)| format!("  {f}:{n} | {code}")));
+    }
+    out
 }
 
 /// Code rows (`   :line | code`) and inline code (`  :line Caller c:h | code`) make an answer
@@ -361,14 +458,38 @@ fn weak_note(weak: usize) -> String {
 /// that name not resolved with certainty to another symbol, and files holding it as a whole word.
 /// With `calls_only`, a file that only names `top` as a value (a callback) still counts: what
 /// it calls through that value is unknown.
-fn completeness(c: &Connection, pid: i64, top: &TSym, listed: &HashSet<String>, calls_only: bool, lead: &str) -> Result<Option<String>> {
-    let n = unlisted_files(c, pid, top, listed, calls_only)?;
-    let name = &top.name;
-    Ok((n > 0)
-        .then(|| format!("{lead}: `{name}` also appears in {n} other file{}; confirm with: rg -nw {name}", if n == 1 { "" } else { "s" })))
+fn completeness(
+    c: &Connection,
+    p: &Project,
+    top: &TSym,
+    listed: &HashSet<String>,
+    calls_only: bool,
+    lead: &str,
+) -> Result<(Option<String>, Vec<String>)> {
+    let files = unlisted_files(c, p.id, top, listed, calls_only)?;
+    Ok(mentions(p, &top.name, &files, lead, "not resolved to it"))
 }
 
-fn unlisted_files(c: &Connection, pid: i64, top: &TSym, listed: &HashSet<String>, calls_only: bool) -> Result<usize> {
+/// The head line and, for at most [`MENTION_FILES`] files, the `path:line | code` rows of files
+/// naming `name` that an answer does not resolve.
+fn mentions(p: &Project, name: &str, files: &[String], lead: &str, why: &str) -> (Option<String>, Vec<String>) {
+    let n = files.len();
+    if n == 0 {
+        return (None, vec![]);
+    }
+    let s = if n == 1 { "" } else { "s" };
+    if n > MENTION_FILES {
+        return (Some(format!("{lead}: `{name}` is also named in {n} other file{s}, {why}")), vec![]);
+    }
+    let mut rows = mention_rows(&p.root, files, name);
+    if !rows.is_empty() {
+        rows.insert(0, "unresolved mentions:".into());
+    }
+    (Some(format!("{lead}: `{name}` is also named in {n} other file{s}, {why}; unresolved mentions at the end")), rows)
+}
+
+/// Files naming `top` that an answer listing `listed` leaves out, sorted.
+fn unlisted_files(c: &Connection, pid: i64, top: &TSym, listed: &HashSet<String>, calls_only: bool) -> Result<Vec<String>> {
     let name = top.name.as_str();
     let mut skip: HashSet<String> = listed.clone();
     skip.insert(top.path.clone());
@@ -416,7 +537,9 @@ fn unlisted_files(c: &Connection, pid: i64, top: &TSym, listed: &HashSet<String>
             }
         }
     }
-    Ok(open.iter().filter(|p| !skip.contains(*p)).count())
+    let mut v: Vec<String> = open.into_iter().filter(|p| !skip.contains(p)).collect();
+    v.sort();
+    Ok(v)
 }
 
 /// Files whose indexed symbol text holds `name` as a whole word, for a name of several parts
@@ -475,16 +598,29 @@ pub fn run(c: &Connection, p: &Project, sym: &str, rel: &str, depth: usize, curs
         let others: Vec<String> = cands.iter().skip(1).take(4).map(|s| format!("{} {}", s.h(), s.qname())).collect();
         lines.push(format!("{} matches; others: {}{}", cands.len(), others.join(", "), if cands.len() > 5 { ", ..." } else { "" }));
     }
+    // Rows that go last: files naming the target that the answer could not resolve.
+    let mut tail: Vec<String> = vec![];
     match rel {
+        "callers" | "refs" | "impact" if top.kind == crate::tsindex::FIELD => {
+            // A field is no reference target: its reads and writes are not resolved, so the
+            // answer is the files that name it, never a confident 0.
+            lines.push(format!("{rel} of {}", top.row()));
+            let files = unlisted_files(c, p.id, top, &HashSet::new(), false)?;
+            let (head, rows) = mentions(p, &top.name, &files, "field uses are not tracked", "by name");
+            lines.push(head.unwrap_or_else(|| format!("field uses are not tracked: no other file names `{}`", top.name)));
+            tail.extend(rows);
+        }
         "callers" | "refs" => {
             let calls = rel == "callers" && is_callable_kind(&top.kind);
             lines.push(format!("{rel} of {}", top.row()));
             let at = lines.len();
-            let (n, files, guessed, weak) = sites(c, &p.root, &[top.id], calls, &mut lines)?;
+            let (n, files, guessed, weak) = sites(c, &p.root, &top.name, &[top.id], calls, &mut lines)?;
             let g = if guessed > 0 { format!(", {guessed} guessed by name") } else { String::new() } + &weak_note(weak);
             lines.insert(at, format!("{n} {} in {} files{g}", if calls { "call sites" } else { "refs" }, files.len()));
-            if let Some(l) = completeness(c, p.id, top, &files, calls, "may be incomplete")? {
+            let (head, rows) = completeness(c, p, top, &files, calls, "may be incomplete")?;
+            if let Some(l) = head {
                 lines.insert(at + 1, l);
+                tail.extend(rows);
             } else if weak > 0 {
                 lines.insert(at + 1, format!("may be incomplete: {}", weak_left_out(weak)));
             }
@@ -542,7 +678,7 @@ pub fn run(c: &Connection, p: &Project, sym: &str, rel: &str, depth: usize, curs
                 lines.push(format!("{}\t{}", i + 1, clip(l, 220)));
             }
         }
-        "impact" => impact(c, p.id, &p.root, top, depth, &mut lines)?,
+        "impact" => impact(c, p, top, depth, &mut lines, &mut tail)?,
         "overrides" if is_callable_kind(&top.kind) => method_overrides(c, p.id, top, &mut lines)?,
         "conforms" | "subtypes" | "extensions" | "overrides" => {
             // Supertype references (`reference.implementation` / `reference.class`) resolved to this type.
@@ -556,6 +692,7 @@ pub fn run(c: &Connection, p: &Project, sym: &str, rel: &str, depth: usize, curs
         }
         _ => bail!("unsupported --rel {rel}"),
     }
+    lines.extend(tail);
     lines.push("~ tree-sitter, name-resolved".into());
     if matches!(rel, "callers" | "refs" | "impact") {
         fit_code(&mut lines, budget);
@@ -658,7 +795,8 @@ fn merge_disp(a: &mut Disp, b: Disp) {
 /// makes its file a dependent; it has no symbol to expand further. Lines starting `partial` say
 /// where the answer may be missing something: names used in files it does not list, dependents
 /// found only through name guesses, or a walk that stopped early.
-fn impact(c: &Connection, pid: i64, root: &std::path::Path, top: &TSym, depth: usize, lines: &mut Vec<String>) -> Result<()> {
+fn impact(c: &Connection, p: &Project, top: &TSym, depth: usize, lines: &mut Vec<String>, tail: &mut Vec<String>) -> Result<()> {
+    let (pid, root) = (p.id, p.root.as_path());
     let mut guess: HashMap<i64, Guess> = HashMap::from([(top.id, None)]);
     let mut top_seen: HashSet<String> = HashSet::new();
     let mut frontier = vec![top.id];
@@ -838,7 +976,9 @@ fn impact(c: &Connection, pid: i64, root: &std::path::Path, top: &TSym, depth: u
         listed.extend(v.iter().map(|s| s.path.clone()));
     }
     let t0 = std::time::Instant::now();
-    lines.extend(completeness(c, pid, top, &listed, false, "partial at d1")?);
+    let (head, rows) = completeness(c, p, top, &listed, false, "partial at d1")?;
+    lines.extend(head);
+    tail.extend(rows);
     crate::tsindex::trace("impact: completeness", t0);
     let t0 = std::time::Instant::now();
     lines.extend(guessed_elsewhere(c, pid, &syms, &guess, &listed)?);
@@ -854,7 +994,7 @@ fn impact(c: &Connection, pid: i64, root: &std::path::Path, top: &TSym, depth: u
         let mut by: BTreeMap<String, Vec<(i64, String)>> = BTreeMap::new();
         for s in v {
             let mark = guess_mark(guess.get(&s.id).copied().flatten()) + disp.get(&s.id).cloned().flatten().as_deref().unwrap_or("");
-            let row = src.with_code(format!("  :{} {} {}{mark}", s.line, s.qname(), s.h()), &s.path, s.line);
+            let row = src.with_code(format!("  :{} {} {}{mark}", s.line, s.qname(), s.h()), &s.path, s.line, &s.name);
             by.entry(s.path.clone()).or_default().push((s.line, row));
         }
         for (path, (ls, g)) in &lvl.tops {

@@ -156,6 +156,11 @@ fn copy_dir(from: &Path, to: &Path) {
     }
 }
 
+/// An answer without its trailing `unresolved mentions:` rows.
+fn resolved(out: &str) -> String {
+    out.split("unresolved mentions:\n").next().unwrap_or(out).to_string()
+}
+
 fn fox_code(p: &project::Project, sym: &str, rel: &str, budget: usize) -> String {
     let c = db::open_ro().unwrap();
     code::run(&c, p, sym, &code::CodeOpts { rel, depth: 2, budget, cursor: 0, fallback: false }).unwrap()
@@ -382,10 +387,21 @@ fn callers_say_when_the_name_occurs_in_unlisted_files() {
     let out = fox_code(&p, "wake_task", "callers", 800);
     assert!(
         out.contains(
-            "1 call sites in 1 files\nmay be incomplete: `wake_task` also appears in 2 other files; confirm with: rg -nw wake_task"
+            "1 call sites in 1 files
+may be incomplete: `wake_task` is also named in 2 other files, not resolved to it; unresolved mentions at the end"
         ),
         "{out}"
     );
+    // The mentions are listed with their code, not left to a grep.
+    assert!(
+        out.contains(
+            "unresolved mentions:
+  mm/a.c:2 | int use_a(void) { register_cb(wake_task); return 0; }
+  mm/b.c:1 |"
+        ),
+        "{out}"
+    );
+    assert!(!out.contains("rg -nw"), "{out}");
     // The callbacks are references: impact lists their users, and nothing is missing.
     let out = fox_code(&p, "wake_task", "impact", 800);
     assert!(out.contains(":2 use_a c:") && out.contains(":1 use_b c:") && !out.contains("partial"), "{out}");
@@ -439,10 +455,10 @@ fn completeness_counts_one_word_names_and_uses_outside_symbols() {
     // unknown to `callers` (what `apply` calls through it is not followed).
     for (rel, lead, n) in [("callers", "may be incomplete", 4), ("refs", "may be incomplete", 3), ("impact", "partial at d1", 3)] {
         let out = fox_code(&p, "helper", rel, 800);
-        assert!(out.contains(&format!("{lead}: `helper` also appears in {n} other files")), "{rel}: {out}");
+        assert!(out.contains(&format!("{lead}: `helper` is also named in {n} other files")), "{rel}: {out}");
     }
     let out = fox_code(&p, "simple_open", "refs", 800);
-    assert!(out.contains("may be incomplete: `simple_open` also appears in 1 other file;"), "{out}");
+    assert!(out.contains("may be incomplete: `simple_open` is also named in 1 other file,"), "{out}");
 }
 
 /// Directories named `target` are build output only beside a build manifest (or with a cache
@@ -634,12 +650,12 @@ fn impact_follows_interface_dispatch() {
     // Go: Flags has every method of Getter, Partial does not.
     let out = fox_code(&p, "Flags.ToConfig", "impact", 2000);
     assert!(out.contains(":5 Run c:") && out.contains(" via Getter.ToConfig"), "{out}");
-    let out = fox_code(&p, "Partial.ToConfig", "impact", 2000);
+    let out = resolved(&fox_code(&p, "Partial.ToConfig", "impact", 2000));
     assert!(!out.contains("Run"), "{out}");
     let out = fox_code(&p, "Getter.ToConfig", "impact", 2000);
     assert!(out.contains("Flags.ToConfig") && !out.contains("Partial.ToConfig"), "{out}");
     // A type named in a class body (a field's type) is no supertype.
-    let out = fox_code(&p, "Service.save", "impact", 2000);
+    let out = resolved(&fox_code(&p, "Service.save", "impact", 2000));
     assert!(!out.contains("persist"), "{out}");
     // Python: a subclass override is reached through calls to the base method.
     let out = fox_code(&p, "Disk.close", "impact", 2000);
@@ -747,7 +763,7 @@ fn go_dispatch_needs_evidence_and_does_not_multiply_guesses() {
         ("pkg/app/use.go", "package app\n\nimport \"example.com/pkg/utilnet\"\n\nfunc Shut(c utilnet.Closeable) { c.Close() }\n"),
         ("pkg/app/main.go", "package app\n\nfunc Main() { Shut(nil) }\n"),
     ]);
-    let out = fox_code(&p, "Writer.Close", "impact", 2000);
+    let out = resolved(&fox_code(&p, "Writer.Close", "impact", 2000));
     assert!(!out.contains("Shut") && !out.contains("via"), "{out}");
     let out = fox_code(&p, "Conn.Close", "impact", 2000);
     assert!(out.contains(":5 Shut c:") && out.contains(" via Closeable.Close"), "{out}");
@@ -818,9 +834,9 @@ fn locals_in_every_declaration_form_are_not_references() {
         let out = fox_code(&p, q, "refs", 800);
         assert!(out.contains("0 refs"), "{q}: {out}");
     }
-    let out = fox_code(&p, "path", "refs", 800);
+    let out = resolved(&fox_code(&p, "path", "refs", 800));
     assert!(!out.contains(":4 "), "{out}");
-    let out = fox_code(&p, "item", "refs", 800);
+    let out = resolved(&fox_code(&p, "item", "refs", 800));
     assert!(!out.contains(":6 ") && !out.contains(":23 "), "{out}");
 }
 
@@ -1329,4 +1345,115 @@ fn fox_read_returns_bodies_and_outlines_with_ranges() {
     assert!(out.contains("1 class Circle c:") && out.contains(" ..5"), "{out}");
     assert!(out.contains(" 4 method area c:") && out.contains("8 function unit c:"), "{out}");
     assert!(out.contains("fox_read target=<handle> for one body, or lines=a-b"), "{out}");
+}
+
+// ---- review fixes: correctness ----
+
+/// Every segment of a qualifier must match: `pkga.Server.Start` is pkga's, Java `p.A.run` is
+/// p/A's; an import path prefers the longest directory match (vendor/ over a one-segment dir);
+/// a Go file stem is no package.
+#[test]
+fn qualified_targets_match_every_segment() {
+    let _g = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    let (_h, _r, p) = inline_project(&[
+        ("go.mod", "module example.com/proj\n\ngo 1.21\n"),
+        ("pkga/server.go", "package pkga\n\ntype Server struct{}\n\nfunc (s *Server) Start() {}\n"),
+        ("pkgb/server.go", "package pkgb\n\ntype Server struct{}\n\nfunc (s *Server) Start() {}\n"),
+        ("pod/pod.go", "package pod\n\nfunc GetStatus() int { return 1 }\n"),
+        ("vendor/github.com/acme/pod/pod.go", "package pod\n\nfunc GetStatus() int { return 2 }\n"),
+        ("svc/user.go", "package svc\n\nfunc Load() {}\n"),
+        ("users/load.go", "package users\n\nfunc Load() {}\n"),
+        ("p/A.java", "package p;\n\nclass A {\n    void run() {}\n}\n"),
+        ("q/A.java", "package q;\n\nclass A {\n    void run() {}\n}\n"),
+    ]);
+    let head = |t: &str| fox_code(&p, t, "src", 800).lines().find(|l| l.starts_with("~c:")).unwrap_or_default().to_string();
+    assert!(head("pkga.Server.Start").contains("pkga/server.go"), "{}", head("pkga.Server.Start"));
+    assert!(head("pkgb.Server.Start").contains("pkgb/server.go"), "{}", head("pkgb.Server.Start"));
+    assert!(head("p.A.run").contains("p/A.java"), "{}", head("p.A.run"));
+    assert!(head("q.A.run").contains("q/A.java"), "{}", head("q.A.run"));
+    assert!(
+        head("github.com/acme/pod.GetStatus").contains("vendor/github.com/acme/pod/pod.go"),
+        "{}",
+        head("github.com/acme/pod.GetStatus")
+    );
+    // `user` is only a file stem in Go: no package of that name.
+    let out = fox_code(&p, "user.Load", "src", 800);
+    assert!(out.contains("no symbol matches"), "{out}");
+    assert!(head("users.Load").contains("users/load.go"), "{}", head("users.Load"));
+    let c = db::open_ro().unwrap();
+    let o = foxdb::query::FindOpts { kind: "symbol", all: false, budget: 800, limit: 10, offset: 0 };
+    let out = foxdb::query::find(&c, Some(&p), "pkgb.Server.Start", &o).unwrap();
+    assert!(out.lines().next().unwrap_or("").contains("pkgb/server.go"), "{out}");
+}
+
+/// A field target never answers a confident 0: its uses are not tracked, so the answer says so
+/// and lists the files naming it. A JS/TS class field holding an arrow function is a method.
+#[test]
+fn field_targets_say_uses_are_not_tracked() {
+    let _g = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    let (_h, _r, p) = inline_project(&[
+        ("go.mod", "module example.com/k\n\ngo 1.21\n"),
+        ("config/types.go", "package config\n\ntype Config struct {\n\tMaxWorkers int32\n}\n"),
+        ("config/use.go", "package config\n\nfunc Workers(c Config) int32 { return c.MaxWorkers }\n"),
+        ("web/app.js", "class App {\n  handleClick = () => { return 1 }\n  render() { return this.handleClick() }\n}\n"),
+    ]);
+    for rel in ["callers", "refs", "impact"] {
+        let out = fox_code(&p, "Config.MaxWorkers", rel, 800);
+        assert!(out.contains("field uses are not tracked"), "{rel}: {out}");
+        assert!(out.contains("config/use.go:3 | func Workers(c Config) int32 { return c.MaxWorkers }"), "{rel}: {out}");
+        assert!(!out.contains("0 call sites") && !out.contains("0 refs"), "{rel}: {out}");
+    }
+    let out = fox_code(&p, "App.handleClick", "callers", 800);
+    assert!(out.contains("method App.handleClick") && out.contains("App.render"), "{out}");
+}
+
+/// A doc that holds a snake_case identifier (`get_user`) is no padding.
+#[test]
+fn find_keeps_docs_holding_a_snake_case_name() {
+    let _g = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    let (_h, _r, p) = inline_project(&[
+        ("app/users.py", "def get_user(uid):\n    return uid\n"),
+        ("docs/guide.md", "# Guide\n\n## Users\n\nCall get_user to load one.\n"),
+    ]);
+    let c = db::open_ro().unwrap();
+    let o = foxdb::query::FindOpts { kind: "any", all: false, budget: 800, limit: 20, offset: 0 };
+    let out = foxdb::query::find(&c, Some(&p), "get_user", &o).unwrap();
+    assert!(out.contains("function get_user") && out.contains("docs/guide.md"), "{out}");
+}
+
+/// Code shown on a row is the line that names the target, now: a file changed since it was
+/// indexed shows no code for a line that moved; a long line is clipped around the name.
+#[test]
+fn row_code_names_the_target_and_is_clipped_around_it() {
+    let _g = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    let long = format!("int far(void) {{ int x = {}; return wake_task(x); }}\n", "1 + ".repeat(60) + "1");
+    let (_h, r, p) = inline_project(&[
+        ("core.c", "int wake_task(int p) { return p; }\n"),
+        ("a.c", "int a_start(void)\n{\n\treturn wake_task(0);\n}\n"),
+        ("far.c", long.as_str()),
+    ]);
+    let out = fox_code(&p, "wake_task", "callers", 2000);
+    let far = out.lines().find(|l| l.contains(" far c:")).unwrap_or_default();
+    assert!(far.contains("return wake_task(x);") && far.chars().count() < 220, "{far}");
+    std::fs::write(r.path().join("a.c"), "// moved\n\nint a_start(void)\n{\n\treturn wake_task(0);\n}\n").unwrap();
+    let out = fox_code(&p, "wake_task", "callers", 2000);
+    for l in out.lines().filter(|l| l.contains(" | ")) {
+        assert!(l.contains("wake_task"), "a row shows code that does not name the target: {l}\n{out}");
+    }
+}
+
+/// An upgrade that parses most of a project again leaves its full-text tables merged.
+#[test]
+fn upgrade_reparse_merges_the_full_text_tables() {
+    let _g = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    let files: Vec<(String, String)> =
+        (0..240).map(|i| (format!("m{i}.go"), format!("package m\n\nfunc F{i}() int {{ return {i} }}\n"))).collect();
+    let refs: Vec<(&str, &str)> = files.iter().map(|(a, b)| (a.as_str(), b.as_str())).collect();
+    let (_h, _r, p) = inline_project(&refs);
+    let mut c = db::open_rw().unwrap();
+    c.execute("UPDATE ts_file SET hash = '', size = -1", []).unwrap();
+    tsindex::index_project(&mut c, &p).unwrap();
+    for t in ["fts_node", "fts_body"] {
+        assert!(db::fts_segments(&c, t) <= 1, "{t}: {} segments", db::fts_segments(&c, t));
+    }
 }

@@ -405,11 +405,14 @@ pub(crate) fn migrate(c: &Connection) -> Result<()> {
     }
     if v < 20 {
         // 0.2.3: struct and class fields are symbols (kind `field`) in Go, C, C++, Rust, Java,
-        // C#, TypeScript, JavaScript and Python. Files of those grammars parse again once; fields
-        // are never reference targets, so references keep their scores.
+        // C#, TypeScript, JavaScript and Python (a field holding a function is a method), and no
+        // field is a reference target any more. Files of those grammars and PHP (whose fields
+        // were targets) parse again once; projects with PHP re-score their references.
         c.execute_batch(
             "UPDATE ts_file SET hash = '', size = -1
-               WHERE lang IN ('go', 'c', 'cpp', 'rust', 'java', 'csharp', 'typescript', 'tsx', 'javascript', 'python');
+               WHERE lang IN ('go', 'c', 'cpp', 'rust', 'java', 'csharp', 'typescript', 'tsx', 'javascript', 'python', 'php');
+             INSERT OR REPLACE INTO meta(k, v)
+               SELECT 'rescore:' || p.id, 1 FROM project p WHERE EXISTS (SELECT 1 FROM ts_file f WHERE f.project_id = p.id AND f.lang = 'php');
              PRAGMA user_version = 20;",
         )?;
     }

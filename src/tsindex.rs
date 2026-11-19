@@ -422,6 +422,15 @@ pub fn extract(l: &Lang, src: &[u8]) -> Parsed {
             {
                 last = b;
             }
+            // A class field holding a function (`handleClick = () => {}`) is a method.
+            if kind == FIELD
+                && node
+                    .child_by_field_name("value")
+                    .or_else(|| node.child_by_field_name("right"))
+                    .is_some_and(|v| matches!(v.kind(), "arrow_function" | "function_expression" | "function" | "lambda"))
+            {
+                kind = "method".into();
+            }
             // A field spans its name: one declaration may name several (`A, B int`).
             let (node, last) = if kind == FIELD { (nn, nn) } else { (node, last) };
             let mut w = node.walk();
@@ -766,6 +775,9 @@ pub fn index_project_with(c: &mut Connection, p: &Project, delta: Option<&crate:
     // symbol's rows to its log. Only a fill the inventory pass of this run started counts.
     let fill = outbox::state(c, p.id).is_some_and(|s| s.1 == "filling");
     let reindex = db::reindex_pending(c, p.id) || fill;
+    // Files an upgrade asked to parse again (empty hash): when they are most of the project, the
+    // rewrite leaves many full-text segments behind, merged once at the end.
+    let forced = old.values().filter(|o| o.0.is_empty()).count();
     let todo: Vec<&(String, i64, i64)> =
         files.iter().filter(|(path, size, mtime)| reindex || old.get(path).is_none_or(|o| o.1 != *size || o.2 != *mtime)).collect();
     let root = p.root.clone();
@@ -887,6 +899,10 @@ pub fn index_project_with(c: &mut Connection, p: &Project, delta: Option<&crate:
     if changed {
         db::optimize(c, full);
         trace("ts optimize", t0);
+    }
+    if forced >= 200 && forced * 2 >= st.files {
+        let _ = db::fts_optimize(c);
+        trace("ts fts optimize after an upgrade", t0);
     }
     st.ms = t0.elapsed().as_millis();
     Ok(st)

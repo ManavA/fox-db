@@ -614,41 +614,45 @@ fn exact_arm(c: &Connection, q: &str, f: &Filter, k: usize) -> Result<Vec<i64>> 
         let mut s = c.prepare_cached(&sql)?;
         s.query_map([q], |r| r.get(0))?.flatten().collect()
     };
-    // `Type.member`: the member, restricted to that parent.
-    if ids.is_empty()
-        && let Some((parent, member)) = q.rsplit_once('.')
-        && !member.is_empty()
-    {
-        let parent = parent.rsplit('.').next().unwrap_or(parent);
-        let sql = format!(
-            "SELECT n.id FROM node n WHERE n.name = ?1 COLLATE NOCASE AND json_extract(n.meta, '$.parent') = ?2 COLLATE NOCASE{}{} LIMIT {k}",
-            f.kind_sql, f.scope_sql
-        );
-        let mut s = c.prepare_cached(&sql)?;
-        ids = s.query_map([member.split('(').next().unwrap_or(member), parent], |r| r.get(0))?.flatten().collect();
-    }
-    // `pkg.Name`, `pkg/api/v1/pod.Name`, `module.path.Name`: the member, in that package or module.
+    // `Type.member`, `pkg.Name`, `pkga.Server.Start`, `pkg/api/v1/pod.Name`, `module.path.Name`:
+    // the member, where every segment of the qualifier points, closest match first. Rows are
+    // narrowed in SQL to those whose path or container names the qualifier's last segment.
     if ids.is_empty()
         && let Some((qual, member)) = q.rsplit_once('.')
         && !member.is_empty()
         && !qual.is_empty()
     {
+        let last = qual.rsplit(['.', '/']).next().unwrap_or(qual);
         let sql = format!(
-            "SELECT n.id, n.path, json_extract(n.meta, '$.parent') FROM node n WHERE n.name = ?1 COLLATE NOCASE AND n.kind = 'symbol'{}{} LIMIT 500",
+            "SELECT n.id, n.path, json_extract(n.meta, '$.parent') FROM node n WHERE n.name = ?1 COLLATE NOCASE AND n.kind = 'symbol'
+               AND (n.path LIKE '%' || ?2 || '%' OR json_extract(n.meta, '$.parent') LIKE '%' || ?2){}{} LIMIT 20000",
             f.kind_sql, f.scope_sql
         );
         let mut s = c.prepare_cached(&sql)?;
-        let rows = s.query_map([member.split('(').next().unwrap_or(member)], |r| {
+        let rows = s.query_map([member.split('(').next().unwrap_or(member), last], |r| {
             Ok((r.get::<_, i64>(0)?, r.get::<_, Option<String>>(1)?, r.get::<_, Option<String>>(2)?))
         })?;
-        ids = rows
+        let mut v: Vec<(i64, (bool, usize))> = rows
             .flatten()
-            .filter(|(_, path, parent)| crate::tscode::qual_matches_at(path.as_deref().unwrap_or(""), parent.as_deref(), qual).is_some())
-            .map(|x| x.0)
-            .take(k)
+            .filter_map(|(id, path, parent)| {
+                Some((id, crate::tscode::qual_matches_at(path.as_deref().unwrap_or(""), parent.as_deref(), qual)?))
+            })
             .collect();
+        v.sort_by_key(|(id, m)| (std::cmp::Reverse(*m), *id));
+        ids = v.into_iter().map(|x| x.0).take(k).collect();
     }
     Ok(ids)
+}
+
+/// Every form an identifier is indexed under, as one FTS5 expression: squashed (`getuser`) and
+/// as its words in order (`"get user"`, how text and docs tokenize `get_user`).
+fn ident_phrases(ident: &str) -> String {
+    let mut v = vec![format!("\"{}\"", squash(ident).replace('"', ""))];
+    let parts = ident_parts(ident);
+    if parts.len() > 1 {
+        v.push(format!("\"{}\"", parts.join(" ").replace('"', "")));
+    }
+    v.join(" OR ")
 }
 
 /// When the queried identifier names a symbol, the answer is that symbol and names that contain
@@ -656,15 +660,18 @@ fn exact_arm(c: &Connection, q: &str, f: &Filter, k: usize) -> Result<Vec<i64>> 
 /// (`i` and `contains` for `IContains`) or only sit next to it in the call graph are padding.
 fn drop_padding(c: &Connection, hits: Vec<Hit>, ident: &str) -> Vec<Hit> {
     let want = squash(ident);
-    let expr = format!("\"{}\"", want.replace('"', ""));
-    let mut holds = c.prepare_cached("SELECT 1 FROM fts_node WHERE fts_node MATCH ?1 AND rowid = ?2").ok();
-    hits.into_iter()
-        .filter(|h| {
-            squash(&h.name).contains(&want)
-                || h.path.as_deref().is_some_and(|p| squash(p).contains(&want))
-                || holds.as_mut().is_some_and(|q| q.exists(rusqlite::params![expr, h.id]).unwrap_or(false))
-        })
-        .collect()
+    let named = |h: &Hit| squash(&h.name).contains(&want) || h.path.as_deref().is_some_and(|p| squash(p).contains(&want));
+    // One lookup for every row not named after the identifier: which of them hold it.
+    let ask: Vec<String> = hits.iter().filter(|h| !named(h)).map(|h| h.id.to_string()).collect();
+    let holds: HashSet<i64> = if ask.is_empty() {
+        HashSet::new()
+    } else {
+        let sql = format!("SELECT rowid FROM fts_node WHERE fts_node MATCH ?1 AND rowid IN ({})", ask.join(","));
+        c.prepare(&sql)
+            .and_then(|mut q| Ok(q.query_map([ident_phrases(ident)], |r| r.get::<_, i64>(0))?.flatten().collect()))
+            .unwrap_or_default()
+    };
+    hits.into_iter().filter(|h| named(h) || holds.contains(&h.id)).collect()
 }
 
 /// Neighbours (callers and callees) of the symbols named `ident` in project `pid`, most connected
@@ -785,7 +792,11 @@ fn feature_boost(h: &Hit, q: &str, ident: Option<&str>) -> f64 {
     let name_eq = |s: &str| ident.is_some_and(|i| s.eq_ignore_ascii_case(i)) || s.eq_ignore_ascii_case(q.trim());
     match h.kind.as_str() {
         // The definition of the queried name.
-        "symbol" if name_eq(&h.name) => m *= if h.meta.as_deref().is_some_and(|x| x.contains("\"k\":\"field\"")) { 2.0 } else { 3.0 },
+        // A tree-sitter field ranks below a same-name function or type (Swift kinds unchanged).
+        "symbol" if name_eq(&h.name) => {
+            let ts_field = h.meta.as_deref().is_some_and(|x| x.contains("\"k\":\"field\"") && x.contains("\"ts\""));
+            m *= if ts_field { 2.0 } else { 3.0 }
+        }
         // A heading whose title is the query is its definition too.
         "doc_section" | "milestone" if name_eq(&h.name) => m *= 3.0,
         "file" => {
