@@ -627,7 +627,44 @@ fn exact_arm(c: &Connection, q: &str, f: &Filter, k: usize) -> Result<Vec<i64>> 
         let mut s = c.prepare_cached(&sql)?;
         ids = s.query_map([member.split('(').next().unwrap_or(member), parent], |r| r.get(0))?.flatten().collect();
     }
+    // `pkg.Name`, `pkg/api/v1/pod.Name`, `module.path.Name`: the member, in that package or module.
+    if ids.is_empty()
+        && let Some((qual, member)) = q.rsplit_once('.')
+        && !member.is_empty()
+        && !qual.is_empty()
+    {
+        let sql = format!(
+            "SELECT n.id, n.path, json_extract(n.meta, '$.parent') FROM node n WHERE n.name = ?1 COLLATE NOCASE AND n.kind = 'symbol'{}{} LIMIT 500",
+            f.kind_sql, f.scope_sql
+        );
+        let mut s = c.prepare_cached(&sql)?;
+        let rows = s.query_map([member.split('(').next().unwrap_or(member)], |r| {
+            Ok((r.get::<_, i64>(0)?, r.get::<_, Option<String>>(1)?, r.get::<_, Option<String>>(2)?))
+        })?;
+        ids = rows
+            .flatten()
+            .filter(|(_, path, parent)| crate::tscode::qual_matches_at(path.as_deref().unwrap_or(""), parent.as_deref(), qual).is_some())
+            .map(|x| x.0)
+            .take(k)
+            .collect();
+    }
     Ok(ids)
+}
+
+/// When the queried identifier names a symbol, the answer is that symbol and names that contain
+/// it, plus files and docs holding the identifier itself. Rows that only share one of its words
+/// (`i` and `contains` for `IContains`) or only sit next to it in the call graph are padding.
+fn drop_padding(c: &Connection, hits: Vec<Hit>, ident: &str) -> Vec<Hit> {
+    let want = squash(ident);
+    let expr = format!("\"{}\"", want.replace('"', ""));
+    let mut holds = c.prepare_cached("SELECT 1 FROM fts_node WHERE fts_node MATCH ?1 AND rowid = ?2").ok();
+    hits.into_iter()
+        .filter(|h| {
+            squash(&h.name).contains(&want)
+                || h.path.as_deref().is_some_and(|p| squash(p).contains(&want))
+                || holds.as_mut().is_some_and(|q| q.exists(rusqlite::params![expr, h.id]).unwrap_or(false))
+        })
+        .collect()
 }
 
 /// Neighbours (callers and callees) of the symbols named `ident` in project `pid`, most connected
@@ -748,7 +785,7 @@ fn feature_boost(h: &Hit, q: &str, ident: Option<&str>) -> f64 {
     let name_eq = |s: &str| ident.is_some_and(|i| s.eq_ignore_ascii_case(i)) || s.eq_ignore_ascii_case(q.trim());
     match h.kind.as_str() {
         // The definition of the queried name.
-        "symbol" if name_eq(&h.name) => m *= 3.0,
+        "symbol" if name_eq(&h.name) => m *= if h.meta.as_deref().is_some_and(|x| x.contains("\"k\":\"field\"")) { 2.0 } else { 3.0 },
         // A heading whose title is the query is its definition too.
         "doc_section" | "milestone" if name_eq(&h.name) => m *= 3.0,
         "file" => {
@@ -1162,6 +1199,13 @@ fn ranked(
         })
         .collect();
     let mut hits = damp_same_file(scored, if route == Route::Text { DAMP_TEXT } else { DAMP_NAMES });
+    if let Some(id) = ident.as_deref()
+        && route != Route::Text
+        && matches!(o.kind, "any" | "symbol")
+        && hits.iter().any(|h| h.kind == "symbol" && h.name.eq_ignore_ascii_case(id))
+    {
+        hits = drop_padding(c, hits, id);
+    }
     for h in hits.iter_mut().take(show).filter(|h| h.kind == "symbol") {
         h.refs = c
             .query_row(

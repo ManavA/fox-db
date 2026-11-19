@@ -23,3 +23,6 @@
 (class_definition superclasses: (argument_list [(identifier) @name (attribute attribute: (identifier) @name)])) @reference.implementation
 ; `from json import loads as parse`: the name the file uses.
 (import_from_statement name: (aliased_import alias: (identifier) @name)) @reference.import
+
+; A class attribute (`title = CharField()`, `pages: int = 0`): found by name, never a call target.
+(class_definition body: (block (expression_statement (assignment left: (identifier) @name) @definition.field)))

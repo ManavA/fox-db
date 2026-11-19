@@ -1122,3 +1122,158 @@ fn go_qualifiers_follow_import_aliases() {
     let out = fox_code(&p, "Printf", "callers", 800);
     assert!(out.contains("1 call sites in 1 files") && out.contains(":9 proj c:"), "{out}");
 }
+
+// ---- first answers (round 3 transcripts) ----
+
+/// A Go target qualified by its package (`pod.GetContainerStatus`), its path in the repo
+/// (`pkg/api/v1/pod.GetContainerStatus`) or its full import path resolves to that package's
+/// function, not to a same-name function of another package or a method.
+#[test]
+fn go_package_qualified_targets_resolve() {
+    let _g = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    let (_h, _r, p) = inline_project(&[
+        ("go.mod", "module example.com/k\n\ngo 1.21\n"),
+        ("pkg/api/v1/pod/util.go", "package pod\n\nfunc GetContainerStatus(name string) (int, bool) { return 0, true }\n"),
+        ("pkg/api/pod/util.go", "package pod\n\nfunc GetContainerStatus(name string) (int, bool) { return 1, true }\n"),
+        ("pkg/kubelet/rt/m.go", "package rt\n\ntype mgr struct{}\n\nfunc (m *mgr) GetContainerStatus() int { return 2 }\n"),
+        (
+            "pkg/kubelet/pods.go",
+            "package kubelet\n\nimport podutil \"example.com/k/pkg/api/v1/pod\"\n\nfunc getPhase() { podutil.GetContainerStatus(\"a\") }\n",
+        ),
+    ]);
+    for target in ["pkg/api/v1/pod.GetContainerStatus", "example.com/k/pkg/api/v1/pod.GetContainerStatus", "v1/pod.GetContainerStatus"] {
+        let out = fox_code(&p, target, "callers", 800);
+        assert!(out.contains("function GetContainerStatus  pkg/api/v1/pod/util.go:3"), "{target}: {out}");
+        assert!(out.contains("1 call sites in 1 files") && out.contains("getPhase"), "{target}: {out}");
+    }
+    // The package name alone: one of the two `pod` packages, never the method.
+    let out = fox_code(&p, "pod.GetContainerStatus", "callers", 800);
+    assert!(out.contains("callers of ~c:") && out.contains("function GetContainerStatus  pkg/api/"), "{out}");
+    // fox_find takes the same qualified name.
+    let c = db::open_ro().unwrap();
+    let o = foxdb::query::FindOpts { kind: "any", all: false, budget: 800, limit: 10, offset: 0 };
+    let out = foxdb::query::find(&c, Some(&p), "pkg/api/v1/pod.GetContainerStatus", &o).unwrap();
+    assert!(out.lines().next().unwrap_or("").contains("pkg/api/v1/pod/util.go:3"), "{out}");
+}
+
+/// `overrides` of a method lists the same-name methods of its subclasses, at any depth, and the
+/// method it overrides; a same-name method of an unrelated class is not one.
+#[test]
+fn python_overrides_list_subclass_methods() {
+    let _g = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    let (_h, _r, p) = inline_project(&[
+        ("pkg/__init__.py", ""),
+        (
+            "pkg/fields/__init__.py",
+            "class Field:\n    def get_db_prep_value(self, value):\n        return value\n\n\nclass IntegerField(Field):\n    def get_db_prep_value(self, value):\n        return int(value)\n\n\nclass BigIntegerField(IntegerField):\n    pass\n\n\nclass PositiveBigIntegerField(BigIntegerField):\n    def get_db_prep_value(self, value):\n        return abs(value)\n",
+        ),
+        (
+            "pkg/fields/json.py",
+            "from pkg.fields import Field\n\n\nclass JSONField(Field):\n    def get_db_prep_value(self, value):\n        return str(value)\n",
+        ),
+        ("pkg/other.py", "class Other:\n    def get_db_prep_value(self, value):\n        return None\n"),
+    ]);
+    let out = fox_code(&p, "Field.get_db_prep_value", "overrides", 800);
+    assert!(out.contains("3 overrides"), "{out}");
+    for m in ["IntegerField.get_db_prep_value", "PositiveBigIntegerField.get_db_prep_value", "JSONField.get_db_prep_value"] {
+        assert!(out.contains(m), "{m}: {out}");
+    }
+    assert!(!out.contains("Other."), "{out}");
+    let out = fox_code(&p, "IntegerField.get_db_prep_value", "overrides", 800);
+    assert!(out.contains("overrides ~c:") && out.contains("method Field.get_db_prep_value"), "{out}");
+    assert!(out.contains("PositiveBigIntegerField.get_db_prep_value") && !out.contains("JSONField"), "{out}");
+}
+
+/// Struct and class fields are symbols of kind `field` inside their type; locals are not.
+#[test]
+fn struct_and_class_fields_are_symbols() {
+    let cases: &[(&str, &str, &[&str])] = &[
+        (
+            "x.go",
+            "package x\n\ntype KubeletConfiguration struct {\n\tContainerLogMaxWorkers *int32 `json:\"containerLogMaxWorkers,omitempty\"`\n\tA, B int\n}\n\nfunc f() {\n\ttype local struct{ Hidden int }\n}\n",
+            &["KubeletConfiguration.ContainerLogMaxWorkers", "KubeletConfiguration.A", "KubeletConfiguration.B"],
+        ),
+        (
+            "x.c",
+            "typedef struct IndexStmt {\n\tint type;\n\tchar *idxname;\n\tchar **names;\n\tint cols[4];\n} IndexStmt;\n",
+            &["IndexStmt.IndexStmt.type", "IndexStmt.IndexStmt.idxname", "IndexStmt.IndexStmt.names", "IndexStmt.IndexStmt.cols"],
+        ),
+        ("x.cpp", "struct Opts {\n  int depth = 2;\n  void run();\n};\n", &["Opts.depth"]),
+        ("x.rs", "pub struct Config {\n    pub max_workers: u32,\n}\n", &["Config.max_workers"]),
+        ("X.java", "class Config {\n    private int maxWorkers = 2;\n}\n", &["Config.maxWorkers"]),
+        ("X.cs", "class Config {\n    private int maxWorkers = 2;\n}\n", &["Config.maxWorkers"]),
+        ("x.ts", "class Config {\n  maxWorkers: number = 2\n}\n", &["Config.maxWorkers"]),
+        ("x.js", "class Config {\n  maxWorkers = 2\n}\n", &["Config.maxWorkers"]),
+        (
+            "x.py",
+            "class Book(Model):\n    title = CharField()\n    pages: int = 0\n\n    def f(self):\n        hidden = 1\n",
+            &["Book.title", "Book.pages"],
+        ),
+    ];
+    let mut fails = vec![];
+    for (path, src, want) in cases {
+        let l = lang::for_path(path).unwrap();
+        let p = tsindex::extract(l, src.as_bytes());
+        let q = qnames(&p);
+        for w in *want {
+            match q.iter().position(|x| x == w) {
+                Some(i) if p.defs[i].kind == "field" => {}
+                Some(i) => fails.push(format!("{path}: {w} is a {}", p.defs[i].kind)),
+                None => fails.push(format!("{path}: missing field {w} (got {q:?})")),
+            }
+        }
+        if q.iter().any(|x| x.ends_with("Hidden") || x.ends_with("hidden")) {
+            fails.push(format!("{path}: a local is a field: {q:?}"));
+        }
+    }
+    assert!(fails.is_empty(), "{}", fails.join("\n"));
+}
+
+/// A field is found by name, first; it is no call target, so a same-name function keeps its
+/// callers certain.
+#[test]
+fn fields_are_found_but_are_no_call_targets() {
+    let _g = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    let (_h, _r, p) = inline_project(&[
+        ("go.mod", "module example.com/k\n\ngo 1.21\n"),
+        ("config/types.go", "package config\n\ntype KubeletConfiguration struct {\n\tContainerLogMaxWorkers int32\n\tWorkers int\n}\n"),
+        ("pool/pool.go", "package pool\n\nfunc Workers() int { return 1 }\n"),
+        ("pool/use.go", "package pool\n\nfunc Use() int { return Workers() }\n"),
+    ]);
+    let c = db::open_ro().unwrap();
+    let o = foxdb::query::FindOpts { kind: "any", all: false, budget: 800, limit: 10, offset: 0 };
+    let out = foxdb::query::find(&c, Some(&p), "ContainerLogMaxWorkers", &o).unwrap();
+    assert!(out.lines().next().unwrap_or("").contains("field KubeletConfiguration.ContainerLogMaxWorkers  config/types.go:4"), "{out}");
+    let out = fox_code(&p, "pool.Workers", "callers", 800);
+    assert!(out.contains("1 call sites in 1 files") && out.contains(":3 Use c:") && !out.contains("guess"), "{out}");
+}
+
+/// An identifier that names a symbol finds that symbol and near names; rows that only share a
+/// word with it (`i` and `contains` for `IContains`) or only call it are padding, and left out.
+/// A text file holding the identifier itself stays.
+#[test]
+fn find_by_exact_name_drops_padding() {
+    let _g = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    let (_h, _r, p) = inline_project(&[
+        (
+            "lookups.py",
+            "class Contains:\n    pass\n\n\nclass IContains(Contains):\n    pass\n\n\nclass KeyTransformIContains(IContains):\n    pass\n",
+        ),
+        ("query.py", "from lookups import IContains\n\n\ndef build_lookup():\n    return IContains()\n"),
+        ("docs/faq.txt", "I think this page contains the answers you need.\n"),
+        ("docs/ref.txt", "Use icontains for a case-insensitive match.\n"),
+        (
+            "postgres.c",
+            "static void helper_a(void) {}\nstatic void helper_b(void) {}\nvoid exec_simple_query(const char *q) { helper_a(); helper_b(); }\nint exec_is_simple_query(void) { return 0; }\n",
+        ),
+    ]);
+    let c = db::open_ro().unwrap();
+    let o = foxdb::query::FindOpts { kind: "any", all: false, budget: 800, limit: 20, offset: 0 };
+    let out = foxdb::query::find(&c, Some(&p), "IContains", &o).unwrap();
+    assert!(out.lines().next().unwrap_or("").contains("class IContains  lookups.py:5"), "{out}");
+    assert!(out.contains("KeyTransformIContains") && out.contains("docs/ref.txt"), "{out}");
+    assert!(!out.contains("docs/faq.txt") && !out.contains("build_lookup"), "{out}");
+    let out = foxdb::query::find(&c, Some(&p), "exec_simple_query", &o).unwrap();
+    assert!(out.lines().next().unwrap_or("").contains("function exec_simple_query  postgres.c:3"), "{out}");
+    assert!(!out.contains("helper_a") && !out.contains("helper_b"), "{out}");
+}

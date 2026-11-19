@@ -14,3 +14,5 @@
 (argument_list (identifier) @name) @reference.ref
 ; An interface embedded in an interface (`type ReadCloser interface { Reader; Close() error }`).
 (interface_type (type_elem [(type_identifier) @name (qualified_type name: (type_identifier) @name)])) @reference.implementation
+; A struct field (`MaxWorkers *int32 \`json:"..."\``): found by name, never a call target.
+(field_declaration name: (field_identifier) @name) @definition.field

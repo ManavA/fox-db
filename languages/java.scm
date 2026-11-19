@@ -19,3 +19,6 @@
 
 (superclass (type_identifier) @name) @reference.class
 (import_declaration (scoped_identifier) @name) @reference.import
+
+; A field: found by name, never a call target.
+(field_declaration declarator: (variable_declarator name: (identifier) @name)) @definition.field

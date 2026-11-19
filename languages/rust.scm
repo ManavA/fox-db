@@ -64,3 +64,6 @@
 (impl_item
     type: (type_identifier) @name
     !trait) @reference.implementation
+
+; A struct field: found by name, never a call target.
+(field_declaration name: (field_identifier) @name) @definition.field

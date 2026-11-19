@@ -22,3 +22,5 @@
 
 (namespace_declaration name: (identifier) @name) @module
 (invocation_expression function: (identifier) @name) @reference.call
+; A field: found by name, never a call target.
+(field_declaration (variable_declaration (variable_declarator name: (identifier) @name))) @definition.field

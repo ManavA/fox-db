@@ -23,3 +23,5 @@
 (implements_clause [(type_identifier) @name (generic_type name: (type_identifier) @name)]) @reference.implementation
 (extends_clause value: [(identifier) @name (member_expression property: (property_identifier) @name)]) @reference.implementation
 (extends_type_clause type: [(type_identifier) @name (generic_type name: (type_identifier) @name)]) @reference.implementation
+; A class field: found by name, never a call target.
+(public_field_definition name: (property_identifier) @name) @definition.field

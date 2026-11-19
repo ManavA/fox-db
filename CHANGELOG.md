@@ -1,5 +1,24 @@
 # Changelog
 
+## 0.2.3 (unreleased)
+
+First answers that were empty, wrong or padded in agent benchmark transcripts are fixed.
+
+- A Go target qualified by its package resolves: `pod.GetContainerStatus`, the repo path
+  `pkg/api/v1/pod.GetContainerStatus` or the full import path. `fox_find` takes the same names.
+  A qualifier may also be a dotted Python or JS module (`pkg.fields.json.JSONField`).
+- `overrides` of a method lists the same-name methods of its subtypes at any depth, and the
+  methods it overrides, instead of the types that reference it (`Field.get_db_prep_value` said 0;
+  it now lists 16).
+- Struct and class fields are symbols of kind `field` in Go, C, C++, Rust, Java, C#, TypeScript,
+  JavaScript and Python, so `fox_find ContainerLogMaxWorkers` finds the struct field first.
+  Fields are never call or reference targets, so callers of a same-name function stay certain.
+  Files of those grammars parse again once (store schema 20).
+- When an identifier names a symbol, `fox_find` returns that symbol, names that contain it and
+  files or docs that hold it; rows that only share one of its words (docs matching `contains` for
+  `IContains`) or only neighbour it in the call graph (the callees of `exec_simple_query`) are
+  left out.
+
 ## 0.2.2 (2026-11-18)
 
 `impact` finds much more of what a change breaks and says when it may have missed something; the

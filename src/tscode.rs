@@ -79,25 +79,62 @@ pub fn resolve(c: &Connection, pid: i64, q: &str) -> Result<Vec<TSym>> {
     }
     let q = q.split('(').next().unwrap_or(q);
     let (qual, name) = match q.rsplit_once('.') {
-        Some((a, b)) if !b.is_empty() => (Some(a.rsplit('.').next().unwrap_or(a)), b),
+        Some((a, b)) if !b.is_empty() => (Some(a), b),
         _ => (None, q),
     };
     let mut s = c.prepare_cached(&resolve_sql())?;
-    let mut v: Vec<(TSym, i64, bool)> = s
+    // (symbol, inbound references, prototype, qualifier matched as typed)
+    let mut v: Vec<(TSym, i64, bool, bool)> = s
         .query_map(params![pid, name], |r| Ok((map(r)?, r.get::<_, i64>(7)?, r.get::<_, Option<i64>>(8)?.is_some())))?
         .flatten()
-        .filter(|(t, ..)| {
-            qual.is_none_or(|w| t.parent.as_deref().is_some_and(|p| p.rsplit('.').next().unwrap_or(p).eq_ignore_ascii_case(w)))
+        .filter_map(|(t, n, decl)| {
+            let exact = match qual {
+                None => true,
+                Some(w) => match qual_matches(&t, w) {
+                    Some(exact) => exact,
+                    None => return None,
+                },
+            };
+            Some((t, n, decl, exact))
         })
         .collect();
     // The name as typed (and its type as typed) beats a same-name symbol in another case
     // (`render` the method, not `Render` the class); a definition beats its C prototype.
-    v.sort_by_key(|(t, n, decl)| {
+    v.sort_by_key(|(t, n, decl, exact)| {
         let rank = if is_callable_kind(&t.kind) || is_type_kind(&t.kind) { 0 } else { 1 };
-        let exact_qual = qual.is_none_or(|w| t.parent.as_deref().is_some_and(|p| p.rsplit('.').next().unwrap_or(p) == w));
-        (t.name != name || !exact_qual, rank, *decl, is_test(&t.path) as u8, std::cmp::Reverse(*n), t.id)
+        (t.name != name || !exact, rank, *decl, is_test(&t.path) as u8, std::cmp::Reverse(*n), t.id)
     });
     Ok(v.into_iter().map(|x| x.0).collect())
+}
+
+/// Whether `t` sits where `qual` (a target's text before its last `.`) points, and whether as
+/// typed (`Some(true)`) or in another case (`Some(false)`). A qualifier names the container
+/// (`Type.member`, `Outer.Inner.member`), or the package or module of the symbol: its last
+/// directory (`pod.GetContainerStatus`), a repo path or an import path that ends in its directory
+/// (`pkg/api/v1/pod.GetContainerStatus`, `k8s.io/kubernetes/pkg/api/v1/pod.GetContainerStatus`),
+/// or a dotted module (`pkg.fields.json.JSONField`).
+pub fn qual_matches(t: &TSym, qual: &str) -> Option<bool> {
+    qual_matches_at(&t.path, t.parent.as_deref(), qual)
+}
+
+/// [`qual_matches`] for a symbol at `path` inside `parent`.
+pub fn qual_matches_at(path: &str, parent: Option<&str>, qual: &str) -> Option<bool> {
+    let last = qual.rsplit(['.', '/']).next().unwrap_or(qual);
+    if let Some(p) = parent.filter(|p| !p.is_empty()) {
+        let p = p.rsplit('.').next().unwrap_or(p);
+        if p == last {
+            return Some(true);
+        }
+        if p.eq_ignore_ascii_case(last) {
+            return Some(false);
+        }
+    }
+    let want = if qual.contains('/') { qual.to_string() } else { qual.trim_start_matches('.').replace('.', "/") };
+    let ends = |a: &str, b: &str| !b.is_empty() && (a == b || a.ends_with(b) && a[..a.len() - b.len()].ends_with('/'));
+    let dir = crate::tsindex::dir_of(path);
+    let module = path.rsplit_once('.').map_or(path, |x| x.0);
+    let hit = ends(dir, &want) || ends(module, &want) || qual.contains('/') && ends(&want, dir);
+    hit.then_some(true)
 }
 
 /// Call or reference sites of `targets`, grouped by file: `path (n)` then `  :line Caller c:h`.
@@ -281,7 +318,8 @@ fn unlisted_files(c: &Connection, pid: i64, top: &TSym, listed: &HashSet<String>
     // of it all go elsewhere. A store still owing its first word pass falls back to symbol text.
     if name.chars().all(|ch| ch.is_alphanumeric() || ch == '_') {
         let mut d = c.prepare_cached(
-            "SELECT path, name FROM node INDEXED BY node_sym_name WHERE project_id = ?1 AND kind = 'symbol' AND name = ?2 COLLATE NOCASE AND source = 'treesitter'",
+            "SELECT path, name FROM node INDEXED BY node_sym_name WHERE project_id = ?1 AND kind = 'symbol' AND name = ?2 COLLATE NOCASE AND source = 'treesitter'
+               AND COALESCE(json_extract(meta,'$.k'), '') != 'field'",
         )?;
         // The words are matched case as typed, so only a definition of that exact name counts.
         let defs: HashSet<String> = d
@@ -431,6 +469,7 @@ pub fn run(c: &Connection, p: &Project, sym: &str, rel: &str, depth: usize, curs
             }
         }
         "impact" => impact(c, p.id, top, depth, &mut lines)?,
+        "overrides" if is_callable_kind(&top.kind) => method_overrides(c, p.id, top, &mut lines)?,
         "conforms" | "subtypes" | "extensions" | "overrides" => {
             // Supertype references (`reference.implementation` / `reference.class`) resolved to this type.
             lines.push(format!("{rel} of {}", top.row()));
@@ -445,6 +484,55 @@ pub fn run(c: &Connection, p: &Project, sym: &str, rel: &str, depth: usize, curs
     }
     lines.push("~ tree-sitter, name-resolved".into());
     Ok(Some(page(&lines, cursor, budget)))
+}
+
+/// Deepest chain of named supertypes `overrides` follows (Field -> DateField -> DateTimeField ...).
+const OVERRIDE_STEPS: usize = 8;
+
+/// `overrides` of a method: the methods it overrides (same name, in a supertype) and its
+/// overrides (same name, in a subtype at any depth). Go has no inheritance: the interface
+/// methods a method implements, or an interface method's implementations, by method set.
+fn method_overrides(c: &Connection, pid: i64, top: &TSym, lines: &mut Vec<String>) -> Result<()> {
+    lines.push(format!("overrides of {}", top.row()));
+    let (mut up, mut down, mut capped) = (vec![], vec![], None);
+    if crate::lang::for_path(&top.path).is_some_and(|l| l.family == "go") {
+        let d = dispatch(c, pid, top)?;
+        (up, down, capped) = (d.up, d.down, d.capped);
+    } else if top.parent.as_deref().is_some_and(|p| !p.is_empty()) {
+        let mut owners = Owners::default();
+        if let Some(owner) = owner_type(c, pid, top, &mut owners)? {
+            let ups = related_types_n(c, owner.id, true, OVERRIDE_STEPS)?;
+            let downs = related_types_n(c, owner.id, false, OVERRIDE_STEPS)?;
+            let mut q = c.prepare_cached(&format!(
+                "SELECT {COLS}, {SYM_PID} FROM node n INDEXED BY node_sym_name
+                 WHERE n.project_id = ?1 AND n.kind = 'symbol' AND n.source = 'treesitter' AND n.name = ?2 COLLATE NOCASE
+                   AND COALESCE(json_extract(n.meta,'$.k'), '') != 'field'
+                 ORDER BY n.path, n.line LIMIT {DISPATCH_SAME_MAX}"
+            ))?;
+            let fam = |p: &str| crate::lang::for_path(p).map(|l| l.family).unwrap_or("");
+            let same: Vec<(TSym, i64)> = q.query_map(params![pid, top.name], |r| Ok((map(r)?, r.get::<_, i64>(7)?)))?.flatten().collect();
+            if same.len() >= DISPATCH_SAME_MAX {
+                capped = Some(format!("partial: checked the first {DISPATCH_SAME_MAX} same-name methods; the rest may override it too"));
+            }
+            for (s, spid) in same {
+                if s.name != top.name || s.id == top.id || fam(&s.path) != fam(&top.path) || !is_callable_kind(&s.kind) {
+                    continue;
+                }
+                let t = if spid != 0 { Some(spid) } else { owner_type(c, pid, &s, &mut owners)?.map(|t| t.id) };
+                match t {
+                    Some(t) if ups.contains(&t) => up.push(s),
+                    Some(t) if downs.contains(&t) => down.push(s),
+                    _ => {}
+                }
+            }
+        }
+    }
+    lines.extend(up.iter().map(|m| format!("overrides {}", m.row())));
+    lines.push(format!("{} override{}", down.len(), if down.len() == 1 { "" } else { "s" }));
+    lines.extend(capped);
+    down.sort_by(|a, b| (&a.path, a.line).cmp(&(&b.path, b.line)));
+    lines.extend(down.iter().map(TSym::row));
+    Ok(())
 }
 
 /// Most dependents the impact walk collects before it stops.
@@ -733,6 +821,7 @@ fn dispatch(c: &Connection, pid: i64, top: &TSym) -> Result<Dispatch> {
     let mut q = c.prepare_cached(&format!(
         "SELECT {COLS}, {SYM_PID} FROM node n INDEXED BY node_sym_name
          WHERE n.project_id = ?1 AND n.kind = 'symbol' AND n.source = 'treesitter' AND n.name = ?2 COLLATE NOCASE
+           AND COALESCE(json_extract(n.meta,'$.k'), '') != 'field'
          ORDER BY {SYM_PID} = 0, n.id LIMIT {DISPATCH_SAME_MAX}"
     ))?;
     let same: Vec<(TSym, i64)> = q.query_map(params![pid, top.name], |r| Ok((map(r)?, r.get::<_, i64>(7)?)))?.flatten().collect();
@@ -910,6 +999,11 @@ fn owner_type(c: &Connection, pid: i64, m: &TSym, cache: &mut Owners) -> Result<
 /// class), or, for grammars that tag supertypes as plain type references, one on the type's
 /// own line; a type named in the body (a field's type) is no supertype.
 fn related_types(c: &Connection, t: i64, up: bool) -> Result<HashSet<i64>> {
+    related_types_n(c, t, up, 3)
+}
+
+/// [`related_types`], `steps` deep.
+fn related_types_n(c: &Connection, t: i64, up: bool, steps: usize) -> Result<HashSet<i64>> {
     let sql = if up {
         "SELECT DISTINCT r.dst FROM ts_ref r JOIN node n ON n.id = r.dst JOIN node s ON s.id = r.src
          WHERE r.src = ?1 AND r.src != 0 AND r.dst != 0 AND r.amb = 0 AND (r.kind = 'impl' OR r.kind = 'ref' AND r.line = s.line)
@@ -922,7 +1016,7 @@ fn related_types(c: &Connection, t: i64, up: bool) -> Result<HashSet<i64>> {
     let mut q = c.prepare_cached(sql)?;
     let mut seen: HashSet<i64> = HashSet::new();
     let mut frontier = vec![t];
-    for _ in 0..3 {
+    for _ in 0..steps {
         let mut next = vec![];
         for x in frontier {
             for y in q.query_map([x], |r| r.get::<_, i64>(0))?.flatten() {

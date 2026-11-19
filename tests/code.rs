@@ -314,7 +314,7 @@ fn mcp_protocol_budgets_cursor_and_notes() {
     let (t, err) = call("fox_graph", json!({"target":"Circle.area","rel":"nonsense"}));
     assert!(err && t.contains("unknown --rel"), "{t}");
     let (t, _) = call("fox_find", json!({"q":"Circle","kind":"symbol","budget":2}));
-    assert!(t.contains("cursor="), "tiny budget must still report a cursor: {t}");
+    assert!(t.contains("cursor=") || t.contains("ids only to fit the budget"), "tiny budget must still say what it left out: {t}");
     // Handles round trip between tools.
     let (t, _) = call("fox_find", json!({"q":"render","kind":"symbol"}));
     let h = t.split_whitespace().next().unwrap().trim_start_matches('~').to_string();

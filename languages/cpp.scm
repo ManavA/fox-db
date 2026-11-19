@@ -17,3 +17,8 @@
 ; (`walk(handle_one, &cb)`): a reference. Parameters and locals are dropped at extraction.
 (initializer_list (identifier) @name) @reference.ref
 (argument_list (identifier) @name) @reference.ref
+; A data member, also behind pointers, references and arrays: found by name, never a call target.
+(field_declaration declarator: [(field_identifier) @name
+  (pointer_declarator declarator: [(field_identifier) @name (pointer_declarator declarator: (field_identifier) @name)])
+  (reference_declarator (field_identifier) @name)
+  (array_declarator declarator: (field_identifier) @name)]) @definition.field

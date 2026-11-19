@@ -403,6 +403,16 @@ pub(crate) fn migrate(c: &Connection) -> Result<()> {
              PRAGMA user_version = 19;",
         )?;
     }
+    if v < 20 {
+        // 0.2.3: struct and class fields are symbols (kind `field`) in Go, C, C++, Rust, Java,
+        // C#, TypeScript, JavaScript and Python. Files of those grammars parse again once; fields
+        // are never reference targets, so references keep their scores.
+        c.execute_batch(
+            "UPDATE ts_file SET hash = '', size = -1
+               WHERE lang IN ('go', 'c', 'cpp', 'rust', 'java', 'csharp', 'typescript', 'tsx', 'javascript', 'python');
+             PRAGMA user_version = 20;",
+        )?;
+    }
     // Cheap when already set: the setting lives in each table's own config.
     for t in MERGE_TABLES {
         defer_merges(c, t)?;
@@ -704,7 +714,7 @@ pub fn minority(c: &Connection, ranges: &[(i64, i64)]) -> bool {
 }
 
 /// The schema version this build writes.
-pub const LATEST: i64 = 19;
+pub const LATEST: i64 = 20;
 
 /// Read-only connection for the hot paths. None if the store does not exist yet.
 pub fn open_ro() -> Option<Connection> {

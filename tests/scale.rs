@@ -486,7 +486,8 @@ fn warm_search_never_waits_for_a_graph_rebuild() {
     reindex(&mut c, &pa);
     let out = search::find_warm(&mut warm, &c, Some(&pa), "alpha", &o).unwrap();
     assert_eq!(out, search::find(&c, Some(&pa), "alpha", &o).unwrap());
-    assert!(out.contains("gamma"), "{out}");
+    // A caller of the name found is a graph neighbour, not a match: it is left out.
+    assert!(out.contains("function alpha") && !out.contains("gamma"), "{out}");
     warm.settle();
     assert_eq!(warm.graph_loads(), 2);
     let out = search::find_warm(&mut warm, &c, Some(&pa), "beta", &o).unwrap();

@@ -87,6 +87,10 @@ pub fn is_type_kind(k: &str) -> bool {
     matches!(k, "class" | "interface" | "object" | "struct" | "enum" | "module" | "trait" | "type" | "protocol")
 }
 
+/// A struct or class field: a symbol found by name and listed in outlines, never the target of
+/// a call or reference (a field and a same-name method would make every call a guess).
+pub const FIELD: &str = "field";
+
 pub fn is_callable_kind(k: &str) -> bool {
     matches!(k, "function" | "method" | "macro" | "constructor")
 }
@@ -418,6 +422,8 @@ pub fn extract(l: &Lang, src: &[u8]) -> Parsed {
             {
                 last = b;
             }
+            // A field spans its name: one declaration may name several (`A, B int`).
+            let (node, last) = if kind == FIELD { (nn, nn) } else { (node, last) };
             let mut w = node.walk();
             let stat = node.children(&mut w).any(|ch| ch.kind() == "storage_class_specifier" && text(ch) == "static");
             out.defs.push(Def {
@@ -522,8 +528,22 @@ fn nest(p: &mut Parsed) {
         .defs
         .iter()
         .map(|d| {
-            matches!(d.kind.as_str(), "property" | "variable" | "constant" | "field")
+            matches!(d.kind.as_str(), "property" | "variable" | "constant")
                 && d.container.is_some_and(|c| is_callable_kind(&p.defs[c].kind))
+                // A field of a type declared inside a function is local too.
+                || d.kind == FIELD && {
+                    let mut up = d.container;
+                    let mut inside = false;
+                    for _ in 0..64 {
+                        let Some(c) = up else { break };
+                        if is_callable_kind(&p.defs[c].kind) {
+                            inside = true;
+                            break;
+                        }
+                        up = p.defs[c].container;
+                    }
+                    inside
+                }
         })
         .collect();
     if local.iter().any(|x| *x) {
@@ -1623,7 +1643,9 @@ pub fn resolve_scoped(tx: &Connection, pid: i64, scope: Option<(&HashSet<String>
             ))?;
             for (name, c) in q.query_map([pid], map_cand)?.flatten() {
                 parent_of.insert(c.id, (c.pid, is_callable_kind(&c.kind)));
-                cands.entry(name).or_default().push(c);
+                if c.kind != FIELD {
+                    cands.entry(name).or_default().push(c);
+                }
             }
         }
         Some(_) => {
@@ -1632,8 +1654,12 @@ pub fn resolve_scoped(tx: &Connection, pid: i64, scope: Option<(&HashSet<String>
             ))?;
             let names: HashSet<&str> = refs.iter().map(|r| r.name.as_str()).collect();
             for n in names {
-                let mut v: Vec<Cand> =
-                    q.query_map(params![pid, n], map_cand)?.flatten().filter(|(name, _)| name == n).map(|x| x.1).collect();
+                let mut v: Vec<Cand> = q
+                    .query_map(params![pid, n], map_cand)?
+                    .flatten()
+                    .filter(|(name, c)| name == n && c.kind != FIELD)
+                    .map(|x| x.1)
+                    .collect();
                 v.sort_by_key(|c| c.id);
                 cands.insert(n.to_string(), v);
             }
