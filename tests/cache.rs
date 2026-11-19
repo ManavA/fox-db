@@ -203,6 +203,8 @@ fn pre_compact_asks_the_summary_to_keep_the_working_set() {
         assert!(out.contains(want), "missing {want:?}:\n{out}");
     }
     assert!(out.lines().count() <= 6 && out.len() < 500, "{out}");
+    // Asking for the lines "verbatim" made summaries copy the bullet list itself.
+    assert!(!out.contains("verbatim"), "{out}");
     assert_eq!(hook::run("pre-compact", &input, hook::Harness::Codex), "", "Codex reads no PreCompact instructions");
 }
 

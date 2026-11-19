@@ -143,7 +143,7 @@ fn owner_of(input: &Value) -> Option<String> {
 /// `handle` the hook just saved. A function of the handle only.
 pub fn compact_instructions(handle: &str) -> String {
     format!(
-        "foxdb: keep these in the summary, verbatim:\n\
+        "foxdb: keep these in the summary:\n\
          - the path:line anchors of files being read or edited, and the symbols being changed\n\
          - leads already ruled out, and why\n\
          - handoff packet {handle} (fox_read target={handle} restores the working set)\n"
