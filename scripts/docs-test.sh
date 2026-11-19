@@ -138,6 +138,18 @@ if command -v claude >/dev/null 2>&1; then
         status=1
     fi
 fi
+if command -v codex >/dev/null 2>&1; then
+    home=$scratch/plugin-codex/home
+    mkdir -p "$home/.codex"
+    cx() { env -i HOME="$home" CODEX_HOME="$home/.codex" PATH="$clean_path" codex "$@" 2>&1; }
+    if out=$(cx plugin marketplace add "$repo" && cx plugin add foxdb@foxdb && cx mcp get foxdb --json) \
+        && printf '%s' "$out" | tr -d ' \n' | grep -q '"env_vars":\["FOXDB_AGENT","FOXDB_PARENT","FOXDB_HOME","FOXDB_SESSION"\]'; then
+        echo "PASS codex plugin add foxdb@foxdb"
+    else
+        echo "FAIL codex plugin: $out"
+        status=1
+    fi
+fi
 
 # This machine's release tarball, when scripts/dist.sh has built one.
 tarball=$repo/dist/foxdb-$version-$(rustc -vV | sed -n 's/^host: //p').tar.gz

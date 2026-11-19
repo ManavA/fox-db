@@ -1,0 +1,10 @@
+{
+  "mcpServers": {
+    "foxdb": {
+      "command": "sh",
+      "args": ["-c", "f=$FOXDB_HOME; [ -n \"$f\" ] || f=$HOME/.foxdb; exec \"$f/bin/fox\" mcp"],
+      "env_vars": ["FOXDB_AGENT", "FOXDB_PARENT", "FOXDB_HOME", "FOXDB_SESSION"],
+      "tool_timeout_sec": 60
+    }
+  }
+}

@@ -166,3 +166,70 @@ fn hook_without_an_install_tells_the_user_once_at_session_start() {
         assert!(o.stdout.is_empty(), "{event} prints nothing");
     }
 }
+
+// ---- Codex: plugin/.codex-plugin/plugin.json overlays the same plugin directory ----
+
+#[test]
+fn codex_manifest_matches_the_crate_and_points_at_codex_files() {
+    let m = json("plugin/.codex-plugin/plugin.json");
+    assert_eq!(m["name"], "foxdb");
+    assert_eq!(m["version"], env!("CARGO_PKG_VERSION"), "bump .codex-plugin/plugin.json too");
+    assert_eq!(m["skills"], "./skills/");
+    assert_eq!(m["mcpServers"], "./codex/mcp.json");
+    assert_eq!(m["hooks"], "./codex/hooks.json");
+}
+
+#[test]
+fn codex_mcp_server_forwards_the_agent_identity() {
+    let m = json("plugin/codex/mcp.json");
+    let s = &m["mcpServers"]["foxdb"];
+    assert_eq!(s["command"], "sh");
+    assert_eq!(s["env_vars"], serde_json::json!(["FOXDB_AGENT", "FOXDB_PARENT", "FOXDB_HOME", "FOXDB_SESSION"]));
+    assert_eq!(s["tool_timeout_sec"], 60);
+}
+
+#[test]
+fn codex_mcp_command_runs_the_installed_fox() {
+    let m = json("plugin/codex/mcp.json");
+    let args: Vec<&str> = m["mcpServers"]["foxdb"]["args"].as_array().unwrap().iter().map(|a| a.as_str().unwrap()).collect();
+    let home = home_with_fox(0);
+    let o = Command::new("sh").args(&args).env("FOXDB_HOME", home.path()).output().unwrap();
+    assert_eq!(stdout(&o), "stub fox mcp\n");
+
+    // No FOXDB_HOME: ~/.foxdb.
+    let user = tempfile::tempdir().unwrap();
+    fs::rename(home.path(), user.path().join(".foxdb")).unwrap();
+    let o = Command::new("sh").args(&args).env_remove("FOXDB_HOME").env("HOME", user.path()).output().unwrap();
+    assert_eq!(stdout(&o), "stub fox mcp\n");
+}
+
+#[test]
+fn codex_hooks_are_the_same_four_with_harness_codex() {
+    let h = json("plugin/codex/hooks.json");
+    let events = h["hooks"].as_object().unwrap();
+    assert_eq!(events.len(), 4);
+    for (event, arg) in [
+        ("SessionStart", "session-start"),
+        ("SubagentStart", "subagent-start"),
+        ("SubagentStop", "subagent-stop"),
+        ("PreCompact", "pre-compact"),
+    ] {
+        let hooks = events[event][0]["hooks"].as_array().unwrap();
+        assert_eq!(hooks.len(), 1, "{event}");
+        assert_eq!(hooks[0]["command"], format!("\"$PLUGIN_ROOT/scripts/hook.sh\" {arg} codex"), "{event}");
+    }
+    let home = home_with_fox(0);
+    let o = run("plugin/scripts/hook.sh", &["pre-compact", "codex"], home.path());
+    assert_eq!(stdout(&o), "stub fox hook pre-compact --harness codex\n");
+}
+
+#[test]
+fn codex_hook_without_an_install_adds_context_only() {
+    let empty = tempfile::tempdir().unwrap();
+    let o = run("plugin/scripts/hook.sh", &["session-start", "codex"], empty.path());
+    assert!(o.status.success());
+    let v: Value = serde_json::from_str(&stdout(&o)).expect("session-start prints JSON");
+    assert!(v.get("systemMessage").is_none(), "Codex gets only hookSpecificOutput");
+    let ctx = v["hookSpecificOutput"]["additionalContext"].as_str().unwrap();
+    assert!(ctx.contains("scripts/install.sh"), "{ctx}");
+}
