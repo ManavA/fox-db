@@ -272,8 +272,22 @@ Hooks. foxdb does not install these; add them to `~/.claude/settings.json` yours
 - A brief cut at its budget or cap ends with `+N lines (brief cut short; fox_memory op=brief budget=2000)`; that call returns up to 2,000 tokens, so it gives back the cut lines. The hook budgets (400 tokens at SessionStart, 250 at SubagentStart) are in `context-budget.json`.
 - Every session-start also registers the session in the agent registry (only when a store exists).
 
-Prompt-cache safety. foxdb adds context only at SessionStart and SubagentStart, never from
-PreToolUse, PostToolUse or UserPromptSubmit: Claude Code rewrites the cached history when a tool
+Opt-in search hooks (off by default; AGENTS-SETUP.md step 6 has the settings entries):
+
+- `post-tool-use` with `[hooks] grep_context = true`: after a Bash `grep -n`, `rg -n` or
+  `git grep -n` in an indexed project, adds `path:lines kind Name c:handle` for the definition
+  holding each hit (at most 12 rows, 1,200 characters). It only adds `additionalContext`; the
+  tool output is unchanged. It is silent on compound commands (`;`, `&&` other than a leading
+  `cd DIR &&`, `$(...)`, redirection to a file), pipes into anything but `head`, `tail`, `sort`,
+  `uniq` or a filtering `grep`, `-l`/`-c`/`--json`-style output, hits outside any definition,
+  files changed since they were indexed, and projects foxdb has not indexed.
+- `user-prompt-submit` with `[hooks] prompt_context = true`: for each code-shaped word in the
+  prompt (`snake_case`, `camelCase`, `Type.member`, a backticked name, a source path) that
+  resolves to exactly one indexed definition (same case) or file, adds its location, caller
+  count and handle (at most 5 rows). Plain words and names with several definitions add nothing.
+
+Prompt-cache safety. By default foxdb adds context only at SessionStart and SubagentStart, never from
+PreToolUse, PostToolUse or UserPromptSubmit (the opt-in search hooks above are the exception): Claude Code rewrites the cached history when a tool
 hook returns context (anthropics/claude-code#83913), and per-prompt context grows every turn. A
 test runs every hook event and fails if any other one injects. `context-budget.json` commits the
 size of everything foxdb puts in a cached prefix (brief caps, `tools/list` bytes, server

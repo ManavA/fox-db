@@ -90,7 +90,7 @@ fn cwd_of(input: &Value) -> PathBuf {
     input["cwd"].as_str().map(PathBuf::from).or_else(|| std::env::current_dir().ok()).unwrap_or_else(|| PathBuf::from("."))
 }
 
-fn context(event: &str, text: String) -> String {
+pub(crate) fn context(event: &str, text: String) -> String {
     if text.trim().is_empty() {
         return String::new();
     }
@@ -321,6 +321,11 @@ fn register(event: &str, input: &Value, h: Harness) {
 
 /// Run one hook. Never errors: a failure is an empty string (the hook then adds nothing).
 pub fn run(event: &str, stdin: &str, h: Harness) -> String {
+    run_with(crate::config::get(), event, stdin, h)
+}
+
+/// [`run`] with explicit settings (the opt-in tool hooks read `[hooks]`).
+pub fn run_with(cfg: &crate::config::Config, event: &str, stdin: &str, h: Harness) -> String {
     let Ok(input) = serde_json::from_str::<Value>(stdin) else { return String::new() };
     if matches!(event, "session-start" | "subagent-start") {
         register(event, &input, h);
@@ -330,6 +335,9 @@ pub fn run(event: &str, stdin: &str, h: Harness) -> String {
         "subagent-start" => subagent_start(&input, h),
         "subagent-stop" => subagent_stop(&input, h),
         "pre-compact" => pre_compact(&input, h),
+        // Opt-in (`[hooks] grep_context` / `prompt_context`): off, they print nothing.
+        "post-tool-use" if cfg.hooks.grep_context => crate::toolhook::grep_context(&input).map(|t| context("PostToolUse", t)),
+        "user-prompt-submit" if cfg.hooks.prompt_context => crate::toolhook::prompt_context(&input).map(|t| context("UserPromptSubmit", t)),
         _ => Ok(String::new()),
     };
     r.unwrap_or_default()

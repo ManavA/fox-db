@@ -26,7 +26,7 @@ pub const USAGE: &str = "usage:
   fox scip import <index.scip> [--project P] [--trust-mtime]   precise tier from a SCIP index your own build produced
   fox vectors setup [--yes] | build [--project P] | status   the opt-in vector arm (builds with --features vectors)
   fox ingest sessions [--since-days N] [--claude DIR] [--codex DIR]   (read-only transcript digests)
-  fox hook session-start|subagent-start|subagent-stop|pre-compact [--harness claude|codex]   (hook JSON on stdin)
+  fox hook session-start|subagent-start|subagent-stop|pre-compact|post-tool-use|user-prompt-submit [--harness claude|codex]   (hook JSON on stdin)
 multi-agent:
   fox dispatch --harness codex|claude --task <text|h:ID> [--repo DIR] [--writer|--reviewer] [--label L] [--model M] [--packet h:ID]
   fox wait <agent|h:ID>... [--any|--all] [--timeout SECS]       exit 3 still running at the timeout, 4 stale/failed
