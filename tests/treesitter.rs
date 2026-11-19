@@ -1344,7 +1344,7 @@ fn fox_read_returns_bodies_and_outlines_with_ranges() {
     let out = call(serde_json::json!({"target": "pkg/shapes.py", "fresh": true}));
     assert!(out.contains("1 class Circle c:") && out.contains(" ..5"), "{out}");
     assert!(out.contains(" 4 method area c:") && out.contains("8 function unit c:"), "{out}");
-    assert!(out.contains("fox_read target=<handle> for one body, or lines=a-b"), "{out}");
+    assert!(out.contains("fox_read target=<handle> or lines=a-b reads one"), "{out}");
 }
 
 // ---- review fixes: correctness ----
@@ -1456,4 +1456,66 @@ fn upgrade_reparse_merges_the_full_text_tables() {
     for t in ["fts_node", "fts_body"] {
         assert!(db::fts_segments(&c, t) <= 1, "{t}: {} segments", db::fts_segments(&c, t));
     }
+}
+
+// ---- review fixes: scale and budget ----
+
+/// Code rides along only when the whole answer with code fits the budget asked for; otherwise
+/// the rows are locations only, and the hint names a budget that does show the code, only when
+/// one exists. A larger budget never shows less.
+#[test]
+fn code_rides_only_when_the_whole_answer_fits() {
+    let _g = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    let mut files: Vec<(String, String)> = vec![("core.c".into(), "int wake_task(int p) { return p; }\n".into())];
+    for i in 0..40 {
+        files.push((format!("d{i}/use.c"), format!("int caller_{i}(void)\n{{\n\treturn wake_task({i}) + wake_task({i} + 1);\n}}\n")));
+    }
+    let refs: Vec<(&str, &str)> = files.iter().map(|(a, b)| (a.as_str(), b.as_str())).collect();
+    let (_h, _r, p) = inline_project(&refs);
+    let has_code = |o: &str| o.lines().any(|l| l.starts_with("  :") && l.contains(" | "));
+    let small = fox_code(&p, "wake_task", "callers", 300);
+    assert!(!has_code(&small), "{small}");
+    let need: usize = small
+        .lines()
+        .find_map(|l| l.strip_prefix("code left out to fit the budget; budget="))
+        .and_then(|x| x.split_whitespace().next())
+        .and_then(|x| x.parse().ok())
+        .unwrap_or_else(|| panic!("no hint: {small}"));
+    assert!(need > 300 && need <= 4000, "{need}");
+    let at = fox_code(&p, "wake_task", "callers", need);
+    assert!(has_code(&at) && !at.contains("cursor="), "budget {need} must show the code whole:\n{at}");
+    let more = fox_code(&p, "wake_task", "callers", 4000);
+    assert!(has_code(&more), "{more}");
+    // Locations only cost what they did before: the hint is the only extra line.
+    assert!(!small.contains(" | "), "{small}");
+}
+
+/// An answer whose code could never fit names no budget: it would show nothing more.
+#[test]
+fn no_budget_hint_when_the_code_cannot_fit() {
+    let _g = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    let mut files: Vec<(String, String)> = vec![("core.c".into(), "int wake_task(int p) { return p; }\n".into())];
+    for i in 0..300 {
+        files.push((format!("d{i}/use.c"), format!("int caller_{i}(void) {{ return wake_task({i}); /* {} */ }}\n", "x".repeat(60))));
+    }
+    let refs: Vec<(&str, &str)> = files.iter().map(|(a, b)| (a.as_str(), b.as_str())).collect();
+    let (_h, _r, p) = inline_project(&refs);
+    let out = fox_code(&p, "wake_task", "callers", 4000);
+    assert!(!out.contains(" | ") && !out.contains("budget=4000") && out.contains("code left out"), "{out}");
+}
+
+/// A file outline lists types and functions; fields are counted, not listed, and a type's own
+/// outline lists them.
+#[test]
+fn file_outlines_leave_fields_to_their_type() {
+    let _g = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    let (_h, _r, p) = inline_project(&[(
+        "api/types.go",
+        "package api\n\ntype Pod struct {\n\tName string\n\tSpec string\n\tStatus string\n}\n\nfunc New() Pod { return Pod{} }\n",
+    )]);
+    let out = fox_code(&p, "api/types.go", "outline", 800);
+    assert!(out.contains("struct Pod") && out.contains("function New") && !out.contains("field "), "{out}");
+    assert!(out.contains("3 fields not listed"), "{out}");
+    let out = fox_code(&p, "Pod", "outline", 800);
+    assert!(out.contains("field Name") || out.contains(" field Name"), "{out}");
 }

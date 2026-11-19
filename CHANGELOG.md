@@ -31,8 +31,9 @@ First answers that were empty, wrong or padded in agent benchmark transcripts ar
 - Answers carry code. `callers` and `refs` rows end in the call site's line (`  :338 Caller c:1f | return f(x)`),
   or list one `   :line | code` row per site for a caller with several; `impact` rows end in the
   dependent's definition line. The code is shown only when the line still names the target
-  (a file changed since indexing shows none), clipped around the name. When the code would push an answer past its budget and the
-  locations alone fit, the code is left out with a line saying which budget shows it.
+  (a file changed since indexing shows none), clipped around the name. Code rides along only
+  when the whole answer with it fits the budget; otherwise the rows are locations only, as
+  before, and the second line names the budget that shows the code (when one up to 4000 does).
 - The server instructions, the four tool descriptions, the skill and the brief's tool line lead
   with the question each tool answers ("Where is X?", "Who calls X, and what breaks if X
   changes?"), say to call foxdb first even when a grep looks quicker, and no longer say to skip
@@ -42,7 +43,8 @@ First answers that were empty, wrong or padded in agent benchmark transcripts ar
   the brief's tool line, the bytes every session pays before its first call (instructions, tool
   list and brief line: 4,935) and the list of always-loaded tools.
 - `fox_read` with no mode returns a symbol's body, and for a file its declarations with the last
-  line of each (`..N`) and how to read one.
+  line of each (`..N`) and how to read one. File outlines count fields instead of listing them;
+  a type's own outline lists its fields.
 
 ## 0.2.2 (2026-11-18)
 

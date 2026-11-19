@@ -134,13 +134,12 @@ src/
 ~ tree-sitter, name-resolved
 
 $ fox code src/tiers.rs --rel outline --budget 70     # a path outlines the whole file
-~outline src/tiers.rs (23 symbols; ..N = last line; fox_read target=<handle> for one body, or lines=a-b)
+~outline src/tiers.rs (19 symbols, 4 fields not listed: outline a type for them; ..N = last line; fox_read target=<handle> or lines=a-b reads one)
 11 enum Tier c:65c ..20
 89 function is_secret_name c:65d ..141
 143 function name_of c:65e ..145
 150 struct Overrides c:65f ..153
- 151 field skip c:660
-+18 more (answer cut) · cursor=6
++15 more (answer cut) · cursor=5
 
 $ fox code c:345 --rel callees
 callees of ~c:345 function classify_file  src/tiers.rs:212
@@ -155,12 +154,17 @@ src/
 
 $ fox code is_secret_name --rel impact   # transitive dependents, grouped by depth and file
 impact of ~c:65d function is_secret_name  src/tiers.rs:89: 2 symbols; per depth 2/0
-partial at d1: `is_secret_name` also appears in 3 other files; confirm with: rg -nw is_secret_name
+partial at d1: `is_secret_name` is also named in 3 other files, not resolved to it; unresolved mentions at the end
 d1
  src/tiers.rs
   :249 classify_file c:66c | pub fn classify_file(rel: &str, size: u64, ov: &Overrides) -> Tier {
   :276 is_denied_path c:66d | pub fn is_denied_path(rel: &str) -> bool {
 d2
+unresolved mentions:
+  src/inventory.rs:141 | if tiers::is_secret_name(&name) {
+  src/inventory.rs:197 | return !tiers::is_secret_name(&e.file_name().to_string_lossy());
+  src/watch.rs:68 | || tiers::is_secret_name(&path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default())
+  tests/inventory.rs:105 | assert!(!foxdb::tiers::is_secret_name(name), "opened secret {rel}");
 ~ tree-sitter, name-resolved
 
 $ fox code classify_file --rel src       # source body with line numbers
@@ -225,8 +229,8 @@ Example exchange:
 - Every row starts with a handle: `s:` symbol (index store), `c:` tree-sitter symbol, `f:` file, `d:` doc section, `m:` milestone, `a:` summarized dir, `g:` memory, `x:` session, `h:` handoff. Every row ends in an exact `path:line`. Pass a handle (or a `Type.member` name) to `fox_graph` / `fox_read` / `fox code`.
 - `budget` is in tokens (default 500, max 4000). Search answers shrink gracefully: a page that fits as full rows is sent whole; otherwise the top five rows are sent in the richest form they fit (full, else skeleton: handle, kind, name, `path:line`, else ids: handle, `path:line`), with a `cursor` for the rest. A shorter form says so in the footer, and `fox_read <handle>` expands a row. A tight budget never trades the best rows' detail for a long tail of ids.
 - A large `fox_read` answer this session already received comes back as one line, `= already sent in this session: <handle> ...`; `fresh=true` resends it. The CLI does the same for `fox code --rel src|outline` when `FOXDB_SESSION` is set (`--fresh` resends); through `foxd` the client sends its own session with each request. This covers foxdb's own answers only. Rows are terse: relative paths, each directory and file printed once as a header.
-- Graph answers carry code. A `callers` or `refs` row with one site ends in ` | ` and that line's code; a caller with several sites is followed by one `   :line | code` row per site. An `impact` row ends in the dependent's definition line. Code is trimmed to 140 characters. When the answer with code exceeds the budget but its locations alone fit, the locations are sent with a last line `code left out to fit the budget; budget=N shows it`; otherwise the code stays and the answer pages. Answers with more than 400 sites or dependents carry no code.
-- `fox_read` with no `mode`: a path returns its declarations (`line kind name handle ..last line`, a header saying how to read one), a symbol name or handle returns its body.
+- Graph answers carry code. A `callers` or `refs` row with one site ends in ` | ` and that line's code; a caller with several sites is followed by one `   :line | code` row per site. An `impact` row ends in the dependent's definition line. Code is shown only when the line still names the target (a file changed since indexing shows none), clipped to 140 characters around the name. Code rides along only when the whole answer with it fits the budget; otherwise the rows are locations only and the second line says `code left out to fit the budget; budget=N shows it` (or, past 4000 tokens, that the answer is too long to carry it). Answers with more than 400 sites or dependents carry no code.
+- `fox_read` with no `mode`: a path returns its declarations (`line kind name handle ..last line`, a header saying how to read one; fields are counted, and `mode=outline` on a type lists them), a symbol name or handle returns its body.
 - A footer `+N more · cursor=K` or `+N more (answer cut) · cursor=K` means the answer is incomplete as shown: call again with `cursor=K` for the next page. Narrow the query before raising the budget.
 - `~` on a row means not compiler-resolved: a tree-sitter result, or a Swift symbol whose file changed since the last build (lines may have drifted; `src` relocates by name).
 
@@ -470,7 +474,7 @@ a test checks the tool list, instructions, briefs, answers and the report schema
 - Swift symbols need an Xcode index store (a build must have run); unbuilt targets only show `~` tree-sitter rows. On Linux Swift needs `FOXDB_INDEXSTORE_LIB`.
 - Non-Swift callers are name-resolved by tree-sitter, not type-checked, unless a fresh SCIP import covers the file (see [Precise tier](#precise-tier-scip)); treat `callers` and `impact` as a lower bound. A call through a receiver resolves by its last name: certainly when the receiver is named like the type (`inputs.render()` reaches `Inputs.render`), as a guess when the name has several words and at most three members share it, and not at all for one-word names (`push`, `get`) with no scope signal, so calls on interfaces, generics and library types are often missed. C free functions resolve across the project, but calls through function pointers and macros are not seen. Guessed rows are marked `guess 1 of N` (or `guess by name` for a lone candidate) and counted in the header (`12 call sites in 4 files, 5 guessed by name`).
 - `impact` lists, level by level, the definitions that call or name the symbol (a function passed as an argument or named in an initializer table counts), and files that use it at their top level (a C command table, a Python module-level call, a test registered inside an anonymous callback) as `  :line (top)`; such a file is counted but not followed further. Through dispatch it also lists the callers of the interface or base methods the symbol implements or overrides (` via Router.add`) and, for an interface method, its implementations (` implements Router.add`) and their callers. Supertypes are the ones a class names (`implements`, `extends`, base classes). A Go type matches an interface when it has every method of it (embedded interfaces included) and the link has evidence: both in one directory, or a file of the type's package that imports the interface's package and names the interface. A caller of the interface method found only by a name guess is listed but not followed further; in Python and JS it counts only through `self`/`this` or a receiver named like the base type. Lines starting `partial at dN:` say where the answer may be missing something: the name occurs in files the answer does not list, a call that could have meant a dependent the walk expanded (through a receiver named like its type, or with no nearer candidate) was guessed to another same-name definition, the walk stopped (5000 dependents, or past depth 4), or the dispatch candidate list was capped. Rows reached through a name guess are marked `guess`; a guess among more than eight same-name definitions, through a receiver not named like the target's type, is not listed, only counted in the header (`, 3 weak guesses left out`) with a `partial` (or, for `callers`, `may be incomplete`) line, since it may be real. Supertypes are followed only when resolved with certainty.
-- When the name occurs in more files than an answer lists, `callers` and `refs` add `may be incomplete: ... confirm with: rg -nw name` and `impact` adds `partial at d1: ...`. The count comes from the index alone (references of that name not resolved elsewhere, and every code file holding the name as a whole word, case as typed, anywhere in the file), so it also counts comments, strings, same-name locals and fields, and other same-name definitions' callers, and leaves out files that define a same-name symbol; it is a prompt to check, not a ground truth.
+- When the name occurs in more files than an answer lists, `callers` and `refs` add `may be incomplete: ...` and `impact` adds `partial at d1: ...`; up to 15 such files are listed at the end under `unresolved mentions:` as `path:line | code`, and more are counted. A field's uses are not tracked: `callers`, `refs` and `impact` of a field say so and list the files that name it. The count comes from the index alone (references of that name not resolved elsewhere, and every code file holding the name as a whole word, case as typed, anywhere in the file), so it also counts comments, strings, same-name locals and fields, and other same-name definitions' callers, and leaves out files that define a same-name symbol; it is a prompt to check, not a ground truth.
 - Type references (a type used in a signature) are not recorded for most languages, so `refs` of a type mostly lists constructor calls and supertype lists.
 - Search is lexical, trigram, name-prefix and graph based; there is no fuzzy or embedding search.
 - A project served by tantivy (opt-in) ranks keyword matches by per-field BM25 rather than FTS5's one weighted score, so its order differs from FTS5's and recall can drop: on the kubernetes eval sets recall@5 fell from 1.00 to 0.80 (lexical) and from 0.67 to 0.31 (retrieval, vague queries hardest hit); see [benchmarks](benchmarks.md#big-projects-milestone-7).

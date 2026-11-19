@@ -367,9 +367,10 @@ fn mention_rows(root: &std::path::Path, files: &[String], name: &str) -> Vec<Str
     out
 }
 
-/// Code rows (`   :line | code`) and inline code (`  :line Caller c:h | code`) make an answer
-/// longer. When the answer with code exceeds the budget but its locations alone fit, send the
-/// locations and say how much budget the code needs; otherwise keep the code and page.
+/// Code rows (`   :line | code`) and inline code (`  :line Caller c:h | code`) ride along only
+/// when the whole answer with them fits the budget. Otherwise the rows are locations only, as
+/// before, and a last line names the budget that shows the code, when there is one (at most
+/// 4000 tokens); a larger budget never shows less.
 fn fit_code(lines: &mut Vec<String>, budget: usize) {
     let room = budget.clamp(32, 4000) * 4 - 64;
     let size = |v: &[String]| v.iter().map(|l| l.len() + 1).sum::<usize>();
@@ -383,11 +384,21 @@ fn fit_code(lines: &mut Vec<String>, budget: usize) {
             *l = a.to_string();
         }
     }
-    if size(&plain) < full && size(&plain) <= room {
-        let need = (full + 64).div_ceil(4).min(4000);
-        plain.push(format!("code left out to fit the budget; budget={need} shows it"));
-        *lines = plain;
+    if size(&plain) == full {
+        return;
     }
+    // The smallest budget whose room holds the answer with code.
+    let need = (full + 64).div_ceil(4);
+    // Near the top, so the first page carries it.
+    plain.insert(
+        plain.len().min(2),
+        if need <= 4000 {
+            format!("code left out to fit the budget; budget={need} shows it")
+        } else {
+            "code left out: the answer is too long to carry it; fox_read target=<handle> shows one site's code".to_string()
+        },
+    );
+    *lines = plain;
 }
 
 /// A guess among more same-name definitions than this says nothing about which one is meant
@@ -1388,9 +1399,14 @@ fn outline_file(c: &Connection, p: &Project, rel: &str, cursor: usize, budget: u
     if v.is_empty() {
         return Ok(None);
     }
-    let mut lines =
-        vec![format!("~outline {rel} ({} symbols; ..N = last line; fox_read target=<handle> for one body, or lines=a-b)", v.len())];
-    for s in &v {
+    // Fields are left to their type's outline, so types and functions stay on the first page.
+    let fields = v.iter().filter(|s| s.kind == crate::tsindex::FIELD).count();
+    let note = if fields > 0 { format!(", {fields} fields not listed: outline a type for them") } else { String::new() };
+    let mut lines = vec![format!(
+        "~outline {rel} ({} symbols{note}; ..N = last line; fox_read target=<handle> or lines=a-b reads one)",
+        v.len() - fields
+    )];
+    for s in v.iter().filter(|s| s.kind != crate::tsindex::FIELD) {
         let depth = s.parent.as_deref().map(|x| x.matches('.').count() + 1).unwrap_or(0);
         let end = if s.end_line > s.line { format!(" ..{}", s.end_line) } else { String::new() };
         lines.push(format!("{}{} {} {} {}{end}", " ".repeat(depth), s.line, s.kind, s.name, s.h()));
