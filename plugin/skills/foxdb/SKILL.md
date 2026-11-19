@@ -34,12 +34,11 @@ For past decisions, handoffs and long logs: `fox_memory op=recall q=<words>`; `o
 | Where is a symbol, file, doc section, milestone, memory, session | `fox_find(q, kind?)` | `fox find <q> [--kind ...]` |
 | Callers / refs / overrides / conformers / impact | `fox_graph(target, rel)` | `fox code <sym> --rel callers\|...\|impact` |
 | Body, outline, doc section, handoff, session digest | `fox_read(target, mode?)` | `fox code <sym> --rel src\|outline` |
-| Recall, note, board, handoffs | `fox_memory(op)` | `fox mem brief\|post\|read\|pickup` |
+| Recall, note, board, handoffs, stale memory | `fox_memory(op)` | `fox mem brief\|post\|read\|pickup\|check` |
 | What a design doc cites that changed | | `fox drift [doc.md]` |
 | Minimal context for a fresh reviewer | | `fox pack <doc.md>` |
 
 - Handles: `s:`/`c:` symbol, `f:` file, `d:` doc, `m:` milestone, `a:` dir, `g:` memory, `x:` session, `h:` handoff.
 - Every tool takes `budget` (tokens, default 500). `+N more · cursor=K` means the answer is cut: pass `cursor=K` for the rest. `code left out to fit the budget; budget=N shows it` means call again with that budget for the code.
 - `~` = not compiler-resolved (tree-sitter, or Swift changed since the build); `guess 1 of N` marks a call resolved by name among N same-name definitions.
-- A repeated `fox_read` returns `= already sent ...`; pass `fresh=true` if that text is no longer in your context.
 - Secrets are never read or indexed. If a `fox` call errors, continue with your other tools. foxdb is read-only: edit with your editor tools.
