@@ -166,10 +166,18 @@ fn context_is_injected_only_at_session_and_subagent_start() {
         let ok = l.contains("context(\"SessionStart\"")
             || l.contains("context(\"SubagentStart\"")
             || (l.contains("context(\"PostToolUse\"") && l.contains("cfg.hooks.grep_context"))
-            || l.contains("context(\"UserPromptSubmit\"");
+            || (l.contains("context(\"UserPromptSubmit\"") && l.contains("cfg.hooks.prompt_context"));
         assert!(ok, "new context carrier: {l}");
     }
-    assert!(src.contains("\"user-prompt-submit\" if cfg.hooks.prompt_context"), "prompt hook must stay behind its switch");
+    // Each opt-in hook is wired exactly once, as a guarded match arm.
+    for (arm, carrier) in [
+        ("\"post-tool-use\" if cfg.hooks.grep_context =>", "context(\"PostToolUse\""),
+        ("\"user-prompt-submit\" if cfg.hooks.prompt_context =>", "context(\"UserPromptSubmit\""),
+    ] {
+        let lines: Vec<&str> = src.lines().filter(|l| l.contains(carrier)).collect();
+        assert_eq!(lines.len(), 1, "{carrier} must appear once: {lines:?}");
+        assert!(lines[0].trim_start().starts_with(arm), "{carrier} must sit behind its switch: {}", lines[0]);
+    }
 }
 
 /// The committed size budget (`context-budget.json`): briefs, the tool list, the server

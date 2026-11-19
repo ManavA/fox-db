@@ -138,6 +138,8 @@ struct Search {
     dir: PathBuf,
     /// Lines carry no path (`line:text`): the one file searched.
     single_file: Option<String>,
+    /// Identifier words of the search patterns, to put a definition they name first.
+    words: Vec<String>,
 }
 
 /// Which pieces of a short-flag cluster take an argument, per tool.
@@ -200,7 +202,7 @@ const GREP: Flags = Flags {
 };
 
 const RG: Flags = Flags {
-    short_arg: "efgtTABCmMjErdS",
+    short_arg: "efgtTABCmMjErd",
     long_arg: &[
         "--regexp",
         "--file",
@@ -290,13 +292,15 @@ const GIT_GREP: Flags = Flags {
 struct Parsed {
     positional: Vec<String>,
     pattern_given: bool,
+    /// Values of `-e`/`--regexp`.
+    patterns: Vec<String>,
     numbers: bool,
     with_name: bool,
     no_name: bool,
 }
 
 fn parse_flags(words: &[String], f: &Flags) -> Option<Parsed> {
-    let mut p = Parsed { positional: vec![], pattern_given: false, numbers: false, with_name: false, no_name: false };
+    let mut p = Parsed { positional: vec![], pattern_given: false, patterns: vec![], numbers: false, with_name: false, no_name: false };
     let mut i = 0;
     let mut opts_done = false;
     while i < words.len() {
@@ -332,6 +336,13 @@ fn parse_flags(words: &[String], f: &Flags) -> Option<Parsed> {
             }
             if name == "--regexp" || name == "--file" {
                 p.pattern_given = true;
+                let v = match long.split_once('=') {
+                    Some((_, v)) => Some(v.to_string()),
+                    None => words.get(i).cloned(),
+                };
+                if let (true, Some(v)) = (name == "--regexp", v) {
+                    p.patterns.push(v);
+                }
             }
             if f.long_arg.contains(&name.as_str()) && !has_val {
                 i += 1;
@@ -365,6 +376,11 @@ fn parse_flags(words: &[String], f: &Flags) -> Option<Parsed> {
             if f.short_arg.contains(*c) {
                 if *c == 'e' || *c == 'f' {
                     p.pattern_given = true;
+                }
+                if *c == 'e' {
+                    let v: String = cs[k + 1..].iter().collect();
+                    let v = if v.is_empty() { words.get(i).cloned() } else { Some(v) };
+                    p.patterns.extend(v);
                 }
                 if k + 1 == cs.len() {
                     i += 1; // the argument is the next word
@@ -525,15 +541,43 @@ fn search_shape(command: &str, cwd: &Path) -> Option<Search> {
         return None;
     }
     let paths: Vec<&String> = p.positional.iter().skip(if p.pattern_given { 0 } else { 1 }).collect();
+    let mut pats = p.patterns.clone();
+    if !p.pattern_given {
+        pats.extend(p.positional.first().cloned());
+    }
+    let words = pattern_words(&pats);
     if git {
-        return (!p.no_name).then_some(Search { dir, single_file: None });
+        return (!p.no_name).then_some(Search { dir, single_file: None, words });
     }
     // One plain file named and no forced file name: grep and rg print `line:text`.
     let single = paths.len() == 1 && !paths[0].contains(['*', '?', '[']) && join(&dir, paths[0]).is_file();
     if p.no_name || (single && !p.with_name) {
-        return if single { Some(Search { dir, single_file: Some(paths[0].clone()) }) } else { None };
+        return if single { Some(Search { dir, single_file: Some(paths[0].clone()), words }) } else { None };
     }
-    Some(Search { dir, single_file: None })
+    Some(Search { dir, single_file: None, words })
+}
+
+/// The identifier words of regex patterns: `\bfoo_bar\(` gives `foo_bar`. Escapes such as `\b`
+/// or `\w` are dropped, not read as the letter that follows.
+fn pattern_words(pats: &[String]) -> Vec<String> {
+    let mut out = vec![];
+    for pat in pats {
+        let mut cur = String::new();
+        let mut cs = pat.chars();
+        while let Some(c) = cs.next() {
+            if c == '\\' {
+                cs.next();
+                out.push(std::mem::take(&mut cur));
+            } else if c.is_alphanumeric() || c == '_' {
+                cur.push(c);
+            } else {
+                out.push(std::mem::take(&mut cur));
+            }
+        }
+        out.push(cur);
+    }
+    out.retain(|w| w.len() > 1 && is_ident(w));
+    out
 }
 
 fn is_ident(s: &str) -> bool {
@@ -672,8 +716,29 @@ pub fn grep_context(input: &Value) -> Result<String> {
     let cwd = input["cwd"].as_str().map(PathBuf::from).unwrap_or_else(|| std::env::current_dir().unwrap_or_default());
     let Some(shape) = search_shape(command, &cwd) else { return Ok(String::new()) };
     let Some(c) = crate::db::open_ro() else { return Ok(String::new()) };
-    let Some(p) = project::find(&c, &project::locate(&shape.dir))? else { return Ok(String::new()) };
+    let Some(p) = project_of(&c, &shape.dir)? else { return Ok(String::new()) };
     Ok(attribute(&c, &p, &shape, stdout))
+}
+
+/// The indexed project holding `dir`. Outside git, `locate` takes the directory itself as the
+/// root, so a subdirectory of an indexed plain directory is matched by walking up to it.
+fn project_of(c: &Connection, dir: &Path) -> Result<Option<Project>> {
+    let loc = project::locate(dir);
+    if loc.common_dir.is_some() {
+        return project::find(c, &loc);
+    }
+    let mut d = Some(loc.root.as_path());
+    while let Some(x) = d {
+        let l = project::locate(x);
+        if l.kind != "dir" {
+            break;
+        }
+        if let Some(p) = project::find(c, &l)? {
+            return Ok(Some(p));
+        }
+        d = x.parent();
+    }
+    Ok(None)
 }
 
 fn canon(p: &Path) -> PathBuf {
@@ -711,8 +776,8 @@ fn file_defs(c: &Connection, pid: i64, root: &Path, abs: &Path) -> FileDefs {
 fn attribute(c: &Connection, p: &Project, shape: &Search, stdout: &str) -> String {
     let root = canon(&p.root);
     let mut files: HashMap<String, FileDefs> = HashMap::new();
-    // Per definition, in first-hit order: (path, kind, qname, handle, hit lines).
-    let mut rows: Vec<(String, String, String, String, Vec<i64>)> = vec![];
+    // Per definition, in first-hit order: (path, kind, qname, handle, hit lines, named by the pattern).
+    let mut rows: Vec<(String, String, String, String, Vec<i64>, bool)> = vec![];
     let mut row_of: HashMap<i64, usize> = HashMap::new();
     for l in stdout.lines().take(MAX_SCAN_LINES) {
         let Some((path, line)) = split_hit(l, shape.single_file.as_deref()) else { continue };
@@ -729,19 +794,19 @@ fn attribute(c: &Connection, p: &Project, shape: &Search, stdout: &str) -> Strin
             Some(&k) => rows[k].4.push(line),
             None => {
                 row_of.insert(d.id, rows.len());
-                rows.push((rel.clone(), d.kind.clone(), d.qname(), d.h(), vec![line]));
+                rows.push((rel.clone(), d.kind.clone(), d.qname(), d.h(), vec![line], shape.words.contains(&d.name)));
             }
         }
     }
     if rows.is_empty() {
         return String::new();
     }
-    // Code before tests, otherwise in the order grep printed them.
-    rows.sort_by_key(|r| is_test_path(&r.0));
+    // The definition the pattern names, then code before tests, otherwise in grep's order.
+    rows.sort_by_key(|r| (!r.5, is_test_path(&r.0)));
     let head = "foxdb: definitions holding these hits (fox_read target=<handle> reads one; fox_graph target=<handle> rel=callers)\n";
     let mut out = String::from(head);
     let mut shown = 0;
-    for (path, kind, q, h, lines) in &rows {
+    for (path, kind, q, h, lines, _) in &rows {
         if shown == GREP_ROWS {
             break;
         }
@@ -903,7 +968,7 @@ pub fn prompt_context(input: &Value) -> Result<String> {
     }
     let cwd = input["cwd"].as_str().map(PathBuf::from).unwrap_or_else(|| std::env::current_dir().unwrap_or_default());
     let Some(c) = crate::db::open_ro() else { return Ok(String::new()) };
-    let Some(p) = project::find(&c, &project::locate(&cwd))? else { return Ok(String::new()) };
+    let Some(p) = project_of(&c, &cwd)? else { return Ok(String::new()) };
     let mut rows = vec![];
     let mut seen = std::collections::HashSet::new();
     for t in terms.iter().take(40) {
@@ -990,6 +1055,14 @@ mod tests {
         for p in ["pkg/a/b.go", "src/contest.c", "django/test_utils_x/a.py"] {
             assert!(!is_test_path(p), "{p}");
         }
+    }
+
+    #[test]
+    fn words_of_patterns() {
+        let w = |p: &[&str]| pattern_words(&p.iter().map(|s| s.to_string()).collect::<Vec<_>>());
+        assert_eq!(w(&["\\bGetContainerStatus\\("]), ["GetContainerStatus"]);
+        assert_eq!(w(&["func (m *x) Foo|bar_baz", "a"]), ["func", "Foo", "bar_baz"]);
+        assert!(w(&["\\w+\\s"]).is_empty());
     }
 
     #[test]

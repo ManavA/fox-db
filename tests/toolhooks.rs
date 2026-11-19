@@ -364,3 +364,58 @@ fn grep_rows_put_non_test_files_first() {
     let rows: Vec<&str> = t.lines().skip(1).collect();
     assert!(rows.last().is_some_and(|l| l.contains("TestPlace")), "{t}");
 }
+
+#[test]
+fn grep_rows_put_the_definition_named_by_the_pattern_first() {
+    let _g = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    let (_h, repo) = setup();
+    let r = repo.path();
+    // Twenty callers of `get_status` come before its definition in grep's output.
+    let mut src = String::new();
+    for i in 0..20 {
+        src.push_str(&format!("def caller_{i}():\n    return get_status()\n\n\n"));
+    }
+    src.push_str("def get_status():\n    return 1\n");
+    fs::write(r.join("shop/status.py"), src).unwrap();
+    index(r);
+    let out = grep(r, "shop", "get_status");
+    for cmd in ["grep -rn get_status shop", "rg -n 'get_status\\(' shop", "grep -rn -e '\\bget_status' shop"] {
+        let t = ctx(&post(&on(), r, cmd, &out), "PostToolUse");
+        let first = t.lines().nth(1).unwrap_or_default();
+        assert!(first.contains(" get_status c:"), "{cmd}: {t}");
+    }
+    // A name that only contains the pattern's word is not promoted.
+    let t = ctx(&post(&on(), r, "grep -rn get_status shop", &out), "PostToolUse");
+    assert!(t.lines().nth(2).is_some_and(|l| l.contains("caller_0")), "{t}");
+}
+
+#[test]
+fn rg_smart_case_flag_takes_no_argument() {
+    let _g = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    let (_h, repo) = setup();
+    let r = repo.path();
+    let out = grep(r, "shop", "TOKEN_MARK");
+    for cmd in ["rg -nS TOKEN_MARK shop", "rg -Sn TOKEN_MARK shop", "rg -S -n TOKEN_MARK shop"] {
+        assert!(ctx(&post(&on(), r, cmd, &out), "PostToolUse").contains("Cart.add_item"), "{cmd}");
+    }
+}
+
+#[test]
+fn grep_from_a_subdirectory_of_a_project_that_is_not_a_git_repo() {
+    let _g = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    let home = tempfile::tempdir().unwrap();
+    let repo = tempfile::tempdir().unwrap();
+    unsafe {
+        std::env::set_var("FOXDB_HOME", home.path());
+        std::env::set_var("FOXDB_CLAUDE_PROJECTS", home.path().join("no-claude"));
+    }
+    copy_dir(&fixture(), repo.path());
+    let r = repo.path();
+    index(r);
+    let sub = r.join("shop");
+    let out = grep(&sub, ".", "TOKEN_MARK");
+    assert!(ctx(&post(&on(), &sub, "grep -rn TOKEN_MARK .", &out), "PostToolUse").contains("Cart.total_price"));
+    // And from the root, as before.
+    let out = grep(r, "shop", "TOKEN_MARK");
+    assert!(ctx(&post(&on(), r, "grep -rn TOKEN_MARK shop", &out), "PostToolUse").contains("PlaceOrder"));
+}
