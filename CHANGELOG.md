@@ -67,6 +67,11 @@ First answers that were empty, wrong or padded in agent benchmark transcripts ar
   fails with "unable to open database file": when the store's directory cannot hold the `-shm`
   file and no `-wal` holds unmerged pages, the store opens `immutable=1`. A daemon socket the
   sandbox cannot reach falls back to answering directly, as before.
+- `fox_read` no longer answers a repeat with `= already sent in this session`. One `fox mcp`
+  process serves a Claude Code session and all its subagents (tool calls carry no agent
+  identity) and outlives compactions, so the reference pointed subagents and compacted sessions
+  at text they never had. The `fresh` argument is gone from the tool list. The CLI keeps its
+  per-`FOXDB_SESSION` set for `fox code --rel src|outline`, and the PreCompact hook now clears it.
 
 ## 0.2.2 (2026-11-18)
 

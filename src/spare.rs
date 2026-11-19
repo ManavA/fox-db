@@ -5,12 +5,13 @@
 //!   tier those fit, and the footer gives the cursor for
 //!   the rest and says how to expand. A tight budget never trades the best rows' detail for a
 //!   long tail of low-ranked ids.
-//! - **Already sent**: a large answer that this session already received comes back as a short
-//!   reference with its handle, so a re-read costs a line. `fresh=true` (MCP) or
-//!   `FOXDB_FRESH=1` (CLI) always returns the full text, for agents that never saw the first copy.
+//! - **Already sent** (CLI only): a large `fox code --rel src|outline` answer that this
+//!   `FOXDB_SESSION` already received comes back as a short reference with its handle, so a
+//!   re-read costs a line; `--fresh` returns the full text. The PreCompact hook clears the
+//!   session's set. The MCP server keeps none: one server process serves a session and all its
+//!   subagents and outlives compactions, so it cannot know what a caller still holds.
 
 use rusqlite::{Connection, params};
-use std::collections::HashSet;
 use std::fmt::Write;
 
 pub struct Row {
@@ -98,28 +99,10 @@ pub const DEDUP_MIN_BYTES: usize = 600;
 
 fn reference(handle: &str, h: &str, bytes: usize) -> String {
     format!(
-        "= already sent in this session: {handle} (unchanged, #{}, ~{} tokens). Pass fresh=true if it is not in your context.\n",
+        "= already sent in this session: {handle} (unchanged, #{}, ~{} tokens). Pass --fresh if it is not in your context.\n",
         &h[..8],
         bytes.div_ceil(4)
     )
-}
-
-/// In-memory seen-set for one MCP server process (one harness session).
-#[derive(Default)]
-pub struct Seen(HashSet<String>);
-
-impl Seen {
-    /// `text`, or a one-line reference if this exact text was already returned.
-    pub fn filter(&mut self, handle: &str, text: String, fresh: bool) -> String {
-        if text.len() < DEDUP_MIN_BYTES {
-            return text;
-        }
-        let h = hash(&text);
-        if !self.0.insert(h.clone()) && !fresh {
-            return reference(handle, &h, text.len());
-        }
-        text
-    }
 }
 
 /// The CLI's seen-set, persisted per client session id (`FOXDB_SESSION`, sent through foxd). No
@@ -191,17 +174,5 @@ mod tests {
         assert!(out.len() <= 50 * 4, "{}", out.len());
         let (out, _) = tiered(&r, 0, 32, 20);
         assert!(out.contains("cursor="), "{out}");
-    }
-
-    #[test]
-    fn seen_set_turns_repeats_into_references() {
-        let mut s = Seen::default();
-        let big = "x".repeat(DEDUP_MIN_BYTES + 10);
-        assert_eq!(s.filter("s:1", big.clone(), false), big);
-        let again = s.filter("s:1", big.clone(), false);
-        assert!(again.starts_with("= already sent") && again.contains("s:1") && again.len() < 200, "{again}");
-        assert_eq!(s.filter("s:1", big.clone(), true), big);
-        assert_eq!(s.filter("s:2", "small".into(), false), "small");
-        assert_eq!(s.filter("s:2", "small".into(), false), "small");
     }
 }

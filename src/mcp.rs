@@ -45,12 +45,6 @@ fn warm() -> &'static std::sync::Mutex<crate::search::Warm> {
     W.get_or_init(Default::default)
 }
 
-/// What this session has already been sent (fox_read answers only).
-fn seen() -> &'static std::sync::Mutex<crate::spare::Seen> {
-    static S: std::sync::OnceLock<std::sync::Mutex<crate::spare::Seen>> = std::sync::OnceLock::new();
-    S.get_or_init(Default::default)
-}
-
 /// Short server instructions, sent once in `initialize`. Frozen with the tool list (see the
 /// hash test): both sit in every request's cached prefix.
 pub const INSTRUCTIONS: &str = "foxdb answers code questions from an index of this repo. \
@@ -92,13 +86,12 @@ pub fn tools() -> Value {
             "depth": {"type": "integer", "description": "impact depth, default 2"},
             "budget": budget, "cursor": cursor}, "required": ["rel"]}},
         {"name": "fox_read", "_meta": always,
-         "description": "What does X say? A symbol's body, a file's declarations with line ranges, a doc section, a handoff (h:) or a session digest (x:). Use it to read one symbol or section instead of a whole file. A repeat returns a short 'already sent' line.",
+         "description": "What does X say? A symbol's body, a file's declarations with line ranges, a doc section, a handoff (h:) or a session digest (x:). Use it to read one symbol or section instead of a whole file.",
          "annotations": ro,
          "inputSchema": {"type": "object", "required": ["target"], "properties": {
             "target": {"type": "string", "description": "handle, symbol name or repo path"},
             "mode": {"type": "string", "enum": ["outline", "signature", "body", "section", "context"]},
             "lines": {"type": "string", "description": "a-b, for files"},
-            "fresh": {"type": "boolean", "description": "resend even if already sent this session"},
             "budget": budget, "cursor": cursor}}},
         {"name": "fox_memory",
          "description": "What was decided or found before? recall searches notes, memory files, milestones and past sessions. Also: brief; note; post a finding/claim/request/decision; read the board (since=auto: only what is new to you); pickup or take (leased) a handoff; packet: create (text=goal) or render id=h:; agents: the agent tree; dispatch a codex/claude worker (text=task); wait for agents or h: (bounded, call again).",
@@ -235,12 +228,9 @@ pub fn call_tool(name: &str, a: &Value) -> Result<String> {
             let o = code::CodeOpts { rel, depth: arg_n(a, "depth").unwrap_or(2), budget, cursor, fallback: false };
             Ok(while_indexing(Some(&p), code::run(&c, &p, arg_s(a, "target").unwrap_or(""), &o)?))
         }
-        "fox_read" => {
-            let t = arg_s(a, "target").unwrap_or("").to_string();
-            let fresh = a.get("fresh").and_then(Value::as_bool).unwrap_or(false);
-            let out = read_tool(ro, a, budget, cursor)?;
-            Ok(seen().lock().unwrap_or_else(|e| e.into_inner()).filter(&t, out, fresh))
-        }
+        // No "already sent" references here: this one process serves the session and all its
+        // subagents, and outlives compactions, so it cannot know what a caller still holds.
+        "fox_read" => read_tool(ro, a, budget, cursor),
         "fox_memory" => memory_tool(ro, a, budget, cursor),
         n => bail!("unknown tool {n}"),
     }

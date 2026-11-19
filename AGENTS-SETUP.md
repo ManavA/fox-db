@@ -383,8 +383,7 @@ re-searching. `~` marks a result that is not compiler-resolved; treat `callers` 
 
 **Budgets.** `budget` is in tokens (default 500, max 4000). Under a tight budget rows shrink
 (full, then skeleton, then ids) before any are dropped. `+N more · cursor=K` or `+N more (answer cut) · cursor=K` means the answer is cut: call again
-with `cursor=K`; narrow the query before raising the budget. A repeated `fox_read` returns
-`= already sent …`; pass `fresh=true` only if that text has left your context.
+with `cursor=K`; narrow the query before raising the budget.
 
 **Multi-agent recipes** (details in [docs/multi-agent.md](docs/multi-agent.md) and
 [docs/swarm.md](docs/swarm.md)):

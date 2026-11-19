@@ -143,6 +143,13 @@ fn pre_compact(input: &Value, h: Harness) -> Result<String> {
         return Ok(String::new());
     }
     let w = db::open_rw()?;
+    // The compaction drops what the CLI sent this session (`FOXDB_SESSION`, a dispatched worker's
+    // id): forget it, so the next read returns the text, not an "already sent" reference.
+    if let Ok(s) = std::env::var("FOXDB_SESSION")
+        && !s.is_empty()
+    {
+        w.execute("DELETE FROM seen WHERE session = ?1", [&s])?;
+    }
     let Some(p) = project::find(&w, &project::locate(&cwd_of(input)))? else { return Ok(String::new()) };
     let owner = owner_of(input);
     let tx = input["transcript_path"].as_str().map(PathBuf::from);

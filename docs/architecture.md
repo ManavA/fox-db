@@ -217,8 +217,10 @@ user service; foxdb never starts it for you.
 
 - **Index generation.** Every index or memory write bumps a counter; `foxd` and the MCP server key
   their result caches and in-memory graphs by it, so a re-index is seen on the next query.
-- **Already sent.** Within one session a large `fox_read` answer is sent once; later calls get a
-  one-line reference (`fresh=true` resends).
+- **Already sent.** Within one CLI session (`FOXDB_SESSION`) a large `fox code --rel src|outline`
+  answer is sent once; later calls get a one-line reference (`--fresh` resends), and the
+  PreCompact hook clears the set. The MCP server keeps no such set: it serves a session and all
+  its subagents and outlives compactions.
 - **Prompt-cache safety.** foxdb adds context only at SessionStart and SubagentStart, and every
   byte it puts in a cached prefix (tool definitions, server instructions, brief caps, the dispatch
   brief, the report schema) is committed in `context-budget.json`, which a test enforces. Briefs

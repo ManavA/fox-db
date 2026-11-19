@@ -106,7 +106,7 @@ fn mcp_tool_definitions_are_frozen() {
     assert_eq!(tools, mcp::tools().to_string());
 }
 
-const FROZEN_TOOLS_HASH: &str = "de8f1f333bff3eee";
+const FROZEN_TOOLS_HASH: &str = "48af18fa6a124f6e";
 
 fn fnv_hex(s: &str) -> String {
     // FNV-1a 64: dependency-free and stable across platforms; collisions are irrelevant here.
@@ -241,10 +241,9 @@ fn foxdb_output_never_resembles_headroom_markers() {
     outs.push(query::brief(&c, &p, Some("main"), 40).unwrap());
     let input = serde_json::json!({"hook_event_name": "SessionStart", "source": "startup", "cwd": repo.path()}).to_string();
     outs.push(hook::run("session-start", &input, hook::Harness::Claude));
-    let mut seen = foxdb::spare::Seen::default();
-    let body = "x".repeat(400);
-    outs.push(seen.filter("s:1", body.clone(), false));
-    outs.push(seen.filter("s:1", body, false));
+    let body = "x".repeat(foxdb::spare::DEDUP_MIN_BYTES + 100);
+    outs.push(foxdb::spare::filter_db(&c, Some("s1"), "s:1", body.clone(), false));
+    outs.push(foxdb::spare::filter_db(&c, Some("s1"), "s:1", body, false));
     let o = query::FindOpts { kind: "any", all: false, budget: 500, limit: 20, offset: 0 };
     outs.push(foxdb::search::find(&c, Some(&p), "alpha", &o).unwrap());
     outs.push(foxdb::orch::dispatch_brief("h:1"));

@@ -85,10 +85,9 @@ after the MCP client and the parent process (`<client>-<pid>`; see
   ("One app-server serves many threads", `CodexAdapterV2.ts`). Its per-thread id goes only into
   the shell environment of commands the thread runs (`T3CODE_THREAD_ID`), not into MCP servers.
   So every Codex thread under one app-server shows up as the same agent (for example
-  `codex-mcp-client-41582`) and shares one `since=auto` cursor and "already sent" set. One
-  thread's `op=read since=auto` then consumes posts another thread has not seen, and an answer
-  already sent to one thread comes back to another as a reference. Under T3, Codex threads should
-  read the board with an explicit `since=h:N` cursor and ask with `fresh=true`; setting
+  `codex-mcp-client-41582`) and shares one `since=auto` cursor. One thread's
+  `op=read since=auto` then consumes posts another thread has not seen. Under T3, Codex threads
+  should read the board with an explicit `since=h:N` cursor; setting
   `FOXDB_AGENT` in the provider environment does not help, because it is still one value for all
   threads.
 - **Claude, OpenCode and ACP agents:** separate threads are separate agents only when the
@@ -128,6 +127,5 @@ model-written summary, and foxdb packets are rendered the same way every time.
 - **Tool list size.** T3 measures and budgets its own MCP tools; foxdb's sit beside them in the
   same prefix. foxdb keeps its four tool definitions frozen and small (`context-budget.json`), so
   adding it changes the prefix once, not per turn.
-- **Compaction.** T3 can compact a Claude thread just before its prompt cache expires. foxdb's
-  "already sent" set does not know what a compaction dropped; ask again with `fresh=true` after a
-  compaction if an answer comes back as a reference to something the thread no longer holds.
+- **Compaction.** T3 can compact a Claude thread just before its prompt cache expires. The MCP
+  tools keep no "already sent" set, so a read after a compaction returns the full text.

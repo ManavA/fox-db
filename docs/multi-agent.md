@@ -53,10 +53,11 @@ fox mem post <text> --topic T          fox mem read --since auto [--topic T]
 - **Board.** Posts carry a topic and the poster's agent id. `read --since auto` returns only rows
   newer than this agent's cursor, minus its own posts, and advances the cursor. An agent's first
   read starts at the newest rows that fit (with a `+N older` line), not the oldest.
-- **Dedup** ("already sent") is per session, deliberately not per agent tree: a sibling never saw
-  another sibling's answer, so a tree-wide "already sent" would make it pay a second call with
-  `fresh=true` to get the content. What the tree shares is compute (one store and `foxd`'s warm
-  cache) and handles: briefs point at packets instead of inlining them.
+- **Dedup** ("already sent") applies only to the CLI, per `FOXDB_SESSION` (a dispatched
+  worker's id), and the PreCompact hook clears it. The MCP tools keep none: one server process
+  serves a session and its subagents, which never saw each other's answers. What the tree
+  shares is compute (one store and `foxd`'s warm cache) and handles: briefs point at packets
+  instead of inlining them.
 
 ## Dispatch
 

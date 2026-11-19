@@ -41,5 +41,4 @@ For past decisions, handoffs and long logs: `fox_memory op=recall q=<words>`; `o
 - Handles: `s:`/`c:` symbol, `f:` file, `d:` doc, `m:` milestone, `a:` dir, `g:` memory, `x:` session, `h:` handoff.
 - Every tool takes `budget` (tokens, default 500). `+N more · cursor=K` means the answer is cut: pass `cursor=K` for the rest. `code left out to fit the budget; budget=N shows it` means call again with that budget for the code.
 - `~` = not compiler-resolved (tree-sitter, or Swift changed since the build); `guess 1 of N` marks a call resolved by name among N same-name definitions.
-- A repeated `fox_read` returns `= already sent ...`; pass `fresh=true` if that text is no longer in your context.
 - Secrets are never read or indexed. If a `fox` call errors, continue with your other tools. foxdb is read-only: edit with your editor tools.
