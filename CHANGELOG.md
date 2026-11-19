@@ -4,6 +4,15 @@
 
 First answers that were empty, wrong or padded in agent benchmark transcripts are fixed.
 
+- `fox_read` also carries `anthropic/alwaysLoad`: with only `fox_find` and `fox_graph` loaded,
+  agents read bodies with the native Read instead. The brief's tool line now names
+  `fox_read target=<handle>` as the way to read a body.
+- `callers`, `refs` and `impact` no longer read as incomplete over mentions that cannot be
+  calls: a file naming the target only in comments, imports, C-family declarations
+  (`extern`, prototypes) or strings is listed under `also mentioned (not calls):` and left out
+  of the `may be incomplete` / `partial at d1` count.
+- `impact` rows at d1 show the line that uses the target (`| :5 raise HttpError(401)`), not
+  only the dependent's definition line, and d1 `(top)` rows show their first use line.
 - A Go target qualified by its package resolves: `pod.GetContainerStatus`, the repo path
   `pkg/api/v1/pod.GetContainerStatus` or the full import path. `fox_find` takes the same names.
   A qualifier may also be a dotted Python or JS module (`pkg.fields.json.JSONField`). Every

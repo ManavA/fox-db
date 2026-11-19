@@ -106,7 +106,7 @@ fn mcp_tool_definitions_are_frozen() {
     assert_eq!(tools, mcp::tools().to_string());
 }
 
-const FROZEN_TOOLS_HASH: &str = "4b5f4141e35fe470";
+const FROZEN_TOOLS_HASH: &str = "de8f1f333bff3eee";
 
 fn fnv_hex(s: &str) -> String {
     // FNV-1a 64: dependency-free and stable across platforms; collisions are irrelevant here.
@@ -425,7 +425,7 @@ fn find_and_graph_are_always_loaded() {
     let r = mcp::handle(&serde_json::json!({"jsonrpc": "2.0", "id": 2, "method": "tools/list"})).unwrap();
     for t in r["result"]["tools"].as_array().unwrap() {
         let on = t["_meta"]["anthropic/alwaysLoad"] == true;
-        assert_eq!(on, matches!(t["name"].as_str(), Some("fox_find" | "fox_graph")), "{t}");
+        assert_eq!(on, matches!(t["name"].as_str(), Some("fox_find" | "fox_graph" | "fox_read")), "{t}");
     }
     let (_home, repo) = setup();
     let (c, p) = indexed(repo.path());

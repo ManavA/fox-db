@@ -13,7 +13,7 @@ Every session starts with a `foxdb · <project> ...` brief. The index is local a
 2. **Trace.** `fox_graph target=<handle or name> rel=callers` for who calls X, `rel=impact` for what breaks if X changes, `rel=overrides` for subclass methods. In tree-sitter languages, callers, refs and impact rows carry the line of code.
 3. **Read.** `fox_read target=<handle>` returns that symbol's body; `fox_read target=<path>` returns the file's declarations with line ranges. Read a file whole only for lines these do not give you.
 
-Done when: every call site from `rel=callers` (or every `d1` row of `rel=impact`) is accounted for before you change a signature, and every `may be incomplete` or `partial` line is checked against the unresolved mentions it lists.
+Done when: every call site from `rel=callers` (or every `d1` row of `rel=impact`) is accounted for before you change a signature, and every `may be incomplete` or `partial` line is checked against the unresolved mentions it lists, which carry their code (no grep needed). Mentions under `also mentioned (not calls)` are comments, imports, declarations or strings.
 
 For a literal string, error message or config value, use Grep.
 

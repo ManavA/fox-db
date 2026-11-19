@@ -483,7 +483,87 @@ fn completeness(
     lead: &str,
 ) -> Result<(Option<String>, Vec<String>)> {
     let files = unlisted_files(c, p.id, top, listed, calls_only)?;
-    Ok(mentions(p, &top.name, &files, lead, "not resolved to it"))
+    if files.is_empty() || files.len() > MENTION_FILES {
+        return Ok(mentions(p, &top.name, &files, lead, "not resolved to it"));
+    }
+    // Files whose every mention is a comment, an import, a declaration or a string cannot hold
+    // a call: listed apart, and they do not make the answer read as incomplete.
+    let mut src = SrcLines::new(&p.root, true);
+    let (quiet, open): (Vec<String>, Vec<String>) = files.into_iter().partition(|f| {
+        src.text(f).is_some_and(|t| t.iter().filter(|l| word_at(l, &top.name).is_some()).all(|l| no_call(l.trim(), &top.name, f)))
+    });
+    let (head, mut rows) = mentions(p, &top.name, &open, lead, "not resolved to it");
+    let nq = quiet.len();
+    if nq == 0 {
+        return Ok((head, rows));
+    }
+    let s = if nq == 1 { "" } else { "s" };
+    let head = match head {
+        Some(h) => format!("{h} ({nq} more file{s} only in comments, imports, declarations or strings)"),
+        None => format!(
+            "`{}` is also named in {nq} other file{s}, only in comments, imports, declarations or strings (listed at the end); none of them is a call",
+            top.name
+        ),
+    };
+    let quiet_rows = mention_rows(&p.root, &quiet, &top.name);
+    if !quiet_rows.is_empty() {
+        rows.push("also mentioned (not calls):".into());
+        rows.extend(quiet_rows);
+    }
+    Ok((Some(head), rows))
+}
+
+/// True when the line naming `name` cannot call or pass it: a comment (whole or trailing), an
+/// import, a C-family declaration (`extern`, or a prototype with only a type before the name)
+/// or a string literal. Conservative: anything else may be a call.
+fn no_call(line: &str, name: &str, path: &str) -> bool {
+    if let Some(d) = line.strip_prefix('#') {
+        // `#define` bodies may call it; `#include`, `#if`, `# comment` do not.
+        return !d.trim_start().starts_with("define");
+    }
+    if ["//", "/*", "*", "--", "<!--"].iter().any(|p| line.starts_with(p)) {
+        return true;
+    }
+    if ["import ", "from ", "use ", "pub use ", "using ", "package ", "extern "].iter().any(|p| line.starts_with(p))
+        || line.starts_with("export {") && line.contains(" from ")
+    {
+        return true;
+    }
+    // Strip string literals, then a trailing comment; what is left must still name it.
+    let mut bare = String::with_capacity(line.len());
+    let ext = path.rsplit_once('.').map(|x| x.1);
+    // A Rust lifetime (`'a`) opens no string; a template literal (`${f()}`) may call.
+    let quotes: &[char] = if ext == Some("rs") { &['"'] } else { &['"', '\''] };
+    let mut quote: Option<char> = None;
+    let mut esc = false;
+    for ch in line.chars() {
+        match quote {
+            Some(q) => {
+                if esc {
+                    esc = false;
+                } else if ch == '\\' {
+                    esc = true;
+                } else if ch == q {
+                    quote = None;
+                    bare.push(' ');
+                }
+            }
+            None if quotes.contains(&ch) => quote = Some(ch),
+            None => bare.push(ch),
+        }
+    }
+    let hash = matches!(ext, Some("py" | "rb" | "sh" | "bash" | "pl" | "r" | "R"));
+    let cut = ["//", "/*"].iter().chain(if hash { &["#"][..] } else { &[][..] }).filter_map(|m| bare.find(m)).min();
+    let bare = &bare[..cut.unwrap_or(bare.len())];
+    let Some(at) = word_at(bare, name) else { return true };
+    // A C-family prototype: only type words before the name, a parameter list after.
+    let cfam = matches!(ext, Some("h" | "hh" | "hpp" | "hxx" | "c" | "cc" | "cpp" | "cxx"));
+    let before = bare[..at].trim();
+    const NOT_TYPES: &[&str] = &["return", "else", "case", "do", "new", "delete", "throw", "goto", "sizeof", "co_return", "co_await"];
+    cfam && !before.is_empty()
+        && bare[at + name.len()..].trim_start().starts_with('(')
+        && before.chars().all(|ch| ch.is_alphanumeric() || matches!(ch, '_' | ' ' | '\t' | '*' | '&' | ':'))
+        && !before.split(|ch: char| !(ch.is_alphanumeric() || ch == '_')).any(|w| NOT_TYPES.contains(&w))
 }
 
 /// The head line and, for at most [`MENTION_FILES`] files, the `path:line | code` rows of files
@@ -873,6 +953,8 @@ fn impact(c: &Connection, p: &Project, top: &TSym, depth: usize, lines: &mut Vec
     let mut imports = FileImportNames::default();
     let mut disp: HashMap<i64, Disp> = HashMap::new();
     let mut disp_top: HashMap<String, Disp> = HashMap::new();
+    // A first-level dependent's first line using `top`, shown as its row's code.
+    let mut use_at: HashMap<i64, i64> = HashMap::new();
     for m in &dsp.up {
         guess.insert(m.id, None);
         frontier.push(m.id);
@@ -975,6 +1057,7 @@ fn impact(c: &Connection, p: &Project, top: &TSym, depth: usize, lines: &mut Vec
                 break;
             }
             if d == 0 {
+                use_at.entry(src).or_insert(line);
                 match disp.get_mut(&src) {
                     Some(x) => merge_disp(x, dl),
                     None => {
@@ -1049,13 +1132,27 @@ fn impact(c: &Connection, p: &Project, top: &TSym, depth: usize, lines: &mut Vec
         let mut by: BTreeMap<String, Vec<(i64, String)>> = BTreeMap::new();
         for s in v {
             let mark = guess_mark(guess.get(&s.id).copied().flatten()) + disp.get(&s.id).cloned().flatten().as_deref().unwrap_or("");
-            let row = src.with_code(format!("  :{} {} {}{mark}", s.line, s.qname(), s.h()), &s.path, s.line, &s.name);
+            let head = format!("  :{} {} {}{mark}", s.line, s.qname(), s.h());
+            let row = match use_at.get(&s.id).filter(|_| d == 0) {
+                Some(&u) if u != s.line => match src.line(&s.path, u, &top.name) {
+                    Some(code) => format!("{head} | :{u} {code}"),
+                    None => src.with_code(head, &s.path, s.line, &s.name),
+                },
+                Some(&u) => src.with_code(head, &s.path, u, &top.name),
+                None => src.with_code(head, &s.path, s.line, &s.name),
+            };
             by.entry(s.path.clone()).or_default().push((s.line, row));
         }
         for (path, (ls, g)) in &lvl.tops {
             let at = ls.iter().map(i64::to_string).collect::<Vec<_>>().join(",");
             let dm = if d == 0 { disp_top.get(path).cloned().flatten().unwrap_or_default() } else { String::new() };
-            by.entry(path.clone()).or_default().push((i64::MAX, format!("  :{at} (top){}{dm}", guess_mark(*g))));
+            let head = format!("  :{at} (top){}{dm}", guess_mark(*g));
+            // The first top-level use's line, for a use of `top` itself.
+            let row = match ls.first() {
+                Some(&l) if d == 0 => src.with_code(head, path, l, &top.name),
+                _ => head,
+            };
+            by.entry(path.clone()).or_default().push((i64::MAX, row));
         }
         for (path, mut rows) in by {
             rows.sort_by_key(|r| r.0);
@@ -1460,6 +1557,38 @@ fn outline_file(c: &Connection, p: &Project, rel: &str, cursor: usize, budget: u
 
 #[cfg(test)]
 mod tests {
+    /// Comments, imports, declarations and strings cannot call; anything else may.
+    #[test]
+    fn non_call_lines() {
+        let n = "plan";
+        for (l, p) in [
+            ("/* plan hook */", "a.c"),
+            ("* `plan` can handle it", "a.ts"),
+            ("extern PlannedStmt *plan(Query *q);", "a.h"),
+            ("PlannedStmt *plan(Query *q, int f);", "a.h"),
+            ("static int plan(void);", "a.c"),
+            ("import { plan, other } from './x'", "a.ts"),
+            ("from x import plan", "a.py"),
+            ("use crate::x::plan;", "a.rs"),
+            ("group('plan', () => {", "a.ts"),
+            ("x = 1  # calls plan later", "a.py"),
+            ("#include \"plan.h\"", "a.c"),
+        ] {
+            assert!(super::no_call(l, n, p), "{l}");
+        }
+        for (l, p) in [
+            ("return plan(q);", "a.c"),
+            ("int x = plan(q);", "a.c"),
+            ("register_cb(plan);", "a.c"),
+            ("#define P(q) plan(q)", "a.c"),
+            ("const s = `${plan(1)}`", "a.ts"),
+            ("fn go<'a>(x: &'a str) { plan(x) }", "a.rs"),
+            ("plan(1) // plan", "a.py"),
+        ] {
+            assert!(!super::no_call(l, n, p), "{l}");
+        }
+    }
+
     /// Name resolution is the hot step of every `fox code` call. It must seek the name index, not
     /// walk every tree-sitter symbol of the project (15 ms on a 28k-symbol Kotlin app).
     #[test]

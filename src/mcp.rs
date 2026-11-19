@@ -64,13 +64,13 @@ Rows end in path:line; pass a row's handle to fox_read or fox_graph.";
 /// client's version when it is one of these, else with the newest.
 pub const PROTOCOL_VERSIONS: &[&str] = &["2025-11-25", "2025-06-18", "2025-03-26", "2024-11-05"];
 
-/// The tool list (`fox_find` and `fox_graph` carry `_meta["anthropic/alwaysLoad"]`). Never add `outputSchema` or return `structuredContent`: Codex replaces a
+/// The tool list (`fox_find`, `fox_graph` and `fox_read` carry `_meta["anthropic/alwaysLoad"]`). Never add `outputSchema` or return `structuredContent`: Codex replaces a
 /// result's text with the structured JSON, losing foxdb's budgeted line format. The three
 /// read tools carry `readOnlyHint` so Claude Code may run them in parallel; `fox_memory` writes.
 pub fn tools() -> Value {
     let ro = json!({"readOnlyHint": true});
-    // Claude Code defers MCP tools behind tool search; these two load up front, so a where-is or
-    // who-calls question can reach them without a search round-trip. Never toggled mid-session.
+    // Claude Code defers MCP tools behind tool search; these three load up front, so a where-is,
+    // who-calls or read-this question can reach them without a search round-trip. Never toggled mid-session.
     let always = json!({"anthropic/alwaysLoad": true});
     let budget = json!({"type": "integer", "description": "tokens, default 500, max 4000"});
     let cursor = json!({"type": "integer", "description": "from a '+N more · cursor=K' footer"});
@@ -91,7 +91,7 @@ pub fn tools() -> Value {
             "rel": {"type": "string", "enum": ["callers", "callees", "refs", "conforms", "subtypes", "extensions", "overrides", "impact"]},
             "depth": {"type": "integer", "description": "impact depth, default 2"},
             "budget": budget, "cursor": cursor}, "required": ["rel"]}},
-        {"name": "fox_read",
+        {"name": "fox_read", "_meta": always,
          "description": "What does X say? A symbol's body, a file's declarations with line ranges, a doc section, a handoff (h:) or a session digest (x:). Use it to read one symbol or section instead of a whole file. A repeat returns a short 'already sent' line.",
          "annotations": ro,
          "inputSchema": {"type": "object", "required": ["target"], "properties": {

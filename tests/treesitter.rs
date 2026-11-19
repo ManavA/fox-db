@@ -409,6 +409,61 @@ may be incomplete: `wake_task` is also named in 2 other files, not resolved to i
     assert!(!out.contains("may be incomplete"), "{out}");
 }
 
+/// Unresolved mentions that cannot be calls (a comment, an `extern` prototype, an import, a
+/// string) are listed apart and do not make the answer read as incomplete.
+#[test]
+fn non_call_mentions_do_not_read_as_incomplete() {
+    let _g = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    let (_h, _r, p) = inline_project(&[
+        ("src/plan.c", "int plan_query(int q) { return q; }\nint run(void) { return plan_query(1); }\n"),
+        ("include/proto.h", "/* see plan_query */\nextern int plan_query_all(int q);\n#include \"plan_query.h\"\n"),
+        ("src/hooks.c", "/* plan_query hook */\nint other(void) { return 0; } // see plan_query\n"),
+        ("web/names.ts", "import { plan_query } from './x'\nconst label = 'plan_query'\n"),
+    ]);
+    let out = fox_code(&p, "plan_query", "callers", 800);
+    assert!(!out.contains("may be incomplete"), "{out}");
+    assert!(
+        out.contains("`plan_query` is also named in 3 other files, only in comments, imports, declarations or strings (listed at the end); none of them is a call"),
+        "{out}"
+    );
+    assert!(out.contains("also mentioned (not calls):\n  include/proto.h:1 | /* see plan_query */"), "{out}");
+    let out = fox_code(&p, "plan_query", "impact", 800);
+    assert!(!out.contains("partial"), "{out}");
+    // One file that may call it: counted alone, the others listed apart.
+    let (_h, _r, p) = inline_project(&[
+        ("src/plan.c", "int plan_query(int q) { return q; }\nint run(void) { return plan_query(1); }\n"),
+        ("include/proto.h", "#include \"plan_query.h\"\n"),
+        ("mm/b.c", "int use_b(void) { return queue_work(plan_query, 2); }\n"),
+    ]);
+    let out = fox_code(&p, "plan_query", "callers", 800);
+    assert!(
+        out.contains("may be incomplete: `plan_query` is also named in 1 other file, not resolved to it; unresolved mentions at the end (1 more file only in comments, imports, declarations or strings)"),
+        "{out}"
+    );
+    assert!(
+        out.contains("unresolved mentions:\n  mm/b.c:1 |") && out.contains("also mentioned (not calls):\n  include/proto.h:1 |"),
+        "{out}"
+    );
+}
+
+/// A first-level impact row shows the line that uses the target, not only the dependent's
+/// definition line; a top-level use shows its line too.
+#[test]
+fn impact_rows_show_the_use_line() {
+    let _g = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    let (_h, _r, p) = inline_project(&[
+        ("lib/err.py", "class HttpError:\n    def __init__(self, code):\n        self.code = code\n"),
+        (
+            "app/auth.py",
+            "from lib.err import HttpError\n\ndef check(ctx):\n    if not ctx:\n        raise HttpError(401)\n    return ctx\n",
+        ),
+        ("app/main.py", "from lib.err import HttpError\n\nprint(HttpError(500))\n"),
+    ]);
+    let out = fox_code(&p, "HttpError", "impact", 2000);
+    assert!(out.contains("  :3 check c:") && out.contains(" | :5 raise HttpError(401)"), "{out}");
+    assert!(out.contains("  :3 (top) | print(HttpError(500))"), "{out}");
+}
+
 /// A Go call through an embedded field (`pl.Evaluator.Preempt()`) reaches the method of the type
 /// the field is named after, not a same-name method of another type in the imported package.
 #[test]
@@ -567,9 +622,9 @@ fn impact_lists_top_level_uses_as_file_dependents() {
     assert!(out.contains(": 1 symbols, 1 files at top level; per depth 1/1"), "{out}");
     assert!(!out.contains("partial"), "a complete answer carries no warning: {out}");
     let out = fox_code(&p, "fmt", "impact", 2000);
-    assert!(out.contains(" tools/main.py\n  :3 (top)\n"), "{out}");
+    assert!(out.contains(" tools/main.py\n  :3 (top) | print(fmt(1))\n"), "{out}");
     let out = fox_code(&p, "getColor", "impact", 2000);
-    assert!(out.contains(" src/utils/color.test.ts\n  :5 (top)\n"), "{out}");
+    assert!(out.contains(" src/utils/color.test.ts\n  :5 (top) | expect(getColor()).toBe(true)\n"), "{out}");
 }
 
 /// A function passed as an argument (a C callback, a Go function value, a Python bound method
@@ -1313,9 +1368,9 @@ fn callers_rows_carry_the_call_site_code() {
     assert!(out.contains("  :3 kthread_start c:") && out.contains(" | return   wake_task(0);"), "{out}");
     assert!(out.contains("  :3,4 run c:"), "{out}");
     assert!(out.contains("\n   :3 | int a = wake_task(1);\n   :4 | return wake_task(a) + 1;\n"), "{out}");
-    // Impact rows carry the dependent's definition line.
+    // A d1 impact row carries the dependent's first line using the target.
     let out = fox_code(&p, "wake_task", "impact", 800);
-    assert!(out.contains(":2 run c:") && out.contains(" | int run(void) {"), "{out}");
+    assert!(out.contains(":2 run c:") && out.contains(" | :3 int a = wake_task(1);"), "{out}");
     // A budget the code does not fit in: locations only, and a note.
     let out = fox_code(&p, "wake_task", "callers", 66);
     assert!(out.len() <= 66 * 4 + 80, "{} bytes: {out}", out.len());

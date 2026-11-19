@@ -278,7 +278,7 @@ pub fn section_text(root: &std::path::Path, rel: &str, line: i64, end: i64) -> S
 /// Session-start brief. Hard cap `budget` tokens.
 /// The brief's second line: how to call foxdb, kept when a brief is cut. Its size is committed
 /// in `context-budget.json`.
-pub const BRIEF_TOOLS_LINE: &str = "To find or trace code here, call fox_find q=<name>, fox_graph target=<name> rel=callers|impact or fox_read target=<handle> first, then Read only the lines they return; fox_memory op=recall for past decisions. CLI: fox find|code|mem";
+pub const BRIEF_TOOLS_LINE: &str = "To find or trace code here, call fox_find q=<name>, fox_graph target=<name> rel=callers|impact first, then fox_read target=<handle> for a body (Read only the lines they return); fox_memory op=recall for past decisions. CLI: fox find|code|mem";
 
 pub fn brief(c: &Connection, p: &Project, branch: Option<&str>, budget: usize) -> Result<String> {
     let mut out = Out::new(budget);
