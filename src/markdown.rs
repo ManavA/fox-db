@@ -51,6 +51,75 @@ pub fn split(text: &str, only_level: Option<usize>) -> Vec<Section> {
     out
 }
 
+/// Split a reStructuredText or AsciiDoc file on its section titles: an RST title is a line
+/// underlined (and maybe overlined) by one punctuation character repeated at least as long as
+/// the title, its level the order its style first appears; an AsciiDoc title starts with
+/// `=` signs. The preamble before the first title is line 0.
+pub fn split_doc(text: &str, ext: &str) -> Vec<Section> {
+    let lines: Vec<&str> = text.lines().collect();
+    let adoc = matches!(ext, "adoc" | "asciidoc");
+    // (title line index, level, title, lines the heading takes from the title on)
+    let mut heads: Vec<(usize, usize, String, usize)> = vec![];
+    let mut styles: Vec<(char, bool)> = vec![];
+    let rule = |l: &str| -> Option<char> {
+        let l = l.trim_end();
+        let c = l.chars().next()?;
+        (l.chars().count() >= 3 && "=-~^\"'*+#`:._".contains(c) && l.chars().all(|x| x == c)).then_some(c)
+    };
+    let mut fence = false;
+    let mut i = 0;
+    while i < lines.len() {
+        let l = lines[i];
+        if adoc {
+            if l.starts_with("----") || l.starts_with("....") {
+                fence = !fence;
+            }
+            let level = l.chars().take_while(|&c| c == '=').count();
+            if !fence && (1..=6).contains(&level) && l[level..].starts_with(' ') {
+                heads.push((i, level, l[level..].trim().to_string(), 1));
+            }
+            i += 1;
+            continue;
+        }
+        let title = l.trim();
+        let under = lines.get(i + 1).and_then(|u| rule(u));
+        if !title.is_empty()
+            && !l.starts_with(char::is_whitespace)
+            && rule(l).is_none()
+            && let Some(c) = under
+            && lines[i + 1].trim_end().chars().count() >= title.chars().count()
+        {
+            let over = i > 0 && rule(lines[i - 1]) == Some(c);
+            let style = (c, over);
+            let level = match styles.iter().position(|x| *x == style) {
+                Some(k) => k + 1,
+                None => {
+                    styles.push(style);
+                    styles.len()
+                }
+            };
+            heads.push((i, level, title.to_string(), 2));
+            i += 2;
+            continue;
+        }
+        i += 1;
+    }
+    let mut out = vec![];
+    let body = |a: usize, b: usize| lines[a.min(b)..b].iter().map(|l| format!("{l}\n")).collect::<String>();
+    let first = heads.first().map_or(lines.len(), |h| h.0.saturating_sub(1));
+    let pre = body(0, first);
+    if !pre.trim().is_empty() {
+        out.push(Section { title: String::new(), level: 0, line: 0, end_line: first, body: pre });
+    }
+    for (k, (at, level, title, take)) in heads.iter().enumerate() {
+        // The next title's overline belongs to it.
+        let end =
+            heads.get(k + 1).map_or(lines.len(), |h| if h.0 > 0 && rule(lines[h.0 - 1]).is_some() && h.3 == 2 { h.0 - 1 } else { h.0 });
+        out.push(Section { title: title.clone(), level: *level, line: at + 1, end_line: end, body: body(at + take, end) });
+    }
+    out
+}
+
 pub const STATES: &[&str] = &[
     "NOT_STARTED",
     "IN_PROGRESS",

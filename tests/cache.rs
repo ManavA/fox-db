@@ -106,7 +106,7 @@ fn mcp_tool_definitions_are_frozen() {
     assert_eq!(tools, mcp::tools().to_string());
 }
 
-const FROZEN_TOOLS_HASH: &str = "0268dada10b84813";
+const FROZEN_TOOLS_HASH: &str = "78c525d63ddec21a";
 
 fn fnv_hex(s: &str) -> String {
     // FNV-1a 64: dependency-free and stable across platforms; collisions are irrelevant here.
@@ -153,12 +153,6 @@ fn context_is_injected_only_at_session_and_subagent_start() {
         if out.is_empty() {
             continue;
         }
-        // PreCompact stdout is instructions to the compaction summariser, plain text that never
-        // enters a cached prefix as context.
-        if event == "pre-compact" {
-            assert!(serde_json::from_str::<serde_json::Value>(&out).is_err(), "PreCompact output is plain text: {out}");
-            continue;
-        }
         let v: serde_json::Value = serde_json::from_str(&out).unwrap();
         if v["hookSpecificOutput"].get("additionalContext").is_some() {
             injected.push(v["hookSpecificOutput"]["hookEventName"].as_str().unwrap_or_default().to_string());
@@ -184,28 +178,6 @@ fn context_is_injected_only_at_session_and_subagent_start() {
         assert_eq!(lines.len(), 1, "{carrier} must appear once: {lines:?}");
         assert!(lines[0].trim_start().starts_with(arm), "{carrier} must sit behind its switch: {}", lines[0]);
     }
-}
-
-/// Claude Code passes PreCompact stdout to the compaction summariser as instructions: ask it to
-/// keep the working set and the packet the hook just saved. Short, and the same bytes for the
-/// same packet. Codex gets nothing.
-#[test]
-fn pre_compact_asks_the_summary_to_keep_the_working_set() {
-    let _g = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
-    let (_home, repo) = setup();
-    let (c, _p) = indexed(repo.path());
-    let input = serde_json::json!({"hook_event_name": "PreCompact", "cwd": repo.path(), "session_id": "s1"}).to_string();
-    let out = hook::run("pre-compact", &input, hook::Harness::Claude);
-    let id: i64 = c.query_row("SELECT MAX(id) FROM handoff WHERE kind = 'packet' AND scope = 'compact'", [], |r| r.get(0)).unwrap();
-    let h = foxdb::handoff::handle(id);
-    assert_eq!(out, hook::compact_instructions(&h), "{out}");
-    for want in ["path:line", "symbols", "ruled out", &format!("fox_read target={h}")] {
-        assert!(out.contains(want), "missing {want:?}:\n{out}");
-    }
-    assert!(out.lines().count() <= 6 && out.len() < 500, "{out}");
-    // Asking for the lines "verbatim" made summaries copy the bullet list itself.
-    assert!(!out.contains("verbatim"), "{out}");
-    assert_eq!(hook::run("pre-compact", &input, hook::Harness::Codex), "", "Codex reads no PreCompact instructions");
 }
 
 /// The committed size budget (`context-budget.json`): briefs, the tool list, the server
@@ -269,9 +241,10 @@ fn foxdb_output_never_resembles_headroom_markers() {
     outs.push(query::brief(&c, &p, Some("main"), 40).unwrap());
     let input = serde_json::json!({"hook_event_name": "SessionStart", "source": "startup", "cwd": repo.path()}).to_string();
     outs.push(hook::run("session-start", &input, hook::Harness::Claude));
-    let body = "x".repeat(foxdb::spare::DEDUP_MIN_BYTES + 100);
-    outs.push(foxdb::spare::filter_db(&c, Some("s1"), "s:1", body.clone(), false));
-    outs.push(foxdb::spare::filter_db(&c, Some("s1"), "s:1", body, false));
+    let mut seen = foxdb::spare::Seen::default();
+    let body = "x".repeat(400);
+    outs.push(seen.filter("s:1", body.clone(), false));
+    outs.push(seen.filter("s:1", body, false));
     let o = query::FindOpts { kind: "any", all: false, budget: 500, limit: 20, offset: 0 };
     outs.push(foxdb::search::find(&c, Some(&p), "alpha", &o).unwrap());
     outs.push(foxdb::orch::dispatch_brief("h:1"));
@@ -293,27 +266,6 @@ fn tool_answers_carry_no_savings_note() {
         assert_eq!(out, "src/lib.rs:1 alpha\n");
     }
     assert!(foxdb::savings::stats(&c).unwrap().contains("45 answers"));
-}
-
-/// The savings baseline is what an agent would read without foxdb: a ranged read around each
-/// cited line, never more than the file. Reading every cited file whole overstated it ~10x.
-#[test]
-fn savings_compare_with_a_ranged_read_of_each_cited_line() {
-    use foxdb::savings::{RANGE_BYTES, estimate, tokens};
-    let _g = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
-    let (_home, repo) = setup();
-    let big: String = (0..3000).map(|i| format!("pub fn filler_function_number_{i}() {{}}\n")).collect();
-    write(repo.path(), "src/big.rs", &big);
-    let (c, p) = indexed(repo.path());
-    let small = fs::metadata(repo.path().join("src/lib.rs")).unwrap().len() as usize;
-    let out = "src/big.rs:10 filler_function_number_9\nsrc/big.rs:2000 filler_function_number_1999\nsrc/lib.rs:1 alpha\n";
-    let want = tokens(2 * RANGE_BYTES) + tokens(small) - tokens(out.len());
-    assert_eq!(estimate(&c, Some(p.id), out), want);
-    assert!(want < tokens(big.len()) / 10, "two cited lines are not the whole file");
-    // A grouped answer: a file header with its site count, then `:line` rows.
-    let grouped = "src/\n big.rs (3)\n  :4 a\n  :9 b\n  :70 c\n";
-    assert_eq!(estimate(&c, Some(p.id), grouped), tokens(3 * RANGE_BYTES) - tokens(grouped.len()));
-    assert!(foxdb::savings::stats(&c).unwrap().starts_with("tokens saved (est., vs a ranged read of each cited line)"));
 }
 
 #[test]

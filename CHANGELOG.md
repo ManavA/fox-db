@@ -21,6 +21,22 @@ First answers that were empty, wrong or padded in agent benchmark transcripts ar
   lines instead of answering nothing. On 80 scrapy commits that removed or re-signed a
   function, the share of the lines those commits changed that callers plus refs list went from
   34% to 73%.
+- Python `@overload` stubs and property setters/deleters beside their definition are no
+  symbols of their own, so the name has one match and calls to it are certain (`must_defer`
+  with three stubs said "4 matches" and every call was `guess 1 of 4`); the stub lines count as
+  declarations. Python files parse again once (store schema 21).
+- `fox_find` no longer pads an identifier's first page with the same attribute repeated in
+  every subclass: a field that only contains the name ranks lower, and each further symbol of
+  a name already shown counts less (`CrawlerProcess` listed nine `requires_crawler_process`
+  fields in its first twenty rows). Long prose queries (an issue's text) keep the identifiers
+  in them (`get_proxy`, `RetryMiddleware`, `fetch()`, anything in backticks) among their
+  search terms instead of only the longest words.
+- A qualifier naming a directory with a dot in it resolves: `yaml.v3.Marshal` and
+  `gopkg.in/yaml.v3.Marshal` reach `vendor/gopkg.in/yaml.v3`.
+- reStructuredText and AsciiDoc files are split into doc sections like Markdown, so
+  `fox_find` answers what the docs say about X in projects documented in `.rst` (scrapy,
+  Django); they are read again once. The server instructions and `fox_find` description say
+  it answers doc questions.
 - `impact` rows at d1 show the line that uses the target (`| :5 raise HttpError(401)`), not
   only the dependent's definition line, and d1 `(top)` rows show their first use line.
 - A Go target qualified by its package resolves: `pod.GetContainerStatus`, the repo path

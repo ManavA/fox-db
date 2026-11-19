@@ -230,7 +230,7 @@ pub fn account(
                 if d.id == top_id {
                     (Cat::Definition, String::new())
                 } else {
-                    let cat = if d.decl || prototype(m, name, ext) { Cat::Decl } else { Cat::Same };
+                    let cat = if d.decl || !matches!(ext, "py" | "pyi") && prototype(m, name, ext) { Cat::Decl } else { Cat::Same };
                     (cat, format!("  {path}:{n} {} {} c:{:x} | {}", d.kind, d.qname, d.id, code()))
                 }
             } else if let Some(rs) = refs.get(&(path.clone(), n)) {
@@ -313,6 +313,13 @@ fn prototype(m: &str, name: &str, ext: &str) -> bool {
     let t = m.trim();
     if t.starts_with("extern ") || t.starts_with("declare ") || t.starts_with("export declare ") {
         return true;
+    }
+    // A Python `@overload` stub or property setter (no symbol of its own).
+    if matches!(ext, "py" | "pyi") {
+        let rest = t.strip_prefix("async ").unwrap_or(t);
+        return rest
+            .strip_prefix("def ")
+            .is_some_and(|r| r.trim_start().strip_prefix(name).is_some_and(|x| x.trim_start().starts_with('(')));
     }
     let cfam = matches!(ext, "h" | "hh" | "hpp" | "hxx" | "c" | "cc" | "cpp" | "cxx" | "m" | "mm");
     if !cfam {

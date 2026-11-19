@@ -119,60 +119,68 @@ pub fn qual_matches(t: &TSym, qual: &str) -> Option<(bool, usize)> {
 /// [`qual_matches`] for a symbol at `path` inside `parent`.
 pub fn qual_matches_at(path: &str, parent: Option<&str>, qual: &str) -> Option<(bool, usize)> {
     let qual = qual.trim_start_matches('.');
-    // (location segments, container segments); an import path's location ends at its last `/`
-    // plus one segment, and only what follows is a container.
-    let (loc_fixed, conts): (Option<Vec<&str>>, Vec<&str>) = match qual.rsplit_once('/') {
+    // Readings of the qualifier as (location segments, container segments). An import path's
+    // location ends at its last `/` plus one segment, which may itself hold dots
+    // (`gopkg.in/yaml.v3`): each split of what follows the `/` is a reading.
+    let mut readings: Vec<(Option<Vec<String>>, Vec<&str>)> = vec![];
+    match qual.rsplit_once('/') {
         Some((head, tail)) => {
-            let mut it = tail.split('.');
-            let first = it.next().unwrap_or("");
-            let mut loc: Vec<&str> = head.split('/').filter(|x| !x.is_empty()).collect();
-            loc.push(first);
-            (Some(loc), it.collect())
+            let parts: Vec<&str> = tail.split('.').collect();
+            for j in 1..=parts.len() {
+                let mut loc: Vec<String> = head.split('/').filter(|x| !x.is_empty()).map(str::to_string).collect();
+                loc.push(parts[..j].join("."));
+                readings.push((Some(loc), parts[j..].to_vec()));
+            }
         }
-        None => (None, qual.split('.').filter(|x| !x.is_empty()).collect()),
-    };
+        None => readings.push((None, qual.split('.').filter(|x| !x.is_empty()).collect())),
+    }
     let ps: Vec<&str> = parent.unwrap_or("").split('.').filter(|x| !x.is_empty()).collect();
     let go = crate::lang::for_path(path).is_some_and(|l| l.family == "go");
     let dir: Vec<&str> = crate::tsindex::dir_of(path).split('/').filter(|x| !x.is_empty()).collect();
+    // The directory with its dotted segments split (`gopkg.in/yaml.v3` -> gopkg, in, yaml, v3),
+    // for a dotted qualifier naming a dotted directory (`yaml.v3.Marshal`).
+    let flat: Vec<&str> = dir.iter().flat_map(|d| d.split('.')).filter(|x| !x.is_empty()).collect();
     let module: Vec<&str> = path.rsplit_once('.').map_or(path, |x| x.0).split('/').filter(|x| !x.is_empty()).collect();
-    // Score of `loc` as the symbol's location: segments matched, or None.
-    let place = |loc: &[&str]| -> Option<usize> {
-        if loc.is_empty() {
-            return Some(0);
-        }
-        let suffix = |have: &[&str]| have.len() >= loc.len() && have[have.len() - loc.len()..] == *loc;
-        if suffix(&dir) || !go && suffix(&module) {
-            return Some(loc.len());
-        }
-        // An import path longer than the directory: the directory ends it. A one-segment
-        // directory says little about a longer path.
-        if loc_fixed.is_some() && !dir.is_empty() && loc.len() > dir.len() && loc[loc.len() - dir.len()..] == *dir {
-            return Some(if dir.len() == 1 { 0 } else { dir.len() });
-        }
-        None
-    };
     let mut best: Option<(bool, usize)> = None;
-    let ks: Vec<usize> = match &loc_fixed {
-        Some(_) => vec![conts.len()],
-        None => (0..=conts.len().min(ps.len())).rev().collect(),
-    };
-    for k in ks {
-        if k > ps.len() {
-            continue;
-        }
-        let (want, have) = (&conts[conts.len() - k..], &ps[ps.len() - k..]);
-        if !want.iter().zip(have).all(|(a, b)| a.eq_ignore_ascii_case(b)) {
-            continue;
-        }
-        let exact = want.iter().zip(have).all(|(a, b)| a == b);
-        let loc: Vec<&str> = match &loc_fixed {
-            Some(l) => l.clone(),
-            None => conts[..conts.len() - k].to_vec(),
+    for (loc_fixed, conts) in &readings {
+        // Score of `loc` as the symbol's location: segments matched, or None.
+        let place = |loc: &[&str]| -> Option<usize> {
+            if loc.is_empty() {
+                return Some(0);
+            }
+            let suffix = |have: &[&str]| have.len() >= loc.len() && have[have.len() - loc.len()..] == *loc;
+            if suffix(&dir) || !go && suffix(&module) || loc_fixed.is_none() && flat.len() > dir.len() && suffix(&flat) {
+                return Some(loc.len());
+            }
+            // An import path longer than the directory: the directory ends it. A one-segment
+            // directory says little about a longer path.
+            if loc_fixed.is_some() && !dir.is_empty() && loc.len() > dir.len() && loc[loc.len() - dir.len()..] == *dir {
+                return Some(if dir.len() == 1 { 0 } else { dir.len() });
+            }
+            None
         };
-        if let Some(sc) = place(&loc) {
-            let cand = (exact, k * 2 + sc);
-            if best.is_none_or(|b| cand > b) {
-                best = Some(cand);
+        let ks: Vec<usize> = match loc_fixed {
+            Some(_) => vec![conts.len()],
+            None => (0..=conts.len().min(ps.len())).rev().collect(),
+        };
+        for k in ks {
+            if k > ps.len() {
+                continue;
+            }
+            let (want, have) = (&conts[conts.len() - k..], &ps[ps.len() - k..]);
+            if !want.iter().zip(have).all(|(a, b)| a.eq_ignore_ascii_case(b)) {
+                continue;
+            }
+            let exact = want.iter().zip(have).all(|(a, b)| a == b);
+            let loc: Vec<&str> = match loc_fixed {
+                Some(l) => l.iter().map(String::as_str).collect(),
+                None => conts[..conts.len() - k].to_vec(),
+            };
+            if let Some(sc) = place(&loc) {
+                let cand = (exact, k * 2 + sc);
+                if best.is_none_or(|b| cand > b) {
+                    best = Some(cand);
+                }
             }
         }
     }

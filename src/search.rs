@@ -299,23 +299,63 @@ pub fn terms(q: &str) -> Vec<String> {
 }
 
 fn terms_capped(q: &str, cap: usize) -> Vec<String> {
-    let mut out: Vec<String> = vec![];
+    let words: Vec<&str> = q.split(|c: char| !(c.is_alphanumeric() || c == '_')).filter(|w| !w.is_empty()).collect();
+    // Long prose (an issue's text): the identifiers in it (`get_proxy`, `RetryMiddleware`,
+    // `fetch()`, anything in backticks) go first, then the longest words.
+    let prose = words.len() > PROSE_WORDS;
+    let code = if prose { code_words(q) } else { HashSet::new() };
+    let mut out: Vec<(bool, String)> = vec![];
     let mut seen = HashSet::new();
-    for word in q.split(|c: char| !(c.is_alphanumeric() || c == '_')).filter(|w| !w.is_empty()) {
+    for word in words {
         let whole = squash(word);
         let parts = ident_parts(word);
+        let is_code = code.contains(word);
         for t in std::iter::once(whole).chain(parts) {
             let t = t.trim_matches('_').to_string();
             if t.chars().count() < 2 || STOPWORDS.contains(&t.as_str()) {
                 continue;
             }
             if seen.insert(t.clone()) {
-                out.push(t);
+                out.push((is_code, t));
             }
         }
     }
-    out.sort_by(|a, b| b.chars().count().cmp(&a.chars().count()).then(a.cmp(b)));
+    out.sort_by(|a, b| b.0.cmp(&a.0).then(b.1.chars().count().cmp(&a.1.chars().count())).then(a.1.cmp(&b.1)));
     out.truncate(cap);
+    out.into_iter().map(|x| x.1).collect()
+}
+
+/// More words than this make a query prose, whose identifiers are picked out first.
+const PROSE_WORDS: usize = 12;
+
+/// The words of `q` shaped like code: snake_case or camelCase names, names called (`f(`) or
+/// dotted (`a.b`), and anything in backticks.
+fn code_words(q: &str) -> HashSet<&str> {
+    let mut out = HashSet::new();
+    let is_word = |c: char| c.is_alphanumeric() || c == '_';
+    for (i, ticked) in q.split('`').enumerate() {
+        if i % 2 == 1 {
+            out.extend(ticked.split(|c: char| !is_word(c)).filter(|w| w.len() >= 2));
+        }
+    }
+    let mut from = 0;
+    for w in q.split(|c: char| !is_word(c)) {
+        let at = q[from..].find(w).map_or(from, |k| k + from);
+        from = at + w.len();
+        if w.len() < 3 || w.chars().all(|c| c.is_ascii_digit()) {
+            continue;
+        }
+        let inner = w.trim_matches('_');
+        let snake = inner.contains('_');
+        let camel = w.chars().skip(1).any(|c| c.is_uppercase()) && w.chars().any(|c| c.is_lowercase());
+        let next = q[from..].chars().next();
+        let prev = q[..at].chars().next_back();
+        let called = next == Some('(');
+        let dotted = next == Some('.') && q[from + 1..].starts_with(|c: char| c.is_alphabetic()) || prev == Some('.');
+        if snake || camel || called || dotted {
+            out.insert(w);
+        }
+    }
     out
 }
 
@@ -802,6 +842,9 @@ fn feature_boost(h: &Hit, q: &str, ident: Option<&str>) -> f64 {
             let ts_field = h.meta.as_deref().is_some_and(|x| x.contains("\"k\":\"field\"") && x.contains("\"ts\""));
             m *= if ts_field { 2.0 } else { 3.0 }
         }
+        // A field that only contains the queried name (`requires_crawler_process` for
+        // `CrawlerProcess`) is a weak match: an attribute, often repeated in every subclass.
+        "symbol" if ident.is_some() && h.meta.as_deref().is_some_and(|x| x.contains("\"k\":\"field\"")) => m *= 0.5,
         // A heading whose title is the query is its definition too.
         "doc_section" | "milestone" if name_eq(&h.name) => m *= 3.0,
         "file" => {
@@ -828,14 +871,19 @@ const DAMP_NAMES: f64 = 0.5;
 /// moves a repeat a few places instead.
 const DAMP_TEXT: f64 = 0.95;
 
-/// Greedy re-order: each further hit from a file already shown counts `damp` times as much again.
-fn damp_same_file(mut v: Vec<(Hit, f64)>, damp: f64) -> Vec<Hit> {
+/// Greedy re-order: each further hit from a file already shown counts `damp` times as much
+/// again, and so does each further symbol of a name already shown (the same attribute or
+/// method in every subclass), unless that name is the queried identifier.
+fn damp_same_file(mut v: Vec<(Hit, f64)>, damp: f64, ident: Option<&str>) -> Vec<Hit> {
     let mut out = Vec::with_capacity(v.len());
     let mut per_file: HashMap<String, i32> = HashMap::new();
+    let mut per_name: HashMap<String, i32> = HashMap::new();
+    let name_key = |h: &Hit| (h.kind == "symbol" && !ident.is_some_and(|i| h.name.eq_ignore_ascii_case(i))).then(|| h.name.to_lowercase());
     while !v.is_empty() {
         let (mut best, mut best_s) = (0, f64::MIN);
         for (i, (h, s)) in v.iter().enumerate() {
-            let n = h.path.as_ref().map(|p| per_file.get(p).copied().unwrap_or(0)).unwrap_or(0);
+            let n = h.path.as_ref().map(|p| per_file.get(p).copied().unwrap_or(0)).unwrap_or(0)
+                + name_key(h).and_then(|k| per_name.get(&k).copied()).unwrap_or(0);
             let adj = s * damp.powi(n);
             if adj > best_s {
                 best = i;
@@ -845,6 +893,9 @@ fn damp_same_file(mut v: Vec<(Hit, f64)>, damp: f64) -> Vec<Hit> {
         let (h, _) = v.remove(best);
         if let Some(p) = &h.path {
             *per_file.entry(p.clone()).or_default() += 1;
+        }
+        if let Some(k) = name_key(&h) {
+            *per_name.entry(k).or_default() += 1;
         }
         out.push(h);
     }
@@ -1214,7 +1265,7 @@ fn ranked(
             (h, s * b)
         })
         .collect();
-    let mut hits = damp_same_file(scored, if route == Route::Text { DAMP_TEXT } else { DAMP_NAMES });
+    let mut hits = damp_same_file(scored, if route == Route::Text { DAMP_TEXT } else { DAMP_NAMES }, ident.as_deref());
     if let Some(id) = ident.as_deref()
         && route != Route::Text
         && matches!(o.kind, "any" | "symbol")
@@ -1238,6 +1289,17 @@ fn ranked(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn prose_queries_keep_their_identifiers() {
+        let q = "Unfortunately, intermittently, the downloader middleware misbehaves considerably \
+                 whenever authenticated requests traverse misconfigured infrastructure; get_proxy \
+                 returns inconsistent credentials and `ProxyMW` misreports everything";
+        let t = super::terms(q);
+        assert!(t.contains(&"getproxy".to_string()) && t.contains(&"proxymw".to_string()), "{t:?}");
+        let short = super::terms("where does get_proxy read credentials");
+        assert!(short.contains(&"getproxy".to_string()), "{short:?}");
+    }
 
     #[test]
     fn identifier_parts_cover_camel_snake_acronyms_and_digits() {

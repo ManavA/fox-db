@@ -48,7 +48,7 @@ fn warm() -> &'static std::sync::Mutex<crate::search::Warm> {
 /// Short server instructions, sent once in `initialize`. Frozen with the tool list (see the
 /// hash test): both sit in every request's cached prefix.
 pub const INSTRUCTIONS: &str = "foxdb answers code questions from an index of this repo. \
-Where is X: fox_find q=X. Who calls X, what breaks if X changes: fox_graph target=X rel=callers or impact. \
+Where is X, or what the docs say about X: fox_find q=X. Who calls X, what breaks if X changes: fox_graph target=X rel=callers or impact. \
 X's body, or a file's declarations: fox_read target=X. A past decision or handoff: fox_memory op=recall. \
 Call them first, even when a grep looks quicker: they resolve qualified names and show each call site. \
 For a literal string, error message or config value, use Grep. \
@@ -70,7 +70,7 @@ pub fn tools() -> Value {
     let cursor = json!({"type": "integer", "description": "from a '+N more · cursor=K' footer"});
     json!([
         {"name": "fox_find", "_meta": always,
-         "description": "Where is X? Finds a function, type, field, file or doc section by name or words; ranked rows end in path:line. Use it for every where-is or which-file question, even when a grep looks quicker. For a literal string, error message or config value, use Grep. Earlier decisions and handoffs: fox_memory op=recall. Handles: s/c symbol, f file, d doc, m milestone, a dir, g memory, x session. ~ = not compiler-resolved (tree-sitter, or Swift changed since the build).",
+         "description": "Where is X? What do docs say on X? Finds a function, type, field, file or doc section by name or words; rows end in path:line. Use it for every where-is or docs question, even when a grep looks quicker. For a literal string, error message or config value, use Grep. Earlier decisions: fox_memory op=recall. Handles: s/c symbol, f file, d doc, m milestone, a dir, g memory, x session. ~ = not compiler-resolved (tree-sitter, or Swift changed since the build).",
          "annotations": ro,
          "inputSchema": {"type": "object", "required": ["q"], "properties": {
             "q": {"type": "string", "description": "name, substring or words"},

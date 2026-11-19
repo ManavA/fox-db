@@ -1367,6 +1367,74 @@ fn find_by_exact_name_drops_padding() {
     assert!(!out.contains("helper_a") && !out.contains("helper_b"), "{out}");
 }
 
+/// The same attribute repeated in every subclass (`requires_crawler_process` in each command)
+/// does not crowd the first page: a field that only contains the name ranks low, and each
+/// further symbol of a name already shown counts less.
+#[test]
+fn find_does_not_pad_with_repeated_fields() {
+    let _g = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    let mut files: Vec<(String, String)> = vec![
+        ("pkg/crawler.py".into(), "class CrawlerProcessBase:\n    pass\n\n\nclass CrawlerProcess(CrawlerProcessBase):\n    pass\n".into()),
+        (
+            "pkg/run.py".into(),
+            "from pkg.crawler import CrawlerProcess\n\n\ndef start_crawler_process():\n    return CrawlerProcess()\n".into(),
+        ),
+    ];
+    for i in 0..8 {
+        files.push((format!("pkg/commands/c{i}.py"), "class Command:\n    requires_crawler_process = True\n".into()));
+    }
+    files.push(("pkg/settings.py".into(), "FORCE_CRAWLER_PROCESS = False\n".into()));
+    files.push(("pkg/commands/base.py".into(), "class ScrapyCommand:\n    crawler_process = None\n".into()));
+    let refs: Vec<(&str, &str)> = files.iter().map(|(a, b)| (a.as_str(), b.as_str())).collect();
+    let (_h, _r, p) = inline_project(&refs);
+    let c = db::open_ro().unwrap();
+    let o = foxdb::query::FindOpts { kind: "any", all: false, budget: 800, limit: 20, offset: 0 };
+    let out = foxdb::query::find(&c, Some(&p), "CrawlerProcess", &o).unwrap();
+    let head: Vec<&str> = out.lines().take(6).collect();
+    assert!(head[0].contains("class CrawlerProcess  pkg/crawler.py:5"), "{out}");
+    assert!(head.iter().filter(|l| l.contains("requires_crawler_process")).count() <= 1, "{out}");
+    for want in ["CrawlerProcessBase", "start_crawler_process", "FORCE_CRAWLER_PROCESS", "ScrapyCommand.crawler_process"] {
+        assert!(head.iter().any(|l| l.contains(want)), "{want}: {out}");
+    }
+}
+
+/// A qualifier naming a directory with a dot in it (`gopkg.in/yaml.v3`) resolves, written as an
+/// import path or with dots alone (`yaml.v3.Marshal`).
+#[test]
+fn dotted_directory_qualifiers_resolve() {
+    let _g = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    let (_h, _r, p) = inline_project(&[
+        ("vendor/gopkg.in/yaml.v3/yaml.go", "package yaml\n\nfunc Marshal(v any) ([]byte, error) { return nil, nil }\n"),
+        ("vendor/gopkg.in/yaml.v2/yaml.go", "package yaml\n\nfunc Marshal(v any) ([]byte, error) { return nil, nil }\n"),
+        ("pkg/enc/enc.go", "package enc\n\nfunc Marshal(v any) ([]byte, error) { return nil, nil }\n"),
+    ]);
+    for q in ["yaml.v3.Marshal", "gopkg.in/yaml.v3.Marshal"] {
+        let out = fox_code(&p, q, "callers", 800);
+        assert!(out.contains("callers of ~c:") && out.contains("vendor/gopkg.in/yaml.v3/yaml.go:3"), "{q}: {out}");
+    }
+}
+
+/// reStructuredText and AsciiDoc files are split into sections like Markdown: a question about
+/// the docs finds the section, with its line.
+#[test]
+fn rst_and_asciidoc_docs_are_sections() {
+    let _g = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    let (_h, _r, p) = inline_project(&[
+        (
+            "docs/topics/settings.rst",
+            "========\nSettings\n========\n\nIntro text.\n\nDownload delay\n--------------\n\nThe amount of time the downloader waits between pages.\n\nConcurrency\n-----------\n\nHow many requests run at once.\n",
+        ),
+        ("docs/guide.adoc", "= Guide\n\n== Retry policy\n\nFailed requests are retried three times.\n"),
+        ("app.py", "def run():\n    pass\n"),
+    ]);
+    let c = db::open_ro().unwrap();
+    let o = foxdb::query::FindOpts { kind: "doc", all: false, budget: 800, limit: 10, offset: 0 };
+    let out = foxdb::query::find(&c, Some(&p), "how long does the downloader wait between pages", &o).unwrap();
+    assert!(out.lines().next().unwrap_or("").contains("Download delay") && out.contains("docs/topics/settings.rst:7"), "{out}");
+    let out = foxdb::query::find(&c, Some(&p), "retried failed requests", &o).unwrap();
+    assert!(out.lines().next().unwrap_or("").contains("Retry policy") && out.contains("docs/guide.adoc:3"), "{out}");
+}
+
 // ---- answers carry code ----
 
 /// Each caller row carries its call site's code: inline after ` | ` for one site, one

@@ -544,7 +544,10 @@ fn index_file(tx: &Transaction, sink: &Sink, pid: i64, e: &Entry, tier: Tier, st
         sink.put(tx, pid, TBL_NODE, file_id, &[&split_ident(&name), "", &e.rel, ""])?;
         return Ok(());
     }
-    let is_md = name.to_ascii_lowercase().ends_with(".md") || name.to_ascii_lowercase().ends_with(".markdown");
+    let lower = name.to_ascii_lowercase();
+    // Docs split into sections: Markdown, reStructuredText and AsciiDoc.
+    let doc_ext = lower.rsplit_once('.').map(|x| x.1).filter(|x| matches!(*x, "rst" | "adoc" | "asciidoc")).map(str::to_string);
+    let is_md = lower.ends_with(".md") || lower.ends_with(".markdown") || doc_ext.is_some();
     let is_log = name.to_ascii_lowercase().ends_with(".log");
     let limit = if is_md {
         tiers::MARKDOWN_MAX_BYTES as usize
@@ -568,7 +571,12 @@ fn index_file(tx: &Transaction, sink: &Sink, pid: i64, e: &Entry, tier: Tier, st
     )?;
     sink.put(tx, pid, TBL_NODE, file_id, &[&split_ident(&name), "", &e.rel, ""])?;
     let mlog = markdown::is_milestone_log(&name);
-    for s in markdown::split(&text, if mlog { Some(2) } else { None }) {
+    let sections = match &doc_ext {
+        Some(ext) => markdown::split_doc(&text, ext),
+        None => markdown::split(&text, if mlog { Some(2) } else { None }),
+    };
+    let mlog = mlog && doc_ext.is_none();
+    for s in sections {
         if s.line == 0 {
             continue; // preamble belongs to the file node
         }

@@ -205,6 +205,30 @@ fn go_and_typescript_groups() {
     assert_eq!(first(&out), "3 lines name `stamp`: 1 call, 1 definition, 1 import; all accounted for", "{out}");
 }
 
+/// Python `@overload` stubs and a property's setter are no symbols of their own: the name
+/// resolves to the one definition, calls to it are certain, and the stub lines are declarations.
+#[test]
+fn python_overload_stubs_and_setters_merge_into_one_symbol() {
+    let _g = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    let (_h, _r, p) = inline_project(&[
+        (
+            "lib/defer.py",
+            "from typing import overload\n\n@overload\ndef must_defer(x: int) -> int: ...\n@overload\ndef must_defer(x: str) -> str: ...\ndef must_defer(x):\n    return x\n\nclass Box:\n    @property\n    def size(self):\n        return 1\n    @size.setter\n    def size(self, v):\n        pass\n",
+        ),
+        ("app/use.py", "from lib.defer import must_defer\n\n\ndef run():\n    return must_defer(1)\n"),
+    ]);
+    let out = fox_code(&p, "must_defer", "callers", 2000);
+    assert!(!out.contains("matches") && !out.contains("guess"), "{out}");
+    assert!(out.contains("callers of ~c:") && out.contains("lib/defer.py:7"), "{out}");
+    assert_eq!(
+        first(&out),
+        "5 lines name `must_defer`: 1 call, 1 definition, 1 import, 2 declarations/prototypes; all accounted for",
+        "{out}"
+    );
+    let out = fox_code(&p, "Box.size", "callers", 2000);
+    assert!(!out.contains("matches"), "{out}");
+}
+
 /// A use inside another same-name definition (a delegating wrapper) is listed when it may
 /// reach the target, not hidden as part of that definition.
 #[test]

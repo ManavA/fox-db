@@ -380,6 +380,8 @@ pub fn extract(l: &Lang, src: &[u8]) -> Parsed {
     let text = |n: tree_sitter::Node| n.utf8_text(src).unwrap_or("").to_string();
     let walk = walk_tree(tree.root_node(), src);
     let c_family = l.family == "c";
+    // Python `@overload` stubs and property setters/deleters, by start byte: (name, scope node).
+    let mut stubs: HashMap<usize, (String, usize)> = HashMap::new();
     while let Some(m) = it.next() {
         let mut name_node = None;
         let mut outer: Option<(tree_sitter::Node, &str)> = None;
@@ -439,6 +441,11 @@ pub fn extract(l: &Lang, src: &[u8]) -> Parsed {
             {
                 kind = "method".into();
             }
+            if l.family == "python"
+                && let Some(scope) = python_stub(node, src)
+            {
+                stubs.insert(node.start_byte(), (name.clone(), scope));
+            }
             // A field spans its name: one declaration may name several (`A, B int`).
             let (node, last) = if kind == FIELD { (nn, nn) } else { (node, last) };
             let mut w = node.walk();
@@ -494,8 +501,49 @@ pub fn extract(l: &Lang, src: &[u8]) -> Parsed {
         let hidden: HashSet<usize> = walk.file_locals.iter().filter(|(_, n)| !defined.contains(n.as_str())).map(|(pos, _)| *pos).collect();
         out.refs.retain(|r| !matches!(r.kind, "ref" | "call") || !hidden.contains(&r.pos));
     }
+    // A stub beside a definition of the same name in the same scope is not a symbol of its
+    // own: calls reach the one definition with certainty.
+    if !stubs.is_empty() {
+        let real: HashSet<(String, usize)> = out
+            .defs
+            .iter()
+            .filter(|d| !stubs.contains_key(&d.start))
+            .filter_map(|d| {
+                let n = tree.root_node().descendant_for_byte_range(d.start, d.start)?;
+                Some((d.name.clone(), python_scope(n)?))
+            })
+            .collect();
+        out.defs.retain(|d| stubs.get(&d.start).is_none_or(|k| !real.contains(k)));
+    }
     nest(&mut out);
     out
+}
+
+/// The scope a Python definition sits in: the block (or module) holding it, past its
+/// decorators.
+fn python_scope(n: tree_sitter::Node) -> Option<usize> {
+    let mut cur = n;
+    for _ in 0..4 {
+        if cur.kind() == "function_definition" {
+            let up = cur.parent()?;
+            let up = if up.kind() == "decorated_definition" { up.parent()? } else { up };
+            return Some(up.id());
+        }
+        cur = cur.parent()?;
+    }
+    None
+}
+
+/// For a Python function decorated `@overload` (`typing.overload`) or `@x.setter` /
+/// `@x.deleter`: the scope it sits in. None for any other definition.
+fn python_stub(def: tree_sitter::Node, src: &[u8]) -> Option<usize> {
+    let dd = def.parent().filter(|p| p.kind() == "decorated_definition")?;
+    let mut w = dd.walk();
+    let stub = dd.children(&mut w).filter(|c| c.kind() == "decorator").any(|c| {
+        let t = c.utf8_text(src).unwrap_or("").trim_start_matches('@').trim();
+        t == "overload" || t.ends_with(".overload") || t.ends_with(".setter") || t.ends_with(".deleter")
+    });
+    if stub { python_scope(def) } else { None }
 }
 
 /// The module an imported name comes from: JS `import { X } from "./m"` -> `./m`, Python

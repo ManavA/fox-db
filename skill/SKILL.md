@@ -9,7 +9,7 @@ Every session starts with a `foxdb · <project> ...` brief. The index is local a
 
 ## The loop
 
-1. **Find.** `fox_find q=<name or words>` for where X is. A row ends in `path:line` and starts with a handle (`c:1f3`).
+1. **Find.** `fox_find q=<name or words>` for where X is; `kind=doc` for what the docs or README say about X (Markdown, reST and AsciiDoc sections, read with `fox_read target=d:...`). A row ends in `path:line` and starts with a handle (`c:1f3`).
 2. **Trace.** `fox_graph target=<handle or name> rel=callers` for who calls X, `rel=impact` for what breaks if X changes, `rel=overrides` for subclass methods. In tree-sitter languages, callers, refs and impact rows carry the line of code.
 3. **Read.** `fox_read target=<handle>` returns that symbol's body; `fox_read target=<path>` returns the file's declarations with line ranges. Read a file whole only for lines these do not give you.
 

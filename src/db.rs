@@ -416,6 +416,18 @@ pub(crate) fn migrate(c: &Connection) -> Result<()> {
              PRAGMA user_version = 20;",
         )?;
     }
+    if v < 21 {
+        // 0.2.3: Python `@overload` stubs and property setters beside their definition are no
+        // symbols of their own: Python files parse again once, and their projects re-score.
+        // reStructuredText and AsciiDoc files split into doc sections: they are read again.
+        c.execute_batch(
+            "UPDATE ts_file SET hash = '', size = -1 WHERE lang = 'python';
+             UPDATE node SET size = -1 WHERE kind = 'file' AND (lower(path) LIKE '%.rst' OR lower(path) LIKE '%.adoc' OR lower(path) LIKE '%.asciidoc');
+             INSERT OR REPLACE INTO meta(k, v)
+               SELECT 'rescore:' || p.id, 1 FROM project p WHERE EXISTS (SELECT 1 FROM ts_file f WHERE f.project_id = p.id AND f.lang = 'python');
+             PRAGMA user_version = 21;",
+        )?;
+    }
     // Cheap when already set: the setting lives in each table's own config.
     for t in MERGE_TABLES {
         defer_merges(c, t)?;
@@ -717,7 +729,7 @@ pub fn minority(c: &Connection, ranges: &[(i64, i64)]) -> bool {
 }
 
 /// The schema version this build writes.
-pub const LATEST: i64 = 20;
+pub const LATEST: i64 = 21;
 
 /// Read-only connection for the hot paths. None if the store does not exist yet.
 pub fn open_ro() -> Option<Connection> {
