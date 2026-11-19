@@ -267,8 +267,13 @@ Hooks. foxdb does not install these; add them to `~/.claude/settings.json` yours
   still get byte-identical text and share a cached prefix. The helper is registered as an agent.
 - `subagent-stop`: saves the helper's final message as a `report` handoff row (redacted), marks
   the agent done and prints nothing.
-- `pre-compact`: saves a handoff packet from the transcript and prints nothing; the
-  `session-start` that follows a compaction (`source: compact`) adds one `pre-compact packet h:…` line.
+- `pre-compact`: saves a handoff packet from the transcript and clears the CLI's "already sent"
+  set for `FOXDB_SESSION`. With `--harness claude` it prints four plain lines, which Claude Code
+  passes to the compaction summariser as instructions (not as context): keep the `path:line`
+  anchors of files being read or edited, the symbols being changed, leads already ruled out, and
+  the packet handle `h:…`. The text depends only on the handle. With `--harness codex` it prints
+  nothing. The `session-start` that follows a compaction (`source: compact`) adds one
+  `pre-compact packet h:…` line.
 - A brief cut at its budget or cap ends with `+N lines (brief cut short; fox_memory op=brief budget=2000)`; that call returns up to 2,000 tokens, so it gives back the cut lines. The hook budgets (400 tokens at SessionStart, 250 at SubagentStart) are in `context-budget.json`.
 - Every session-start also registers the session in the agent registry (only when a store exists).
 
@@ -289,7 +294,9 @@ Opt-in search hooks (off by default; AGENTS-SETUP.md step 6 has the settings ent
 Prompt-cache safety. By default foxdb adds context only at SessionStart and SubagentStart, never from
 PreToolUse, PostToolUse or UserPromptSubmit (the opt-in search hooks above are the exception): Claude Code rewrites the cached history when a tool
 hook returns context (anthropics/claude-code#83913), and per-prompt context grows every turn. A
-test runs every hook event and fails if any other one injects. `context-budget.json` commits the
+test runs every hook event and fails if any other one injects. The PreCompact lines are
+summariser instructions, plain text rather than `additionalContext`, and the same test checks
+they stay that way. `context-budget.json` commits the
 size of everything foxdb puts in a cached prefix (brief caps, `tools/list` bytes, server
 instructions, the dispatch brief, the report schema); a test fails if any of them changes, so
 growth is a reviewed edit to that file.

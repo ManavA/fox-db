@@ -194,7 +194,7 @@ Each is a command hook that prints nothing and exits 0 on any error or after 1.5
 | `SessionStart` | Project brief (current gate, open milestones, board), capped at 9,500 characters | Runs once per session, before the first prompt, so it is part of the cached prefix |
 | `SubagentStart` | A ~1,500-character brief for the helper and a pointer to the parent's board snapshot; skipped for agents matching `skip_agents` | The snapshot is frozen per parent session, so sibling subagents get byte-identical text |
 | `SubagentStop` | Saves the helper's final message as a report on the board; prints nothing | Injects nothing |
-| `PreCompact` | Saves a handoff packet before compaction; prints nothing | Injects nothing; the following session start adds one line |
+| `PreCompact` | Saves a handoff packet before compaction; for Claude Code, prints four lines asking the compaction summary to keep the working set's `path:line` anchors, the symbols being edited, ruled-out leads and the packet handle | Injects no context: Claude Code hands the lines to the summariser as instructions; the following session start adds one line |
 
 By default foxdb never injects from `PreToolUse`, `PostToolUse` or `UserPromptSubmit`, which
 would rewrite the cached history or grow every turn; a test enforces this. The two search hooks

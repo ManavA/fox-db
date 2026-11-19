@@ -153,6 +153,12 @@ fn context_is_injected_only_at_session_and_subagent_start() {
         if out.is_empty() {
             continue;
         }
+        // PreCompact stdout is instructions to the compaction summariser, plain text that never
+        // enters a cached prefix as context.
+        if event == "pre-compact" {
+            assert!(serde_json::from_str::<serde_json::Value>(&out).is_err(), "PreCompact output is plain text: {out}");
+            continue;
+        }
         let v: serde_json::Value = serde_json::from_str(&out).unwrap();
         if v["hookSpecificOutput"].get("additionalContext").is_some() {
             injected.push(v["hookSpecificOutput"]["hookEventName"].as_str().unwrap_or_default().to_string());
@@ -178,6 +184,26 @@ fn context_is_injected_only_at_session_and_subagent_start() {
         assert_eq!(lines.len(), 1, "{carrier} must appear once: {lines:?}");
         assert!(lines[0].trim_start().starts_with(arm), "{carrier} must sit behind its switch: {}", lines[0]);
     }
+}
+
+/// Claude Code passes PreCompact stdout to the compaction summariser as instructions: ask it to
+/// keep the working set and the packet the hook just saved. Short, and the same bytes for the
+/// same packet. Codex gets nothing.
+#[test]
+fn pre_compact_asks_the_summary_to_keep_the_working_set() {
+    let _g = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    let (_home, repo) = setup();
+    let (c, _p) = indexed(repo.path());
+    let input = serde_json::json!({"hook_event_name": "PreCompact", "cwd": repo.path(), "session_id": "s1"}).to_string();
+    let out = hook::run("pre-compact", &input, hook::Harness::Claude);
+    let id: i64 = c.query_row("SELECT MAX(id) FROM handoff WHERE kind = 'packet' AND scope = 'compact'", [], |r| r.get(0)).unwrap();
+    let h = foxdb::handoff::handle(id);
+    assert_eq!(out, hook::compact_instructions(&h), "{out}");
+    for want in ["path:line", "symbols", "ruled out", &format!("fox_read target={h}")] {
+        assert!(out.contains(want), "missing {want:?}:\n{out}");
+    }
+    assert!(out.lines().count() <= 6 && out.len() < 500, "{out}");
+    assert_eq!(hook::run("pre-compact", &input, hook::Harness::Codex), "", "Codex reads no PreCompact instructions");
 }
 
 /// The committed size budget (`context-budget.json`): briefs, the tool list, the server

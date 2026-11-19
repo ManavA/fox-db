@@ -75,6 +75,10 @@ First answers that were empty, wrong or padded in agent benchmark transcripts ar
 - The weekly `fox saved ~N tokens` line and `fox stats` compare each answer with a ranged read of
   30 lines around each cited line (never more than the file), not with reading every cited file
   whole, which overstated savings about tenfold.
+- `fox hook pre-compact --harness claude` prints four plain lines, which Claude Code hands to the
+  compaction summariser as instructions: keep the `path:line` anchors of files being read or
+  edited, the symbols being changed, leads already ruled out, and the packet handle `h:…` the
+  hook just saved. The text depends only on that handle; Codex gets nothing.
 
 ## 0.2.2 (2026-11-18)
 

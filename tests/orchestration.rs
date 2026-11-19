@@ -410,9 +410,12 @@ fn pre_compact_saves_a_packet_and_the_compact_session_start_points_at_it() {
     };
     let plain = hook::run("session-start", &ev("SessionStart", json!({"source": "startup"})), hook::Harness::Claude);
     assert!(!plain.contains("pre-compact packet"));
-    assert_eq!(hook::run("pre-compact", &ev("PreCompact", json!({"trigger": "auto"})), hook::Harness::Claude), "");
+    let asked = hook::run("pre-compact", &ev("PreCompact", json!({"trigger": "auto"})), hook::Harness::Claude);
     let after = hook::run("session-start", &ev("SessionStart", json!({"source": "compact"})), hook::Harness::Claude);
     assert!(after.contains("pre-compact packet h:"), "{after}");
+    // The summariser was asked to keep the same packet the next session start points at.
+    let saved = asked.split_whitespace().find(|w| w.starts_with("h:")).unwrap();
+    assert!(after.contains(&format!("pre-compact packet {saved} ")), "{asked}\n{after}");
     let v: serde_json::Value = serde_json::from_str(&after).unwrap();
     let ctx = v["hookSpecificOutput"]["additionalContext"].as_str().unwrap();
     let h = ctx.split_whitespace().find(|w| w.starts_with("h:")).unwrap();

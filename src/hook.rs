@@ -1,5 +1,6 @@
 //! `fox hook <event>`: Claude Code / Codex command hooks. Input is the hook's JSON on stdin; output
-//! is the `hookSpecificOutput` JSON form, or nothing. Hooks fail open: any error prints nothing.
+//! is the `hookSpecificOutput` JSON form, nothing, or (PreCompact, Claude Code) plain-text
+//! instructions for the compaction summariser. Hooks fail open: any error prints nothing.
 //!
 //! Everything a hook injects is a deterministic function of the index (no clocks, no relative
 //! ages), so siblings and resumed sessions share the prompt-cache prefix.
@@ -137,7 +138,20 @@ fn owner_of(input: &Value) -> Option<String> {
         .or_else(|| input["session_id"].as_str().filter(|s| !s.is_empty()).map(String::from))
 }
 
-/// Save a handoff packet from the transcript before the harness compacts it. Prints nothing.
+/// What `fox hook pre-compact --harness claude` prints. Claude Code hands PreCompact stdout to
+/// the compaction summariser as instructions (not context): keep the working set and the packet
+/// `handle` the hook just saved. A function of the handle only.
+pub fn compact_instructions(handle: &str) -> String {
+    format!(
+        "foxdb: keep these in the summary, verbatim:\n\
+         - the path:line anchors of files being read or edited, and the symbols being changed\n\
+         - leads already ruled out, and why\n\
+         - handoff packet {handle} (fox_read target={handle} restores the working set)\n"
+    )
+}
+
+/// Save a handoff packet from the transcript before the harness compacts it. For Claude Code,
+/// prints [`compact_instructions`]; for Codex, nothing.
 fn pre_compact(input: &Value, h: Harness) -> Result<String> {
     if !db::db_path().exists() {
         return Ok(String::new());
@@ -156,7 +170,7 @@ fn pre_compact(input: &Value, h: Harness) -> Result<String> {
     let spec = crate::packet::Spec { agent: owner.as_deref(), harness: Some(h.name()), transcript: tx.as_deref(), ..Default::default() };
     let id = crate::packet::create(&w, &p, &spec)?;
     w.execute("UPDATE handoff SET scope = 'compact' WHERE id = ?1", [id])?;
-    Ok(String::new())
+    Ok(if h == Harness::Claude { compact_instructions(&crate::handoff::handle(id)) } else { String::new() })
 }
 
 fn glob_match(pat: &str, s: &str) -> bool {
