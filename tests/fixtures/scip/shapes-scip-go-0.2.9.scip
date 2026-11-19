@@ -1,0 +1,29 @@
+
+(
+scip-go0.2.9file:///src/shapes »
+	shapes.goB8scip-go gomod example.com/shapes . `example.com/shapes`/BR>scip-go gomod example.com/shapes . `example.com/shapes`/Shape#B
+Z WCscip-go gomod example.com/shapes . `example.com/shapes`/Shape#Area.BRS?scip-go gomod example.com/shapes . `example.com/shapes`/Square#BZ XDscip-go gomod example.com/shapes . `example.com/shapes`/Square#Side.BRlocal 0B
+K?scip-go gomod example.com/shapes . `example.com/shapes`/Square#B
+XFscip-go gomod example.com/shapes . `example.com/shapes`/Square#Area().B
+R
+5local 0B
+$%PDscip-go gomod example.com/shapes . `example.com/shapes`/Square#Side.B
+&*local 0B
+-.PDscip-go gomod example.com/shapes . `example.com/shapes`/Square#Side.B
+/3T@scip-go gomod example.com/shapes . `example.com/shapes`/Total().B
+Z local 1BJ>scip-go gomod example.com/shapes . `example.com/shapes`/Shape#Blocal 2Blocal 3B	local 1Blocal 2Blocal 3BOCscip-go gomod example.com/shapes . `example.com/shapes`/Shape#Area.B	local 2B	WCscip-go gomod example.com/shapes . `example.com/shapes`/useTotal().BZ L@scip-go gomod example.com/shapes . `example.com/shapes`/Total().BJ>scip-go gomod example.com/shapes . `example.com/shapes`/Shape#BK?scip-go gomod example.com/shapes . `example.com/shapes`/Square#BPDscip-go gomod example.com/shapes . `example.com/shapes`/Square#Side.B!Z
+8scip-go gomod example.com/shapes . `example.com/shapes`/(#2shapes:"go*package shapes‡
+>scip-go gomod example.com/shapes . `example.com/shapes`/Shape#Shape has an area.(2Shape:("go*"type Shape interface{ Area() int }l
+Cscip-go gomod example.com/shapes . `example.com/shapes`/Shape#Area.(C2Area:"go*func (Shape).Area() intÉ
+?scip-go gomod example.com/shapes . `example.com/shapes`/Square#Square is a Shape."B
+>scip-go gomod example.com/shapes . `example.com/shapes`/Shape#(12Square:$"go*type Square struct{ Side int }k
+Dscip-go gomod example.com/shapes . `example.com/shapes`/Square#Side.(2Side:"go*struct field Side int¹
+Fscip-go gomod example.com/shapes . `example.com/shapes`/Square#Area()."G
+Cscip-go gomod example.com/shapes . `example.com/shapes`/Shape#Area.(2Area:"go*func (Square).Area() intŸ
+@scip-go gomod example.com/shapes . `example.com/shapes`/Total().0Total adds the areas of
+every shape it is given.(2Total: "go*func Total(xs []Shape) intl
+Cscip-go gomod example.com/shapes . `example.com/shapes`/useTotal().(2useTotal:"go*func useTotal() int"
+local 0(=2s:"go*var s Square%
+local 1(=2xs:"go*var xs []Shape
+local 2(=2n:"go*	var n int!
+local 3(=2x:"go*var x Shape"go0

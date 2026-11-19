@@ -189,6 +189,25 @@ pub fn decode(b: &[u8]) -> Result<Index> {
                             while let Some((f, v)) = or.next()? {
                                 match f {
                                     1 => pb::ints(&v, &mut o.range)?,
+                                    // Typed ranges (newer indexers, scip-go 0.2.9): single_line_range
+                                    // {line, start, end} and multi_line_range {start line, start,
+                                    // end line, end}. A packed `range` (field 1) wins when both exist.
+                                    8 | 9 if o.range.is_empty() => {
+                                        if let Val::Bytes(b) = v {
+                                            let mut x = [0i64; 4];
+                                            let mut tr = Reader::new(b);
+                                            while let Some((f, v)) = tr.next()? {
+                                                if let (1..=4, Val::Int(n)) = (f, v) {
+                                                    x[f as usize - 1] = n as i32 as i64;
+                                                }
+                                            }
+                                            o.range = match f {
+                                                8 => vec![x[0], x[1], x[2]],
+                                                _ if x[2] == x[0] => vec![x[0], x[1], x[3]],
+                                                _ => x.to_vec(),
+                                            };
+                                        }
+                                    }
                                     2 => {
                                         if let Val::Bytes(s) = v {
                                             o.symbol = string(s);

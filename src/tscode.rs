@@ -7,7 +7,7 @@ use crate::query::{clip, page};
 use crate::tsindex::{is_callable_kind, is_type_kind};
 use anyhow::{Result, bail};
 use rusqlite::{Connection, params};
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
 #[derive(Debug, Clone)]
 pub struct TSym {
@@ -566,6 +566,48 @@ fn no_call(line: &str, name: &str, path: &str) -> bool {
         && !before.split(|ch: char| !(ch.is_alphanumeric() || ch == '_')).any(|w| NOT_TYPES.contains(&w))
 }
 
+/// One `may be incomplete` line when precise (SCIP) references in files `listed` leaves out go to
+/// a method `top` overrides or that overrides it: a call resolved there may still run `top`, and
+/// the completeness check counts such files as settled. Only stores with an import have them.
+fn dispatched_elsewhere(c: &Connection, pid: i64, top: &TSym, listed: &HashSet<String>) -> Result<Option<String>> {
+    if !crate::scip::active(c, pid) {
+        return Ok(None);
+    }
+    let mut q = c.prepare_cached(
+        "SELECT DISTINCT path, dst FROM ts_ref WHERE project_id = ?1 AND name = ?2 AND amb < 0 AND dst != ?3 AND dst != 0 AND kind = 'call'",
+    )?;
+    let rows: Vec<(String, i64)> = q
+        .query_map(params![pid, top.name, top.id], |r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?)))?
+        .flatten()
+        .filter(|(path, _)| !listed.contains(path))
+        .collect();
+    if rows.is_empty() {
+        return Ok(None);
+    }
+    let d = dispatch(c, pid, top)?;
+    let related: HashMap<i64, &TSym> = d.up.iter().chain(&d.down).map(|s| (s.id, s)).collect();
+    let mut files: BTreeSet<&str> = BTreeSet::new();
+    let mut via: BTreeSet<String> = BTreeSet::new();
+    for (path, dst) in &rows {
+        if let Some(s) = related.get(dst) {
+            files.insert(path);
+            via.insert(s.qname());
+        }
+    }
+    if files.is_empty() {
+        return Ok(None);
+    }
+    let n = files.len();
+    let shown: Vec<&str> = files.iter().take(5).copied().collect();
+    let more = if n > shown.len() { format!(", +{} more", n - shown.len()) } else { String::new() };
+    Ok(Some(format!(
+        "may be incomplete: calls in {n} file{} resolve to {}, which may dispatch here: {}{more}",
+        if n == 1 { "" } else { "s" },
+        via.into_iter().collect::<Vec<_>>().join(", "),
+        shown.join(", ")
+    )))
+}
+
 /// The head line and, for at most [`MENTION_FILES`] files, the `path:line | code` rows of files
 /// naming `name` that an answer does not resolve.
 fn mentions(p: &Project, name: &str, files: &[String], lead: &str, why: &str) -> (Option<String>, Vec<String>) {
@@ -758,6 +800,8 @@ pub fn run(c: &Connection, p: &Project, sym: &str, rel: &str, depth: usize, curs
                 tail.extend(rows);
             } else if weak > 0 {
                 lines.insert(at + 1, format!("may be incomplete: {}", weak_left_out(weak)));
+            } else if let Some(l) = dispatched_elsewhere(c, p.id, top, &files)? {
+                lines.insert(at + 1, l);
             }
         }
         "callees" => {
@@ -1377,11 +1421,11 @@ fn related_types(c: &Connection, t: i64, up: bool) -> Result<HashSet<i64>> {
 fn related_types_n(c: &Connection, t: i64, up: bool, steps: usize) -> Result<HashSet<i64>> {
     let sql = if up {
         "SELECT DISTINCT r.dst FROM ts_ref r JOIN node n ON n.id = r.dst JOIN node s ON s.id = r.src
-         WHERE r.src = ?1 AND r.src != 0 AND r.dst != 0 AND r.amb = 0 AND (r.kind = 'impl' OR r.kind = 'ref' AND r.line = s.line)
+         WHERE r.src = ?1 AND r.src != 0 AND r.dst != 0 AND r.amb <= 0 AND (r.kind = 'impl' OR r.kind = 'ref' AND r.line = s.line)
            AND json_extract(n.meta,'$.k') IN ('class','interface','object','struct','enum','trait','protocol')"
     } else {
         "SELECT DISTINCT r.src FROM ts_ref r JOIN node n ON n.id = r.src
-         WHERE r.dst = ?1 AND r.dst != 0 AND r.amb = 0 AND (r.kind = 'impl' OR r.kind = 'ref' AND r.line = n.line)
+         WHERE r.dst = ?1 AND r.dst != 0 AND r.amb <= 0 AND (r.kind = 'impl' OR r.kind = 'ref' AND r.line = n.line)
            AND json_extract(n.meta,'$.k') IN ('class','interface','object','struct','enum','trait','protocol')"
     };
     let mut q = c.prepare_cached(sql)?;
