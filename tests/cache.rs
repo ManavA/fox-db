@@ -267,6 +267,27 @@ fn tool_answers_carry_no_savings_note() {
     assert!(foxdb::savings::stats(&c).unwrap().contains("45 answers"));
 }
 
+/// The savings baseline is what an agent would read without foxdb: a ranged read around each
+/// cited line, never more than the file. Reading every cited file whole overstated it ~10x.
+#[test]
+fn savings_compare_with_a_ranged_read_of_each_cited_line() {
+    use foxdb::savings::{RANGE_BYTES, estimate, tokens};
+    let _g = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    let (_home, repo) = setup();
+    let big: String = (0..3000).map(|i| format!("pub fn filler_function_number_{i}() {{}}\n")).collect();
+    write(repo.path(), "src/big.rs", &big);
+    let (c, p) = indexed(repo.path());
+    let small = fs::metadata(repo.path().join("src/lib.rs")).unwrap().len() as usize;
+    let out = "src/big.rs:10 filler_function_number_9\nsrc/big.rs:2000 filler_function_number_1999\nsrc/lib.rs:1 alpha\n";
+    let want = tokens(2 * RANGE_BYTES) + tokens(small) - tokens(out.len());
+    assert_eq!(estimate(&c, Some(p.id), out), want);
+    assert!(want < tokens(big.len()) / 10, "two cited lines are not the whole file");
+    // A grouped answer: a file header with its site count, then `:line` rows.
+    let grouped = "src/\n big.rs (3)\n  :4 a\n  :9 b\n  :70 c\n";
+    assert_eq!(estimate(&c, Some(p.id), grouped), tokens(3 * RANGE_BYTES) - tokens(grouped.len()));
+    assert!(foxdb::savings::stats(&c).unwrap().starts_with("tokens saved (est., vs a ranged read of each cited line)"));
+}
+
 #[test]
 fn read_only_tools_are_annotated_and_nothing_is_structured() {
     let tools = mcp::tools();

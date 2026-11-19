@@ -170,15 +170,15 @@ unresolved mentions:
 $ fox code classify_file --rel src       # source body with line numbers
 
 $ fox stats
-tokens saved (est., vs reading cited files whole)
-today: ~35k in 10 answers
-7 days: ~35k in 10 answers
-all time: ~35k in 10 answers
-top: code callers ~15k/5, code outline ~11k/3, code callees ~6397/1, code impact ~2159/1
+tokens saved (est., vs a ranged read of each cited line)
+today: ~4100 in 10 answers
+7 days: ~4100 in 10 answers
+all time: ~4100 in 10 answers
+top: code callers ~1800/5, code outline ~1300/3, code callees ~700/1, code impact ~250/1
 ```
 
 - `index` walks the project (honouring `.gitignore`), re-parses changed code files with tree-sitter, refreshes Swift index stores (and the codanna mirror if enabled), and also indexes global memory unless `--no-global`.
-- `stats` reports estimated tokens saved: each answer is compared with reading every file it cites, whole (about 4 characters per token). A coarse weekly line ends the session brief; tool answers never carry a note, so identical answers stay byte-identical.
+- `stats` reports estimated tokens saved: each answer is compared with a ranged read of 30 lines around each line it cites, never more than the whole file (about 4 characters per token). A coarse weekly line ends the session brief; tool answers never carry a note, so identical answers stay byte-identical.
 - `watch` keeps a project fresh with inotify/FSEvents (skip-listed dirs such as `node_modules` are not watched).
 - `mem brief` is fail-open: it never prints errors and always exits 0, so it is safe in hooks.
 - `code --rel impact` with no target uses the working-tree git diff; in 0.1.0 this covers changed Swift files only (other languages print `no changed Swift files vs HEAD`; name a symbol instead).

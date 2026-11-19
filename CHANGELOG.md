@@ -72,6 +72,9 @@ First answers that were empty, wrong or padded in agent benchmark transcripts ar
   identity) and outlives compactions, so the reference pointed subagents and compacted sessions
   at text they never had. The `fresh` argument is gone from the tool list. The CLI keeps its
   per-`FOXDB_SESSION` set for `fox code --rel src|outline`, and the PreCompact hook now clears it.
+- The weekly `fox saved ~N tokens` line and `fox stats` compare each answer with a ranged read of
+  30 lines around each cited line (never more than the file), not with reading every cited file
+  whole, which overstated savings about tenfold.
 
 ## 0.2.2 (2026-11-18)
 
