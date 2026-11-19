@@ -121,8 +121,9 @@ fn fnv_hex(s: &str) -> String {
 // ---- milestone 3: cache safety ----
 
 /// Claude Code rewrites the cached history when PreToolUse/PostToolUse return context
-/// (anthropics/claude-code#83913), and UserPromptSubmit context grows every turn. foxdb injects
-/// only at session start and subagent start.
+/// (anthropics/claude-code#83913), and UserPromptSubmit context grows every turn. By default
+/// foxdb injects only at session start and subagent start; the grep and prompt hooks are opt-in
+/// (`[hooks] grep_context` / `prompt_context`, tested in tests/toolhooks.rs).
 #[test]
 fn context_is_injected_only_at_session_and_subagent_start() {
     let _g = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
@@ -148,7 +149,7 @@ fn context_is_injected_only_at_session_and_subagent_start() {
             "tool_name": "Bash", "tool_input": {"command": "ls"}
         })
         .to_string();
-        let out = hook::run(event, &input, hook::Harness::Claude);
+        let out = hook::run_with(&foxdb::config::Config::default(), event, &input, hook::Harness::Claude);
         if out.is_empty() {
             continue;
         }
@@ -158,10 +159,24 @@ fn context_is_injected_only_at_session_and_subagent_start() {
         }
     }
     assert_eq!(injected, ["SessionStart", "SubagentStart"], "context injected outside session/subagent start");
-    // The source names no other event as a context carrier.
+    // The source names no other event as a context carrier, except the two opt-in tool hooks,
+    // each behind its config switch.
     let src = include_str!("../src/hook.rs");
     for l in src.lines().filter(|l| l.contains("context(\"")) {
-        assert!(l.contains("context(\"SessionStart\"") || l.contains("context(\"SubagentStart\""), "new context carrier: {l}");
+        let ok = l.contains("context(\"SessionStart\"")
+            || l.contains("context(\"SubagentStart\"")
+            || (l.contains("context(\"PostToolUse\"") && l.contains("cfg.hooks.grep_context"))
+            || (l.contains("context(\"UserPromptSubmit\"") && l.contains("cfg.hooks.prompt_context"));
+        assert!(ok, "new context carrier: {l}");
+    }
+    // Each opt-in hook is wired exactly once, as a guarded match arm.
+    for (arm, carrier) in [
+        ("\"post-tool-use\" if cfg.hooks.grep_context =>", "context(\"PostToolUse\""),
+        ("\"user-prompt-submit\" if cfg.hooks.prompt_context =>", "context(\"UserPromptSubmit\""),
+    ] {
+        let lines: Vec<&str> = src.lines().filter(|l| l.contains(carrier)).collect();
+        assert_eq!(lines.len(), 1, "{carrier} must appear once: {lines:?}");
+        assert!(lines[0].trim_start().starts_with(arm), "{carrier} must sit behind its switch: {}", lines[0]);
     }
 }
 

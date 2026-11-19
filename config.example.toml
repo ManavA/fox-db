@@ -16,6 +16,12 @@ MyAppMobile = "iOS"
 # the default, which keeps zero-context ("goldfish") reviewers zero-context.
 [hooks]
 skip_agents = ["egm-*", "*goldfish*", "*reviewer*"]
+# Opt-in search hooks (AGENTS-SETUP.md step 6). grep_context: after a Bash grep/rg/git grep,
+# name each hit's enclosing definition and handle (`fox hook post-tool-use`). prompt_context:
+# when a prompt names an identifier or path that resolves to exactly one indexed definition or
+# file, add its location (`fox hook user-prompt-submit`). Both off by default.
+grep_context = false
+prompt_context = false
 
 # Full-text engine per project. "fts5" (default) never uses tantivy. "auto" (opt-in) gives a
 # project of at least tantivy_min_docs rows a tantivy index kept by foxd (builds with the tantivy

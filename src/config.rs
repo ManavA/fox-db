@@ -78,6 +78,14 @@ pub struct Hooks {
     /// default `["egm-*", "*goldfish*", "*reviewer*"]`: zero-context reviewers stay zero-context.
     #[serde(default)]
     pub skip_agents: Option<Vec<String>>,
+    /// PostToolUse on Bash: name the enclosing symbol and handle of each `grep`/`rg`/`git grep`
+    /// hit (`fox hook post-tool-use`). Off unless set.
+    #[serde(default)]
+    pub grep_context: bool,
+    /// UserPromptSubmit: when the prompt names an identifier or path that resolves to exactly one
+    /// indexed definition or file, add its location (`fox hook user-prompt-submit`). Off unless set.
+    #[serde(default)]
+    pub prompt_context: bool,
 }
 
 pub const DEFAULT_SKIP_AGENTS: &[&str] = &["egm-*", "*goldfish*", "*reviewer*"];

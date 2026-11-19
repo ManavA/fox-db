@@ -36,6 +36,7 @@ pub mod swiftimport;
 #[cfg(feature = "tantivy")]
 pub mod tantivy_index;
 pub mod tiers;
+pub mod toolhook;
 pub mod tscode;
 pub mod tsindex;
 #[cfg(feature = "vectors")]
