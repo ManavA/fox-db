@@ -56,7 +56,7 @@ fn python_lines_are_accounted_for_by_group() {
     let out = fox_code(&p, "Fetcher.fetch_page", "callers", 2000);
     assert_eq!(
         first(&out),
-        "8 lines name `fetch_page`: 1 call (1 guessed), 1 definition, 1 import, 2 in 1 same-name definition elsewhere, 2 comments, 1 in strings (may be dynamic uses); all accounted for",
+        "8 lines name `fetch_page`: 1 call (1 guessed), 1 definition, 1 import, 2 in 1 same-name definition elsewhere, 2 comments, 1 in strings (may be dynamic uses); all accounted for in indexed Python code",
         "{out}"
     );
     assert!(out.contains("callers of ~c:") && out.contains(":8 run c:"), "{out}");
@@ -67,12 +67,13 @@ fn python_lines_are_accounted_for_by_group() {
     let out = fox_code(&p, "Fetcher.fetch_page", "refs", 2000);
     assert!(
         first(&out).starts_with("8 lines name `fetch_page`: 1 ref (1 guessed), 1 definition,")
-            && first(&out).ends_with("all accounted for"),
+            && first(&out).contains("; all accounted for in indexed "),
         "{out}"
     );
     let out = fox_code(&p, "Fetcher.fetch_page", "impact", 2000);
     assert!(
-        first(&out).starts_with("8 lines name `fetch_page`: 1 use (d1), 1 definition,") && first(&out).ends_with("all accounted for"),
+        first(&out).starts_with("8 lines name `fetch_page`: 1 use (d1), 1 definition,")
+            && first(&out).contains("; all accounted for in indexed "),
         "{out}"
     );
     assert!(out.contains("impact of ~c:"), "{out}");
@@ -107,7 +108,11 @@ fn c_prototypes_are_declarations_and_unknown_uses_are_listed() {
         ("src/plan.c", "#include \"plan.h\"\nint plan_query(int q) { return q; }\nint run(void) { return plan_query(1); }\n"),
     ]);
     let out = fox_code(&p, "plan_query", "callers", 2000);
-    assert_eq!(first(&out), "4 lines name `plan_query`: 1 call, 1 definition, 2 declarations/prototypes; all accounted for", "{out}");
+    assert_eq!(
+        first(&out),
+        "4 lines name `plan_query`: 1 call, 1 definition, 2 declarations/prototypes; all accounted for in indexed C/C++/Objective-C/Swift code",
+        "{out}"
+    );
 }
 
 /// A cited file changed since it was indexed: the accounting says so instead of claiming
@@ -180,11 +185,11 @@ fn go_and_typescript_groups() {
     let out = fox_code(&p, "clock.NewFake", "callers", 2000);
     assert_eq!(
         first(&out),
-        "4 lines name `NewFake`: 1 call, 1 definition, 1 in 1 same-name definition elsewhere, 1 comment; all accounted for",
+        "4 lines name `NewFake`: 1 call, 1 definition, 1 in 1 same-name definition elsewhere, 1 comment; all accounted for in indexed Go code",
         "{out}"
     );
     let out = fox_code(&p, "stamp", "callers", 2000);
-    assert_eq!(first(&out), "3 lines name `stamp`: 1 call, 1 definition, 1 import; all accounted for", "{out}");
+    assert_eq!(first(&out), "3 lines name `stamp`: 1 call, 1 definition, 1 import; all accounted for in indexed JS/TS code", "{out}");
 }
 
 /// Python `@overload` stubs and a property's setter are no symbols of their own: the name
@@ -204,7 +209,7 @@ fn python_overload_stubs_and_setters_merge_into_one_symbol() {
     assert!(out.contains("callers of ~c:") && out.contains("lib/defer.py:7"), "{out}");
     assert_eq!(
         first(&out),
-        "5 lines name `must_defer`: 1 call, 1 definition, 1 import, 2 declarations/prototypes; all accounted for",
+        "5 lines name `must_defer`: 1 call, 1 definition, 1 import, 2 declarations/prototypes; all accounted for in indexed Python code",
         "{out}"
     );
     let out = fox_code(&p, "Box.size", "callers", 2000);
@@ -222,13 +227,13 @@ fn a_wrapper_inside_a_same_name_definition_is_listed() {
     ]);
     let out = fox_code(&p, "Engine.plan_query", "callers", 2000);
     assert!(out.contains("lib/proxy.py:3 "), "{out}");
-    assert!(!first(&out).ends_with("all accounted for"), "{out}");
+    assert!(!first(&out).contains("all accounted for"), "{out}");
 }
 
 // ---- review fixes: no line the ledger cannot classify reads as accounted for ----
 
 fn ends_complete(out: &str) -> bool {
-    first(out).ends_with("all accounted for")
+    first(out).contains("; all accounted for in indexed ")
 }
 
 /// A line naming the target inside another same-name definition with no reference row (a Rust
@@ -547,4 +552,139 @@ fn parsed_strings_never_hide_a_use() {
         let out = fox_code(&p, "A.plan", "refs", 2000);
         assert!(!ends_complete(&out) && !first(&out).contains("comment") && !first(&out).contains("strings"), "{what}: {out}");
     }
+}
+
+/// (what, target, rel, files)
+type Case<'a> = (&'a str, &'a str, &'a str, &'a [(&'a str, &'a str)]);
+
+/// Every occurrence on a line needs its own reference or definition: a second, unresolved use
+/// beside a resolved one, an alias (`plan = core.plan`) or a delegating wrapper, an import and a
+/// call on one line all leave the line unresolved.
+#[test]
+fn every_occurrence_on_a_line_is_covered() {
+    let _g = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    let cases: &[Case] = &[
+        (
+            "alias",
+            "core.plan",
+            "callers",
+            &[
+                ("core.py", "def plan(x):\n    return x\n"),
+                ("use.py", "import core\nplan = core.plan\n\n\ndef go():\n    return plan(1)\n"),
+            ],
+        ),
+        (
+            "second use",
+            "A.plan",
+            "callers",
+            &[(
+                "a.py",
+                "class A:\n    def plan(self):\n        return 1\n\n    def run(self, b):\n        return self.plan(), register(b.plan)\n\n\nclass B:\n    def plan(self):\n        return 2\n",
+            )],
+        ),
+        (
+            "import and call",
+            "A.plan",
+            "refs",
+            &[
+                ("a.py", "class A:\n    def plan(self):\n        return 1\n\n\nclass B:\n    def plan(self):\n        return 2\n"),
+                ("other.py", "def plan():\n    return 3\n"),
+                ("use.py", "from other import plan; o.plan()\n"),
+            ],
+        ),
+        (
+            "wrapper",
+            "A.plan",
+            "callers",
+            &[
+                ("a.js", "export class A { plan(x) { return x; } }\n"),
+                ("b.js", "export class B { plan(x) { return this.inner.plan(x); } }\n"),
+            ],
+        ),
+        (
+            "go method value",
+            "Server.plan",
+            "refs",
+            &[
+                ("go.mod", "module ex\ngo 1.21\n"),
+                (
+                    "a.go",
+                    "package ex\n\ntype Server struct{}\n\nfunc (s *Server) plan() int { return 1 }\n\ntype Other struct{}\n\nfunc (o *Other) plan() int { return 2 }\n\nfunc (o *Other) run(y *Server) func() int {\n\to.plan(); return y.plan\n}\n",
+                ),
+            ],
+        ),
+        (
+            "python class body",
+            "A.plan",
+            "callers",
+            &[(
+                "a.py",
+                "class A:\n    def plan(x):\n        return x\n\n    y = plan(3)\n\n\nclass B:\n    def plan(self):\n        return 1\n\n\ndef go(b):\n    return b.plan()\n",
+            )],
+        ),
+    ];
+    for (what, q, rel, files) in cases {
+        let (_h, _r, p) = inline_project(files);
+        let out = fox_code(&p, q, rel, 2000);
+        // The call beside the import is listed either way: as a (guessed) row, or unresolved.
+        if *what == "import and call" {
+            assert!(out.contains("from other import plan; o.plan()"), "{what}: {out}");
+            continue;
+        }
+        assert!(!ends_complete(&out), "{what}: {out}");
+    }
+}
+
+/// Swift `\(x)` and Kotlin `$x` in strings are code.
+#[test]
+fn swift_and_kotlin_templates_are_code() {
+    let _g = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    for files in [
+        &[
+            ("A.swift", "let plan = 3\nfunc go() -> String {\n    return \"v \\(plan)\"\n}\n"),
+            ("B.swift", "func plan() -> Int { return 1 }\n"),
+        ][..],
+        &[
+            ("A.kt", "package ex\nval plan = 3\nfun go(): String {\n    return \"v $plan\"\n}\n"),
+            ("B.kt", "package ex\nfun plan(): Int = 1\n"),
+        ][..],
+    ] {
+        let (_h, _r, p) = inline_project(files);
+        let target = if files[0].0.ends_with(".swift") { "B.plan" } else { "ex.plan" };
+        let out = fox_code(&p, target, "refs", 2000);
+        assert!(!first(&out).contains("in strings") && !ends_complete(&out), "{out}");
+    }
+}
+
+/// A warm server sees edits: an edit to a file the answer read, a new file, or a changed
+/// ignore rule since the index makes the next answer (a second later) stale.
+#[test]
+fn a_warm_answer_sees_edits_and_ignore_changes() {
+    let _g = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    let (_h, r, p) = inline_project(&[
+        ("core.py", "def plan(x):\n    return x\n\n\ndef go():\n    return plan(1)\n"),
+        ("use.py", "from core import plan\n\n\ndef other():\n    return plan(5)\n"),
+    ]);
+    let out = fox_code(&p, "core.plan", "callers", 2000);
+    assert!(ends_complete(&out), "{out}");
+    std::fs::write(
+        r.path().join("use.py"),
+        "from core import plan\n\n\ndef other():\n    return plan(5)\n\n\ndef more():\n    return plan(6)\n",
+    )
+    .unwrap();
+    std::thread::sleep(std::time::Duration::from_millis(1100));
+    let out = fox_code(&p, "core.plan", "callers", 2000);
+    assert!(first(&out).contains("stale") && first(&out).contains("use.py"), "edited: {out}");
+    let (_h, r, p) = inline_project(&[
+        (".gitignore", "gen/\n"),
+        ("core.py", "def plan(x):\n    return x\n\n\ndef go():\n    return plan(1)\n"),
+        ("gen/g.py", "from core import plan\n\n\ndef g():\n    return plan(2)\n"),
+    ]);
+    let out = fox_code(&p, "core.plan", "callers", 2000);
+    assert!(ends_complete(&out), "{out}");
+    std::thread::sleep(std::time::Duration::from_millis(1100));
+    std::fs::write(r.path().join(".gitignore"), "").unwrap();
+    std::thread::sleep(std::time::Duration::from_millis(1100));
+    let out = fox_code(&p, "core.plan", "callers", 2000);
+    assert!(first(&out).contains("stale") && first(&out).contains("gen/g.py"), "ignore changed: {out}");
 }

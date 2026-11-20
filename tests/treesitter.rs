@@ -412,7 +412,11 @@ fn callers_say_when_the_name_occurs_in_unlisted_files() {
     let out = fox_code(&p, "wake_task", "impact", 800);
     assert!(out.contains(":2 use_a c:") && out.contains(":1 use_b c:") && !out.contains("partial"), "{out}");
     let out = fox_code(&p, "run", "callers", 800);
-    assert!(!out.contains("may be incomplete") && out.starts_with("1 line names `run`: 0 calls, 1 definition; all accounted for"), "{out}");
+    assert!(
+        !out.contains("may be incomplete")
+            && out.starts_with("1 line names `run`: 0 calls, 1 definition; all accounted for in indexed C/C++/Objective-C/Swift code"),
+        "{out}"
+    );
 }
 
 /// Mentions that cannot be calls (a comment, an import, a string) are counted and listed by
@@ -432,7 +436,7 @@ fn non_call_mentions_do_not_read_as_incomplete() {
     // are not counted; a complete answer lists no extra rows.
     assert!(
         out.starts_with(
-            "6 lines name `plan_query`: 1 call, 1 definition, 3 comments, 1 in strings (may be dynamic uses); all accounted for\n"
+            "6 lines name `plan_query`: 1 call, 1 definition, 3 comments, 1 in strings (may be dynamic uses); all accounted for in indexed C/C++/Objective-C/Swift code\n"
         ),
         "{out}"
     );

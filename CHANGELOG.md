@@ -11,7 +11,7 @@ First answers that were empty, wrong or padded in agent benchmark transcripts ar
   in the code of its language, so the answer is a labelled superset of `rg -w name` there. The
   first line counts them by group (`16 lines name `f`: 7 calls, 1 definition, 5 imports,
   2 declarations/prototypes, 1 in 1 same-name definition elsewhere, 1 comment; all accounted
-  for`); comments and strings come from the file's tree-sitter parse, and names in strings are
+  for in indexed Python code`, the code the verdict covers); every occurrence on a line needs its own reference or definition; comments and strings come from the file's tree-sitter parse, and names in strings are
   counted as possible dynamic uses. It reads `all accounted for` only when every line is
   positively classified, the scan was complete and the index is proven fresh (no cited file
   changed, no code file added or edited since indexing that names it, none too big to index,

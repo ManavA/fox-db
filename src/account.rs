@@ -94,6 +94,8 @@ struct Fresh {
 /// The accounting of one answer: counts, and the few rows it lists.
 pub struct Ledger {
     name: String,
+    /// The code the verdict covers (`indexed Python code`).
+    scope: String,
     mode: Mode,
     resolved: usize,
     counts: BTreeMap<Cat, usize>,
@@ -105,6 +107,12 @@ pub struct Ledger {
     fresh: Fresh,
     /// (files read, files naming it) when the scan stopped at a cap.
     capped: Option<(usize, usize)>,
+    /// (file, size, mtime) of every file the scan read, and the changed-files listing it used:
+    /// a cached ledger is rebuilt when either moved.
+    seen: Vec<(String, u64, i64)>,
+    changed_sig: u64,
+    /// When `seen` was last checked against the disk.
+    checked: Mutex<Instant>,
 }
 
 /// Same-name definition.
@@ -149,8 +157,12 @@ pub fn account(
         if let Some(i) = cache.iter().position(|(k, _)| *k == key) {
             let hit = cache.remove(i);
             let l = hit.1.clone();
-            cache.push(hit);
-            return Ok(l);
+            drop(cache);
+            if l.still_fresh(c, p) {
+                let mut cache = CACHE.lock().unwrap_or_else(|e| e.into_inner());
+                cache.push(hit);
+                return Ok(l);
+            }
         }
     }
     let l = Arc::new(build(c, p, name, top, resolved, linked, mode)?);
@@ -171,6 +183,9 @@ type FileLine = (Cat, Option<(u8, String)>, bool);
 struct FileOut {
     lines: Vec<FileLine>,
     linked: usize,
+    /// Lines the answer resolves that hold another, unsettled occurrence: counted in their
+    /// group instead.
+    demoted: usize,
     /// Its content differs from what was indexed.
     stale: bool,
 }
@@ -203,6 +218,7 @@ fn build(
 ) -> Result<Ledger> {
     let mut l = Ledger {
         name: name.to_string(),
+        scope: scope(top.and_then(|t| family(&t.path))),
         mode,
         resolved: resolved.len(),
         counts: BTreeMap::new(),
@@ -211,6 +227,9 @@ fn build(
         more: 0,
         fresh: Fresh::default(),
         capped: None,
+        seen: vec![],
+        changed_sig: 0,
+        checked: Mutex::new(Instant::now()),
     };
     if name.is_empty() || !name.chars().all(|ch| ch.is_alphanumeric() || ch == '_' || ch == '$') {
         return Ok(l);
@@ -268,11 +287,7 @@ fn build(
     let mut files: Vec<String> = files.into_iter().filter(|f| in_fam(f)).collect();
     files.sort();
     crate::tsindex::trace("account: names", t_all);
-    let mut q = c.prepare_cached("SELECT path, size, mtime, hash FROM ts_file WHERE project_id = ?1")?;
-    let indexed: HashMap<String, (i64, i64, String)> = q
-        .query_map([pid], |r| Ok((r.get::<_, String>(0)?, (r.get::<_, i64>(1)?, r.get::<_, i64>(2)?, r.get::<_, String>(3)?))))?
-        .flatten()
-        .collect();
+    let indexed = indexed_files(c, pid)?;
     let total = files.len();
     let parsed = AtomicU64::new(0);
     // A reference the answer does not resolve already makes it incomplete: telling comments and
@@ -329,6 +344,7 @@ fn build(
             l.fresh.stale.push(path.clone());
         }
         l.resolved += out.linked;
+        l.resolved -= out.demoted.min(l.resolved);
         for (n, (cat, row, same_def)) in out.lines.into_iter().enumerate() {
             *l.counts.entry(cat).or_default() += 1;
             l.same_defs += same_def as usize;
@@ -359,10 +375,49 @@ fn build(
     l.fresh.pending = pending || files.iter().any(|f| indexed.get(f).is_some_and(|x| x.0 < 0 || x.2.is_empty()));
     crate::tsindex::trace("account: scan", t_all);
     freshness(c, p, name, fam, &indexed, &files, &mut l.fresh);
+    l.changed_sig = sig(&changed(c, p, &indexed));
+    l.seen = pool().install(|| {
+        use rayon::prelude::*;
+        files
+            .par_iter()
+            .filter_map(|f| std::fs::metadata(p.root.join(f)).ok().map(|md| (f.clone(), md.len(), crate::inventory::mtime_ms(&md))))
+            .collect()
+    });
     crate::tsindex::trace("account: freshness", t_all);
     l.fresh.stale.sort();
     l.fresh.stale.dedup();
     Ok(l)
+}
+
+/// Every indexed code file: path -> (size, mtime, hash).
+fn indexed_files(c: &Connection, pid: i64) -> Result<HashMap<String, (i64, i64, String)>> {
+    let mut q = c.prepare_cached("SELECT path, size, mtime, hash FROM ts_file WHERE project_id = ?1")?;
+    let v = q
+        .query_map([pid], |r| Ok((r.get::<_, String>(0)?, (r.get::<_, i64>(1)?, r.get::<_, i64>(2)?, r.get::<_, String>(3)?))))?
+        .flatten()
+        .collect();
+    Ok(v)
+}
+
+/// What a verdict covers: the indexed code of the target's language family. Other languages
+/// (templates, FFI), files the index skips and calls under another spelling are out of scope.
+fn scope(fam: Option<&str>) -> String {
+    let what = match fam {
+        Some("python") => "Python",
+        Some("js") => "JS/TS",
+        Some("go") => "Go",
+        Some("c") | Some("swift") => "C/C++/Objective-C/Swift",
+        Some("jvm") => "Java/Kotlin/Scala",
+        Some("rust") => "Rust",
+        Some("dotnet") => "C#",
+        Some("ruby") => "Ruby",
+        Some("php") => "PHP",
+        Some("bash") => "shell",
+        Some("dart") => "Dart",
+        Some("lua") => "Lua",
+        _ => return "indexed code".into(),
+    };
+    format!("indexed {what} code")
 }
 
 /// The interop family of a file's language.
@@ -377,20 +432,20 @@ fn family(path: &str) -> Option<&'static str> {
 type Changed = Arc<Option<Vec<(String, u64)>>>;
 /// (store, project, generation).
 type WalkKey = (String, i64, i64);
-static WALKS: Mutex<Vec<(WalkKey, Changed)>> = Mutex::new(Vec::new());
+static WALKS: Mutex<Vec<(WalkKey, Changed, Instant)>> = Mutex::new(Vec::new());
 
 fn changed(c: &Connection, p: &Project, indexed: &HashMap<String, (i64, i64, String)>) -> Changed {
     let key = (c.path().unwrap_or_default().to_string(), p.id, crate::db::generation(c));
-    if let Some(w) = WALKS.lock().unwrap_or_else(|e| e.into_inner()).iter().find(|(k, _)| *k == key) {
+    if let Some(w) = WALKS.lock().unwrap_or_else(|e| e.into_inner()).iter().find(|(k, _, at)| *k == key && at.elapsed() < RECHECK) {
         return w.1.clone();
     }
     let v = Arc::new(changed_now(c, p, indexed));
     let mut walks = WALKS.lock().unwrap_or_else(|e| e.into_inner());
-    walks.retain(|(k, _)| k.0 != key.0 || k.1 != key.1);
+    walks.retain(|(k, ..)| k.0 != key.0 || k.1 != key.1);
     if walks.len() >= 4 {
         walks.remove(0);
     }
-    walks.push((key, v.clone()));
+    walks.push((key, v.clone(), Instant::now()));
     v
 }
 
@@ -432,7 +487,22 @@ fn changed_now(c: &Connection, p: &Project, indexed: &HashMap<String, (i64, i64,
             .collect();
         (moved, edited)
     });
-    if !moved_dirs.is_empty() {
+    // An ignore rule that changed may have let in files the index never saw: walk everything.
+    let ov_path = crate::db::home().join("projects").join(format!("{}.toml", p.name));
+    let mut sources: Vec<std::path::PathBuf> = vec![ov_path, p.root.join(".git/info/exclude")];
+    sources.extend(ignore::gitignore::gitconfig_excludes_path());
+    let ignores_moved = sources
+        .iter()
+        .chain(dirs.iter().flat_map(|d| [root.join(d).join(".gitignore"), root.join(d).join(".ignore")]).collect::<Vec<_>>().iter())
+        .any(|f| std::fs::metadata(f).is_ok_and(|md| crate::inventory::mtime_ms(&md) >= since));
+    if ignores_moved {
+        let ov = Arc::new(crate::inventory::overrides_for(&p.name));
+        let w = crate::inventory::walk(&p.root, &ov, None);
+        if w.entries.len() > WALK_MAX {
+            return None;
+        }
+        out.extend(w.entries.into_iter().filter(|e| !known.contains(e.rel.as_str()) && family(&e.rel).is_some()).map(|e| (e.rel, e.size)));
+    } else if !moved_dirs.is_empty() {
         let known_dirs: HashSet<String> = dirs.iter().cloned().collect();
         let enter: HashSet<String> = moved_dirs
             .iter()
@@ -565,7 +635,7 @@ fn scan_file(cx: &Ctx, p: &Project, path: &str, raw: &[u8]) -> FileOut {
         if !t.0 {
             return None;
         }
-        Some(t.1.as_ref().map_or(Place::Code, |t| place_of(t, at, name.len(), lang.map_or("", |l| l.family))))
+        Some(t.1.as_ref().map_or(Place::Code, |t| place_of(t, bytes, at, name.len(), lang.map_or("", |l| l.family))))
     };
     let line_text = |ln: usize| -> &str {
         let a = starts[ln];
@@ -583,81 +653,132 @@ fn scan_file(cx: &Ctx, p: &Project, path: &str, raw: &[u8]) -> FileOut {
     let ty = cx.top.and_then(|t| t.parent.as_deref()).map(|p| p.rsplit('.').next().unwrap_or(p)).unwrap_or("");
     let stem = cx.top.map(|t| t.path.rsplit('/').next().unwrap_or(&t.path)).map(|f| f.split('.').next().unwrap_or(f)).unwrap_or("");
     let method = cx.top.is_some_and(|t| t.parent.as_deref().is_some_and(|p| !p.is_empty()));
-    let needs_receiver = method && matches!(family(path), Some("go" | "python" | "js" | "rust"));
+    // Python methods may be called bare inside their class body: no skip there.
+    let needs_receiver = method && matches!(family(path), Some("go" | "js" | "rust"));
     for (&ln, occ) in &hits {
         let n = ln as i64 + 1;
         let key = (path.to_string(), n);
-        if cx.resolved.contains(&key) {
-            continue;
-        }
+        let resolved_line = cx.resolved.contains(&key);
+        let rs: &[RefAt] = cx.refs.get(&key).map(Vec::as_slice).unwrap_or(&[]);
+        let def = def_at.get(&n).copied();
         let raw_line = line_text(ln);
-        let has_refs = cx.refs.contains_key(&key);
-        let needs_parse = !has_refs && !def_at.contains_key(&n);
-        let places: Vec<Place> = if needs_parse {
-            match occ.iter().map(|&i| place(i)).collect::<Option<Vec<Place>>>() {
-                Some(v) => v,
-                None => {
-                    out.lines.push((Cat::Unparsed, None, false));
-                    continue;
-                }
-            }
-        } else {
-            vec![Place::Code]
-        };
-        let in_code = places.contains(&Place::Code);
         let row = |note: &str, rank: u8| -> Option<(u8, String)> {
             let code = clip_around(raw_line.trim(), name).unwrap_or_default();
             Some((rank, format!("  {path}:{n}{note} | {code}")))
         };
-        let (cat, r, same_def) = if let Some(d) = def_at.get(&n) {
-            if cx.linked.contains(&d.id) {
-                out.linked += 1;
-                continue;
-            }
-            if d.id == cx.top_id {
-                (Cat::Definition, None, false)
-            } else if d.decl || prototype(raw_line, name, ext) {
-                let code = clip_around(raw_line.trim(), name).unwrap_or_default();
-                (Cat::Decl, Some((0, format!("  {path}:{n} {} {} c:{:x} | {code}", d.kind, d.qname, d.id))), false)
-            } else {
-                (Cat::Same, None, true)
-            }
-        } else if !in_code && family(path) == Some("js") && import_line(raw_line.trim()) && !places.contains(&Place::Comment) {
-            // `import doIt from './plan'`: the module named, its names bound under others.
-            (Cat::Unresolved, row(" imports the module under other names", 0), false)
-        } else if !in_code {
-            if places.contains(&Place::Comment) { (Cat::Comment, None, false) } else { (Cat::Str, None, false) }
-        } else if renamed_import(raw_line, name) {
-            (Cat::Unresolved, row(" renamed import", 0), false)
-        } else if let Some(rs) = cx.refs.get(&key) {
-            let to_top: Vec<&RefAt> = rs.iter().filter(|r| r.1 == cx.top_id).collect();
-            if !to_top.is_empty() {
-                if cx.mode == Mode::Calls && to_top.iter().all(|r| r.0 != "call") {
-                    (Cat::NotCall, row("", 0), false)
-                } else {
-                    (Cat::Unresolved, row(" weak guess", 1), false)
-                }
-            } else if rs.iter().any(|r| r.0 == "import") {
-                (Cat::Import, row("", 0), false)
-            } else if rs.iter().all(|r| r.1 != 0 && r.2 <= 0) {
-                (Cat::Same, None, false)
-            } else if needs_receiver && occ.iter().all(|&i| bare(bytes, i)) {
-                // A method is never called bare in these languages (`len(x)` is not `T.len`).
-                continue;
-            } else {
-                let note = if rs.iter().any(|r| r.1 != 0) { " guessed elsewhere" } else { "" };
-                (Cat::Unresolved, row(note, plausible(raw_line, name, ty, stem)), false)
-            }
-        } else if import_line(raw_line.trim()) {
-            (Cat::Import, row("", 0), false)
-        } else if prototype(raw_line, name, ext) {
-            (Cat::Decl, row("", 0), false)
-        } else if py_stub(raw_line, name, ext) {
-            if cx.top.is_some_and(|t| t.path == path) { (Cat::Decl, row("", 0), false) } else { (Cat::Same, None, false) }
-        } else if needs_receiver && occ.iter().all(|&i| bare(bytes, i)) {
+        // Each occurrence needs its own reference row or definition; occurrences beyond those
+        // must be shown by the parse to sit in comments or strings.
+        let covered = rs.len() + def.is_some() as usize;
+        let places: Option<Vec<Place>> = if occ.len() > covered { occ.iter().map(|&i| place(i)).collect() } else { Some(vec![]) };
+        let Some(places) = places else {
+            out.lines.push((if covered == 0 { Cat::Unparsed } else { Cat::Unresolved }, row(" not parsed", 2), false));
             continue;
+        };
+        let code_occ = places.iter().filter(|p| **p == Place::Code).count();
+        let all_bare = || needs_receiver && occ.iter().all(|&i| bare(bytes, i));
+        if covered == 0 {
+            let (cat, r) =
+                if code_occ == 0 && family(path) == Some("js") && import_line(raw_line.trim()) && !places.contains(&Place::Comment) {
+                    // `import doIt from './plan'`: the module named, its names bound under others.
+                    (Cat::Unresolved, row(" imports the module under other names", 0))
+                } else if code_occ == 0 {
+                    if places.contains(&Place::Comment) { (Cat::Comment, None) } else { (Cat::Str, None) }
+                } else if renamed_import(raw_line, name) {
+                    (Cat::Unresolved, row(" renamed import", 0))
+                } else if import_line(raw_line.trim()) {
+                    (Cat::Import, row("", 0))
+                } else if prototype(raw_line, name, ext) {
+                    (Cat::Decl, row("", 0))
+                } else if py_stub(raw_line, name, ext) {
+                    if cx.top.is_some_and(|t| t.path == path) { (Cat::Decl, row("", 0)) } else { (Cat::Same, None) }
+                } else if all_bare() {
+                    continue;
+                } else {
+                    (Cat::Unresolved, row("", plausible(raw_line, name, ty, stem)))
+                };
+            out.lines.push((cat, r, false));
+            continue;
+        }
+        // Each covering item's group; the line takes the least settled.
+        let mut unresolved: Option<&str> = None;
+        let mut not_call = false;
+        let mut import = false;
+        let mut other_ref = false;
+        if code_occ > covered {
+            unresolved = Some(" more uses on the line");
+        }
+        if renamed_import(raw_line, name) {
+            unresolved = Some(" renamed import");
+        }
+        for r in rs {
+            if r.1 == cx.top_id {
+                if cx.mode == Mode::Calls && r.0 != "call" {
+                    not_call = true;
+                } else if resolved_line {
+                    continue;
+                } else {
+                    unresolved = unresolved.or(Some(" weak guess"));
+                }
+            } else if r.0 == "import" {
+                import = true;
+            } else if r.1 != 0 && r.2 <= 0 {
+                other_ref = true;
+            } else if !(all_bare() && def.is_none()) {
+                unresolved = unresolved.or(Some(if r.1 != 0 { " guessed elsewhere" } else { "" }));
+            }
+        }
+        let def_cat = def.map(|d| {
+            if cx.linked.contains(&d.id) {
+                None
+            } else if d.id == cx.top_id {
+                Some(Cat::Definition)
+            } else if d.decl || prototype(raw_line, name, ext) {
+                Some(Cat::Decl)
+            } else {
+                Some(Cat::Same)
+            }
+        });
+        // Another definition of the name on a line that also uses the target (`plan = core.plan`,
+        // `fun plan() = inner.plan()`): an alias or wrapper, through which calls may reach it.
+        if matches!(def_cat, Some(Some(Cat::Same | Cat::Decl))) && rs.iter().any(|r| r.1 == cx.top_id || r.1 == 0 || r.2 > 0) {
+            unresolved = unresolved.or(Some(" alias or wrapper"));
+        }
+        if let Some(note) = unresolved {
+            let rank = if note.is_empty() { plausible(raw_line, name, ty, stem) } else { 0 };
+            out.lines.push((Cat::Unresolved, row(note, rank), false));
+            out.demoted += resolved_line as usize;
+            continue;
+        }
+        if not_call {
+            out.lines.push((Cat::NotCall, row("", 0), false));
+            out.demoted += resolved_line as usize;
+            continue;
+        }
+        if matches!(def_cat, Some(None)) {
+            out.linked += 1;
+            continue;
+        }
+        if resolved_line {
+            continue;
+        }
+        let (cat, r, same_def) = if not_call {
+            (Cat::NotCall, row("", 0), false)
+        } else if let Some(Some(c)) = def_cat {
+            match c {
+                Cat::Decl => {
+                    let d = def.expect("a definition");
+                    let code = clip_around(raw_line.trim(), name).unwrap_or_default();
+                    (Cat::Decl, Some((0, format!("  {path}:{n} {} {} c:{:x} | {code}", d.kind, d.qname, d.id))), false)
+                }
+                Cat::Same => (Cat::Same, None, true),
+                c => (c, None, false),
+            }
+        } else if import {
+            (Cat::Import, row("", 0), false)
+        } else if other_ref {
+            (Cat::Same, None, false)
         } else {
-            (Cat::Unresolved, row("", plausible(raw_line, name, ty, stem)), false)
+            continue;
         };
         out.lines.push((cat, r, same_def));
     }
@@ -673,7 +794,14 @@ enum Place {
 
 /// Where the occurrence at byte `at` (length `len`) sits: inside a comment, inside a string
 /// literal (outside any interpolation), or code. Text the parse could not read is code.
-fn place_of(tree: &tree_sitter::Tree, at: usize, len: usize, fam: &str) -> Place {
+fn place_of(tree: &tree_sitter::Tree, src: &[u8], at: usize, len: usize, fam: &str) -> Place {
+    let p = place_in(tree, at, len, fam);
+    // `"$name"` (Kotlin, Groovy, Scala, Dart, PHP, shell): a template, whatever the parse.
+    let dollar = at > 0 && src.get(at - 1) == Some(&b'$') && matches!(fam, "jvm" | "dart" | "php" | "bash");
+    if p == Place::Str && dollar { Place::Code } else { p }
+}
+
+fn place_in(tree: &tree_sitter::Tree, at: usize, len: usize, fam: &str) -> Place {
     let Some(mut n) = tree.root_node().descendant_for_byte_range(at, at + len) else { return Place::Code };
     loop {
         let k = n.kind();
@@ -684,6 +812,7 @@ fn place_of(tree: &tree_sitter::Tree, at: usize, len: usize, fam: &str) -> Place
             return Place::Comment;
         }
         if k.contains("interpolation")
+            || k.contains("interpolated")
             || k.contains("substitution")
             || k == "embedded_expression"
             || k == "template_expression"
@@ -803,7 +932,37 @@ fn plural(n: usize, one: &str, many: &str) -> String {
     format!("{n} {}", if n == 1 { one } else { many })
 }
 
+/// Least time between two disk checks of a cached ledger or listing.
+const RECHECK: Duration = Duration::from_secs(1);
+
+/// A signature of a changed-files listing.
+fn sig(ch: &Changed) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    ch.as_ref().hash(&mut h);
+    h.finish()
+}
+
 impl Ledger {
+    /// Whether nothing the ledger read moved since: at most once per [`RECHECK`], every file
+    /// it read is stat'ed and the changed-files listing compared.
+    fn still_fresh(&self, c: &Connection, p: &Project) -> bool {
+        let mut checked = self.checked.lock().unwrap_or_else(|e| e.into_inner());
+        if checked.elapsed() < RECHECK {
+            return true;
+        }
+        let same = pool().install(|| {
+            use rayon::prelude::*;
+            self.seen.par_iter().all(|(f, size, mtime)| {
+                std::fs::metadata(p.root.join(f)).is_ok_and(|md| md.len() == *size && crate::inventory::mtime_ms(&md) == *mtime)
+            })
+        });
+        let indexed = indexed_files(c, p.id).unwrap_or_default();
+        let fresh = same && sig(&changed(c, p, &indexed)) == self.changed_sig;
+        *checked = Instant::now();
+        fresh
+    }
+
     fn n(&self, c: Cat) -> usize {
         self.counts.get(&c).copied().unwrap_or(0)
     }
@@ -890,14 +1049,14 @@ impl Ledger {
                 if k == 1 { "it" } else { "them" }
             )
         } else {
-            "all accounted for".to_string()
+            format!("all accounted for in {}", self.scope)
         };
         let total = plural(total, "line names", "lines name");
         Some(format!("{total} `{name}`: {}; {status}", parts.join(", ")))
     }
 
     fn complete(&self) -> bool {
-        self.head(0).is_some_and(|h| h.ends_with("all accounted for"))
+        self.head(0).is_some_and(|h| h.ends_with(&format!("all accounted for in {}", self.scope)))
     }
 
     /// The few listed rows for the end of the answer: none when every line is accounted for.
@@ -934,7 +1093,7 @@ mod tests {
         let mut ps = tree_sitter::Parser::new();
         ps.set_language(&l.language()).unwrap();
         let t = ps.parse(src, None).unwrap();
-        src.match_indices(name).map(|(i, _)| place_of(&t, i, name.len(), l.family)).collect()
+        src.match_indices(name).map(|(i, _)| place_of(&t, src.as_bytes(), i, name.len(), l.family)).collect()
     }
 
     /// Comments and strings come from the parse; interpolations are code.
@@ -952,6 +1111,8 @@ mod tests {
         assert_eq!(places("void go(dynamic o) { print('v ${o.plan(1)}'); }\n", "dart", "plan"), [Code]);
         assert_eq!(places("<?php\n$d = <<<EOT\nsrc/*.php\nEOT;\n$o->plan(1); // plan\n", "php", "plan"), [Code, Comment]);
         assert_eq!(places("s = \"line one\n#{o.plan(1)} two\"\n", "rb", "plan"), [Code]);
+        assert_eq!(places("val plan = 3\nfun go(): String {\n    return \"v $plan\"\n}\n", "kt", "plan"), [Code, Code]);
+        assert_eq!(places("let plan = 3\nfunc go() -> String {\n    return \"v \\(plan)\"\n}\n", "swift", "plan"), [Code, Code]);
     }
 
     #[test]
