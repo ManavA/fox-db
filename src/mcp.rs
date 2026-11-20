@@ -19,18 +19,19 @@ fn client_name() -> Option<String> {
     CLIENT.get().cloned()
 }
 
-/// This client's agent identity: `FOXDB_AGENT` from the env the harness gave this server
-/// process (each harness spawns its own `fox mcp`), else an explicit `agent` argument, else the
-/// session it serves (see [`crate::agents::ambient_id`]): never the bare client name, which every
-/// session of one harness shares.
+/// The caller's agent identity: an explicit `agent` argument, else `FOXDB_AGENT` from the env the
+/// harness gave this server process (each harness spawns its own `fox mcp`), else the session it
+/// serves (see [`crate::agents::ambient_id`]): never the bare client name, which every session of
+/// one harness shares. The argument comes first because Claude Code subagents call through their
+/// parent's server, with its env: only the argument tells siblings apart.
 fn agent_id(a: &Value) -> Option<String> {
+    if let Some(x) = arg_s(a, "agent") {
+        return Some(x.chars().take(64).collect());
+    }
     if let Ok(v) = std::env::var("FOXDB_AGENT")
         && !v.trim().is_empty()
     {
         return Some(v.trim().to_string());
-    }
-    if let Some(x) = arg_s(a, "agent") {
-        return Some(x.to_string());
     }
     let c = db::open_ro();
     Some(crate::agents::ambient_id(c.as_ref(), &client_name().unwrap_or_else(|| "mcp".into())))
@@ -94,15 +95,16 @@ pub fn tools() -> Value {
             "lines": {"type": "string", "description": "a-b, for files"},
             "budget": budget, "cursor": cursor}}},
         {"name": "fox_memory",
-         "description": "What was decided or found before? recall searches notes, memory files, milestones and past sessions. Also: brief; note; check (memory lines citing code that is gone); post a finding/claim/request/decision; read the board (since=auto: only what is new to you); pickup or take (leased) a handoff; packet: create (text=goal) or render id=h:; agents: the agent tree; dispatch a codex/claude worker (text=task); wait for agents or h: (bounded, call again).",
+         "description": "What was decided or found before? recall searches notes, memory files, milestones and past sessions. Also: brief; note; check (memory lines citing code that is gone); post a fact/failed approach/question/decision; read the board (since=me: what is new to you; subagents add agent=<name>); pickup or take (leased) a handoff; packet: create (text=goal) or render id=h:; agents: the agent tree; dispatch a codex/claude worker (text=task); wait for agents or h: (bounded, call again).",
          "inputSchema": {"type": "object", "required": ["op"], "properties": {
             "op": {"type": "string", "enum": ["brief", "recall", "note", "check", "post", "read", "pickup", "take", "packet", "agents", "dispatch", "wait"]},
             "q": {"type": "string", "description": "recall or read filter"},
             "text": {"type": "string", "description": "note/post text, packet goal, dispatch task"},
-            "kind": {"type": "string", "enum": ["finding", "claim", "request", "decision", "report", "packet"]},
+            "kind": {"type": "string", "enum": ["fact", "failed", "question", "finding", "claim", "request", "decision", "report", "packet"]},
             "topic": {"type": "string", "description": "board topic, for post and read"},
-            "since": {"type": "string", "description": "read cursor: 'auto' or h:"},
-            "evidence": {"type": "string", "description": "path:line or handles"},
+            "since": {"type": "string", "description": "'me' or h:"},
+            "agent": {"type": "string"},
+            "evidence": {"type": "string", "description": "handles or paths"},
             "next": {"type": "string", "description": "packet next steps"},
             "id": {"type": "string", "description": "h: handle; for wait, agent ids or h: (space-separated)"},
             "harness": {"type": "string", "enum": ["codex", "claude"]},
@@ -387,11 +389,12 @@ fn memory_tool(ro: Option<Connection>, a: &Value, budget: usize, cursor: usize) 
                 let client = client_name();
                 let who = agent_id(a);
                 let sess = std::env::var("FOXDB_SESSION").ok();
+                let kind = arg_s(a, "kind").unwrap_or("finding");
                 let id = crate::handoff::post(
                     &w,
                     &crate::handoff::Post {
                         project_id: p.id,
-                        kind: arg_s(a, "kind").unwrap_or("finding"),
+                        kind,
                         text,
                         title: arg_s(a, "title"),
                         evidence: arg_s(a, "evidence"),
@@ -403,7 +406,16 @@ fn memory_tool(ro: Option<Connection>, a: &Value, budget: usize, cursor: usize) 
                         ..Default::default()
                     },
                 )?;
-                Ok(format!("posted {}\n", crate::handoff::handle(id)))
+                let clipped = crate::handoff::SWARM_KINDS.contains(&kind) && text.chars().count() > crate::handoff::ENTRY_MAX;
+                Ok(if clipped {
+                    format!(
+                        "posted {} (clipped to {} chars: attach handles, not content)\n",
+                        crate::handoff::handle(id),
+                        crate::handoff::ENTRY_MAX
+                    )
+                } else {
+                    format!("posted {}\n", crate::handoff::handle(id))
+                })
             }
             "read" => {
                 let Some(c) = ro else { bail!("no store yet") };

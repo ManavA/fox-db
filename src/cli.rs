@@ -19,7 +19,7 @@ pub const USAGE: &str = "usage:
   fox index rebuild [PATH] [--backend tantivy|fts5]   build (or drop) a big project's tantivy index
   fox eval retrieval --set bench/eval/SET.json [--repo DIR] [--limit K] [--json] [--gate BASELINE.json]
   fox mem brief [--budget TOKENS] [--harness claude|codex]
-  fox mem post <text> [--kind finding|claim|request|decision|report] [--title T] [--evidence E]
+  fox mem post <text> [--kind fact|failed|question|summary|finding|claim|request|decision|report] [--title T] [--evidence E]
   fox mem read [query] [--kind K]          fox mem pickup h:ID [--by NAME]
   fox mem check                            memory lines citing symbols, paths or flags that are gone
   fox drift [doc.md]                       cited symbols/paths changed, moved or vanished since the doc's last commit
@@ -38,7 +38,7 @@ multi-agent:
   fox handoff render h:ID [--for claude|codex|t3|plain] [--budget TOKENS]     fox handoff take h:ID [--by A] [--lease SECS]
   fox swarm run <plan.toml> [--no-wait] [--timeout SECS]    fox swarm status <swarm>
   fox switch --to codex|claude|--for t3 [--from H] [--handoff h:ID] [--agent A] [--session ID] [--transcript PATH] [--inline] [--exec]
-  fox mem post <text> [--topic T]          fox mem read --since auto|h:ID [--topic T]   (auto: new to $FOXDB_AGENT)";
+  fox mem post <text> [--topic T]          fox mem read --since me|h:ID [--topic T]   (me: new to $FOXDB_AGENT)";
 
 /// Default answer budget (tokens) for `find` and `code`: small, page with `--cursor`.
 pub const DEFAULT_BUDGET: usize = 500;
@@ -177,8 +177,8 @@ pub fn board(a: &Args, cwd: &Path) -> anyhow::Result<String> {
             let who = whoami(&w);
             let since = match crate::handoff::parse_handle(s) {
                 Some(n) => crate::handoff::Since::After(n),
-                None if s == "auto" => crate::handoff::Since::Auto(&who),
-                None => anyhow::bail!("--since takes auto or h:ID"),
+                None if s == "auto" || s == "me" => crate::handoff::Since::Auto(&who),
+                None => anyhow::bail!("--since takes me (or auto) or h:ID"),
             };
             crate::handoff::read_since(&w, p.id, since, kind, a.opt.get("topic").map(String::as_str), a.budget.unwrap_or(DEFAULT_BUDGET))
         }

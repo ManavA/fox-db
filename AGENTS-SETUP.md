@@ -287,7 +287,7 @@ project's `AGENTS.md` (show them to the user; do not edit `CLAUDE.md` or memory 
 ```md
 ## Code navigation
 To find or trace code, call `fox_find` / `fox find <q>`, `fox_graph` / `fox code <sym> --rel callers|impact` and `fox_read` / `fox code <sym> --rel src|outline` first, even when a grep looks quicker; `fox_memory op=recall` for past decisions. Rows start with handles and end in path:line; `~` rows are tree-sitter, not compiler-resolved.
-- Shared agent context lives in foxdb: `fox_memory op=read since=auto` for new board posts, `op=take id=h:…` before working a handoff, `op=post` for findings; packets via `fox handoff render h:…`.
+- Shared agent context lives in foxdb: `fox_memory op=read since=me` for new board posts, `op=take id=h:…` before working a handoff, `op=post` for findings; packets via `fox handoff render h:…`.
 ```
 
 ## 8. Verify
@@ -388,7 +388,7 @@ with `cursor=K`; narrow the query before raising the budget.
 **Multi-agent recipes** (details in [docs/multi-agent.md](docs/multi-agent.md) and
 [docs/swarm.md](docs/swarm.md)):
 
-- Leave a finding for others: `fox_memory op=post kind=finding text=… evidence=path:line`; read theirs with `op=read since=auto`.
+- Leave a finding for others: `fox_memory op=post kind=fact text=… evidence=path:line` (`kind=failed` for an approach that did not work); read theirs with `op=read since=me`.
 - Hand work over: `fox_memory op=packet text=<goal> next=<steps>` returns `packet h:N`; the next agent runs `op=take id=h:N`, then `fox_read target=h:N`.
 - One writer, several readers: `fox dispatch --harness codex --task "…" --writer`, then `fox dispatch … --label scan` for readers (a second `--writer` is refused), then `fox wait <ids> --timeout 1800` (exit 0 done, 3 still running, 4 failed or stale) and `fox mem read --kind report`.
 - A whole plan: write a `plan.toml` with tasks, dependencies and an optional review panel, then `fox swarm run plan.toml`.

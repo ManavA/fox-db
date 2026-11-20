@@ -250,3 +250,216 @@ fn a_cut_brief_says_it_was_cut() {
     assert!(capped.chars().count() <= 300 && capped.lines().last().unwrap().contains("brief cut short"), "{capped}");
     assert_eq!(hook::cap_marked("short\n", 300), "short\n");
 }
+
+// ---- swarm board: typed entries, attachments by handle, per-agent cursors ----
+
+fn memory_call(args: serde_json::Value) -> (String, bool) {
+    let r = mcp::handle(&json!({"jsonrpc":"2.0","id":7,"method":"tools/call","params":{"name":"fox_memory","arguments":args}})).unwrap();
+    (r["result"]["content"][0]["text"].as_str().unwrap().to_string(), r["result"]["isError"].as_bool().unwrap())
+}
+
+fn read_call(target: &str) -> (String, bool) {
+    let r = mcp::handle(&json!({"jsonrpc":"2.0","id":8,"method":"tools/call","params":{"name":"fox_read","arguments":{"target": target}}}))
+        .unwrap();
+    (r["result"]["content"][0]["text"].as_str().unwrap().to_string(), r["result"]["isError"].as_bool().unwrap())
+}
+
+/// [`setup`] plus the tree-sitter pass, so `alpha` is a symbol.
+fn setup_ts() -> (tempfile::TempDir, tempfile::TempDir, rusqlite::Connection, project::Project) {
+    let (h, r, mut c, p) = setup();
+    foxdb::tsindex::index_project(&mut c, &p).unwrap();
+    let p = project::find(&c, &project::locate(r.path())).unwrap().unwrap();
+    (h, r, c, p)
+}
+
+fn node_handle(c: &rusqlite::Connection, kind: &str, name: &str) -> String {
+    let id: i64 = c.query_row("SELECT id FROM node WHERE kind = ?1 AND name = ?2", [kind, name], |r| r.get(0)).unwrap();
+    foxdb::query::handle(kind, id)
+}
+
+fn posted(t: &str) -> i64 {
+    let h = t.split_whitespace().find(|w| w.starts_with("h:")).unwrap_or_else(|| panic!("no handle in {t}"));
+    handoff::parse_handle(h).unwrap()
+}
+
+/// fact, failed, summary and question are board kinds of their own. Each stays short (the cap
+/// is [`handoff::ENTRY_MAX`]), and the board shows such an entry's whole text on its row, so a
+/// read of what is new needs no second call per entry.
+#[test]
+fn swarm_entries_are_typed_short_and_read_whole_on_the_board() {
+    let _g = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    let (_h, _r, c, p) = setup();
+    for kind in ["fact", "failed", "summary", "question"] {
+        assert!(handoff::KINDS.contains(&kind), "{kind}");
+    }
+    let post = |kind: &str, text: &str| handoff::post(&c, &handoff::Post { project_id: p.id, kind, text, ..Default::default() }).unwrap();
+    let fact = post("fact", "The cache key omits the generation.\nSo two generations share an entry.");
+    let failed = post("failed", "Raising the TTL did not help: the stale entry is keyed, not timed.");
+    let long: String = (0..400).map(|i| format!("w{i} ")).collect();
+    let q = post("question", &long);
+    let body: String = c.query_row("SELECT body FROM handoff WHERE id = ?1", [q], |r| r.get(0)).unwrap();
+    assert!(body.chars().count() <= handoff::ENTRY_MAX, "{} chars", body.chars().count());
+    // Other kinds keep the long cap.
+    let rep = post("report", &long);
+    let rbody: String = c.query_row("SELECT body FROM handoff WHERE id = ?1", [rep], |r| r.get(0)).unwrap();
+    assert!(rbody.chars().count() > handoff::ENTRY_MAX);
+    let board = handoff::read_since(&c, p.id, handoff::Since::After(0), None, None, 2000).unwrap();
+    let row = board.lines().find(|l| l.starts_with(&handoff::handle(fact))).unwrap();
+    assert!(row.contains("fact") && row.contains("So two generations share an entry."), "whole text on the row: {row}");
+    let row = board.lines().find(|l| l.starts_with(&handoff::handle(failed))).unwrap();
+    assert!(row.contains("failed") && row.contains("keyed, not timed"), "{row}");
+    assert!(handoff::read(&c, p.id, Some("failed"), None, 500, 0).unwrap().contains("keyed, not timed"));
+    // An unknown kind is refused and names the kinds.
+    let e = handoff::post(&c, &handoff::Post { project_id: p.id, kind: "fail", text: "x", ..Default::default() }).unwrap_err().to_string();
+    assert!(e.contains("failed") && e.contains("fact"), "{e}");
+}
+
+/// Attachments are handles, never pasted content: a path becomes its file's `f:` handle, a
+/// known handle stays, an unknown handle is refused. Each attached handle opens with fox_read,
+/// and fox_read of the entry lists what its handles point at.
+#[test]
+fn attachments_are_handles_that_fox_read_resolves() {
+    let _g = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    let (_h, repo, c, _p) = setup_ts();
+    std::env::set_current_dir(repo.path()).unwrap();
+    let (f, s) = (node_handle(&c, "file", "lib.rs"), node_handle(&c, "symbol", "alpha"));
+    let (t, err) = memory_call(
+        json!({"op": "post", "kind": "fact", "agent": "w1", "text": "alpha has no callers", "evidence": format!("src/lib.rs, {s}")}),
+    );
+    assert!(!err && t.starts_with("posted h:"), "{t}");
+    let id = posted(&t);
+    let ev: String = c.query_row("SELECT evidence FROM handoff WHERE id = ?1", [id], |r| r.get(0)).unwrap();
+    assert_eq!(ev, format!("{f} {s}"), "paths become file handles");
+    let (shown, err) = read_call(&handoff::handle(id));
+    assert!(!err && shown.contains("attached") && shown.contains("src/lib.rs") && shown.contains("alpha"), "{shown}");
+    for h in [&f, &s] {
+        let (out, err) = read_call(h);
+        assert!(!err && !out.trim().is_empty(), "{h} must open with fox_read: {out}");
+    }
+    let (t, err) = memory_call(json!({"op": "post", "kind": "failed", "agent": "w1", "text": "tried it", "evidence": "c:fffffff"}));
+    assert!(err && t.contains("unknown handle c:fffffff"), "{t}");
+    // An over-long entry is clipped, and the reply says so.
+    let long = "z".repeat(900);
+    let (t, err) = memory_call(json!({"op": "post", "kind": "fact", "agent": "w1", "text": long}));
+    assert!(!err && t.contains("clipped"), "{t}");
+}
+
+/// `since=me` reads what is new to the calling agent: its first read shows the latest entries,
+/// later reads only entries posted since, never its own. Subagents of one session share one MCP
+/// server, so each names itself with `agent`; `since=h:N` is the stateless form.
+#[test]
+fn since_me_returns_only_entries_new_to_that_agent() {
+    let _g = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    let (_h, repo, _c, _p) = setup();
+    std::env::set_current_dir(repo.path()).unwrap();
+    let post = |who: &str, kind: &str, text: &str| {
+        let (t, err) = memory_call(json!({"op": "post", "kind": kind, "agent": who, "text": text}));
+        assert!(!err, "{t}");
+        posted(&t)
+    };
+    let read = |who: &str| {
+        let (t, err) = memory_call(json!({"op": "read", "since": "me", "agent": who}));
+        assert!(!err, "{t}");
+        t
+    };
+    post("A", "fact", "A one: the lease is per repo");
+    let b1 = post("B", "failed", "B one: retrying the lock did not help");
+    let r = read("A");
+    assert!(r.contains("B one") && !r.contains("A one"), "own posts are skipped: {r}");
+    assert!(r.trim_end().lines().last().unwrap().starts_with("since=h:"), "{r}");
+    assert!(read("A").contains("nothing new"));
+    post("B", "question", "B two: is the lease renewed on take?");
+    let r = read("A");
+    assert!(r.contains("B two") && !r.contains("B one"), "{r}");
+    let r = read("C");
+    assert!(r.contains("A one") && r.contains("B one") && r.contains("B two"), "a new agent sees the latest: {r}");
+    // `auto` is the same cursor as `me`.
+    let (t, _) = memory_call(json!({"op": "read", "since": "auto", "agent": "C"}));
+    assert!(t.contains("nothing new"), "{t}");
+    // Stateless: after a handle, whoever asks.
+    let (t, _) = memory_call(json!({"op": "read", "since": handoff::handle(b1), "agent": "A"}));
+    assert!(t.contains("B two") && !t.contains("B one"), "{t}");
+}
+
+fn parent_transcript(dir: &Path, repo: &Path) -> std::path::PathBuf {
+    let r = repo.to_string_lossy();
+    let line = |name: &str, input: serde_json::Value| {
+        json!({"type": "assistant", "sessionId": "s1", "cwd": r, "message": {"role": "assistant",
+            "content": [{"type": "tool_use", "id": "t", "name": name, "input": input}]}})
+        .to_string()
+    };
+    let lines = [
+        line("Read", json!({"file_path": format!("{r}/src/lib.rs")})),
+        line("Read", json!({"file_path": "/etc/hostname"})),
+        line("Grep", json!({"pattern": "alpha", "path": format!("{r}/src")})),
+        line("mcp__foxdb__fox_read", json!({"target": "AGENT_MILESTONE_LOG.md"})),
+    ];
+    let p = dir.join("parent.jsonl");
+    fs::write(&p, lines.join("\n") + "\n").unwrap();
+    p
+}
+
+/// The SubagentStart brief carries the board protocol (read posts after the parent's snapshot,
+/// post fact/failed/question with handles) and the handles of files the parent already read
+/// (from its transcript), never their content. Siblings still get the same bytes, within the cap.
+#[test]
+fn subagent_brief_has_the_board_protocol_and_the_parents_files_as_handles() {
+    let _g = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    let (_h, repo, c, _p) = setup_ts();
+    let tx = tempfile::tempdir().unwrap();
+    let t = parent_transcript(tx.path(), repo.path());
+    let input = |id: &str| {
+        json!({"hook_event_name": "SubagentStart", "session_id": "s1", "cwd": repo.path(), "agent_id": id,
+            "agent_type": "worker", "transcript_path": t})
+        .to_string()
+    };
+    let a = hook::run("subagent-start", &input("a1"), hook::Harness::Claude);
+    let b = hook::run("subagent-start", &input("b2"), hook::Harness::Claude);
+    assert_eq!(a, b, "sibling briefs must be byte-identical");
+    let v: serde_json::Value = serde_json::from_str(&a).unwrap();
+    let ctx = v["hookSpecificOutput"]["additionalContext"].as_str().unwrap();
+    let snap = ctx.split_whitespace().find(|w| w.starts_with("h:")).unwrap();
+    assert!(ctx.contains(&format!("since={snap}")), "board cursor from the snapshot: {ctx}");
+    for want in ["fact", "failed", "question", "agent="] {
+        assert!(ctx.contains(want), "missing {want:?}: {ctx}");
+    }
+    let f = node_handle(&c, "file", "lib.rs");
+    assert!(ctx.contains(&format!("{f} src/lib.rs")), "the parent's file as a handle: {ctx}");
+    assert!(!ctx.contains("hostname") && !ctx.contains("pub fn alpha"), "no outside paths, no content: {ctx}");
+    assert!(ctx.chars().count() <= hook::SUBAGENT_BRIEF_CHARS, "{} chars", ctx.chars().count());
+    // Without a transcript the brief just leaves the line out.
+    let bare =
+        json!({"hook_event_name": "SubagentStart", "session_id": "s1", "cwd": repo.path(), "agent_id": "c3", "agent_type": "worker"});
+    let out = hook::run("subagent-start", &bare.to_string(), hook::Harness::Claude);
+    assert!(!out.contains("src/lib.rs") && out.contains("since=h:"), "{out}");
+}
+
+/// SubagentStop still saves the whole report, and also posts a short `summary` entry that links
+/// it, with the paths it cites as file handles: siblings reading the board get the gist.
+#[test]
+fn subagent_stop_posts_a_summary_entry_with_handles() {
+    let _g = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    let (_h, repo, c, p) = setup_ts();
+    std::env::set_current_dir(repo.path()).unwrap();
+    let filler: String = (0..300).map(|i| format!("detail{i} ")).collect();
+    let msg = format!("Found it: alpha in src/lib.rs:1 is never called, see c:fffffff.\n{filler}");
+    let input = json!({"hook_event_name": "SubagentStop", "session_id": "s1", "cwd": repo.path(), "agent_id": "a9",
+        "agent_type": "worker", "last_assistant_message": msg})
+    .to_string();
+    assert_eq!(hook::run("subagent-stop", &input, hook::Harness::Claude), "");
+    let rep: i64 = c.query_row("SELECT id FROM handoff WHERE project_id = ?1 AND kind = 'report'", [p.id], |r| r.get(0)).unwrap();
+    let (sid, body, ev, parent): (i64, String, String, i64) = c
+        .query_row("SELECT id, body, evidence, parent_id FROM handoff WHERE project_id = ?1 AND kind = 'summary'", [p.id], |r| {
+            Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?))
+        })
+        .unwrap();
+    assert_eq!(parent, rep, "the summary hangs off the report");
+    assert!(body.starts_with("Found it") && body.contains(&handoff::handle(rep)), "{body}");
+    assert!(body.chars().count() <= handoff::ENTRY_MAX, "{} chars", body.chars().count());
+    let f = node_handle(&c, "file", "lib.rs");
+    assert_eq!(ev, f, "cited paths become handles; unknown handles are dropped");
+    let board = handoff::read_since(&c, p.id, handoff::Since::After(0), Some("summary"), None, 500).unwrap();
+    assert!(board.contains(&handoff::handle(sid)) && board.contains("Found it"), "{board}");
+    let (out, err) = read_call(&f);
+    assert!(!err && out.contains("alpha"), "{out}");
+}

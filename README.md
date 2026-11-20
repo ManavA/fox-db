@@ -156,7 +156,7 @@ read by handle, so siblings don't each pay for the same large read.
 
 ```
 fox mem post "Upload retries ignore 429" --kind finding --evidence src/upload.rs:88
-fox mem read --since auto                 # only what is new to this agent
+fox mem read --since me                   # only what is new to this agent
 fox handoff create --goal "Fix 429 retries" --next "add backoff in upload.rs"   # -> h:12
 fox handoff take h:12                     # claimed exactly once, even with several takers
 fox switch --to codex --handoff h:12      # prints the command to continue the task in Codex

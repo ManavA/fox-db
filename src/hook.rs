@@ -233,19 +233,93 @@ fn subagent_start(input: &Value, h: Harness) -> Result<String> {
     // The savings and stale-memory lines are of no use to a helper.
     text = text.lines().filter(|l| !l.starts_with("fox saved") && !l.starts_with("stale memory:")).map(|l| format!("{l}\n")).collect();
     // A pointer to the parent's frozen board snapshot, not the live board: siblings started
-    // before and after a post still get the same bytes.
+    // before and after a post still get the same bytes. The board protocol reads from that
+    // snapshot on; the subagent carries its own cursor (`since=h:N`), since subagents call
+    // through their parent's MCP server and share its identity.
     if let Ok(w) = db::open_rw()
         && let Some(sid) = input["session_id"].as_str().filter(|s| !s.is_empty())
         && let Ok(h) =
             crate::handoff::snapshot(&w, p.id, &format!("session:{sid}"), Some(&owner_of(input).unwrap_or_else(|| sid.to_string())))
     {
         let h = crate::handoff::handle(h);
+        text.push_str(&format!("parent packet {h} - open decisions/requests (fox_read target={h})\n"));
         text.push_str(&format!(
-            "parent packet {h} - open decisions/requests (fox_read target={h}; new posts: fox_memory op=read since=auto)\n"
+            "board: before each new lead, fox_memory op=read since={h}, then the since=h:N it ends with. \
+             Post fact|failed (approach, why)|question with agent=<your name>, evidence=handles, not content.\n"
         ));
     }
-    text.push_str("Report findings with fox_memory op=post; your final answer is saved for the parent.\n");
-    Ok(context("SubagentStart", cap_marked(&text, SUBAGENT_BRIEF_CHARS.min(h.cap_chars()))))
+    const LAST: &str = "Final answer: findings and handles (path:line, s:/f:), not file contents; it is saved for the parent.\n";
+    let cap = SUBAGENT_BRIEF_CHARS.min(h.cap_chars());
+    // Files the parent already read, as handles that fit in what the cap leaves.
+    if let Some(t) = input["transcript_path"].as_str().filter(|_| h == Harness::Claude) {
+        let room = cap.saturating_sub(text.chars().count() + LAST.len());
+        text.push_str(&parent_read_line(&c, &p, Path::new(t), room));
+    }
+    text.push_str(LAST);
+    Ok(context("SubagentStart", cap_marked(&text, cap)))
+}
+
+/// The tail of a parent transcript that [`parent_reads`] scans: recent reads matter most, and a
+/// long session's transcript runs to tens of megabytes.
+const PARENT_TAIL_BYTES: u64 = 16 << 20;
+
+/// Paths under `root` that a Claude Code transcript read (`Read`, or `fox_read` of a path), most
+/// recent first, relative to `root`. Only tool_use lines are parsed; nothing is read but the
+/// transcript's last [`PARENT_TAIL_BYTES`].
+pub fn parent_reads(transcript: &Path, root: &Path) -> Vec<String> {
+    use std::io::{Read, Seek, SeekFrom};
+    let Ok(mut f) = std::fs::File::open(transcript) else { return vec![] };
+    let start = f.metadata().map(|m| m.len()).unwrap_or(0).saturating_sub(PARENT_TAIL_BYTES);
+    let mut buf = Vec::new();
+    if f.seek(SeekFrom::Start(start)).is_err() || f.take(PARENT_TAIL_BYTES).read_to_end(&mut buf).is_err() {
+        return vec![];
+    }
+    let text = String::from_utf8_lossy(&buf);
+    let root = root.to_string_lossy();
+    let mut seen: Vec<String> = vec![];
+    // A tail that starts mid-line skips that line.
+    for l in text.lines().skip(usize::from(start > 0)).filter(|l| l.contains("\"tool_use\"")) {
+        let Ok(v) = serde_json::from_str::<Value>(l) else { continue };
+        for b in v["message"]["content"].as_array().into_iter().flatten().filter(|b| b["type"] == "tool_use") {
+            let name = b["name"].as_str().unwrap_or("");
+            let path = match name {
+                "Read" => b["input"]["file_path"].as_str(),
+                n if n.ends_with("fox_read") => b["input"]["target"].as_str(),
+                _ => None,
+            };
+            let Some(path) = path else { continue };
+            let rel = match path.strip_prefix(root.as_ref()) {
+                Some(r) => r.trim_start_matches('/'),
+                None if !path.starts_with('/') => path,
+                None => continue,
+            };
+            if !rel.is_empty() {
+                seen.retain(|x| x != rel);
+                seen.push(rel.to_string());
+            }
+        }
+    }
+    seen.reverse();
+    seen
+}
+
+/// `parent read (...): f:1a src/a.rs, f:2b src/b.rs` for the indexed files among the parent's
+/// reads, as many as fit in `room` chars; empty when none does.
+fn parent_read_line(c: &Connection, p: &project::Project, transcript: &Path, room: usize) -> String {
+    const HEAD: &str = "parent read (fox_read a handle, lines=a-b for a slice):";
+    let Ok(mut s) = c.prepare_cached("SELECT id FROM node WHERE project_id = ?1 AND kind = 'file' AND path = ?2") else {
+        return String::new();
+    };
+    let mut line = HEAD.to_string();
+    for rel in parent_reads(transcript, &p.root) {
+        let Ok(id) = s.query_row(rusqlite::params![p.id, rel], |r| r.get::<_, i64>(0)) else { continue };
+        let item = format!("{}{} {rel}", if line.len() == HEAD.len() { " " } else { ", " }, query::handle("file", id));
+        if line.chars().count() + item.chars().count() + 1 > room {
+            break;
+        }
+        line.push_str(&item);
+    }
+    if line.len() == HEAD.len() { String::new() } else { line + "\n" }
 }
 
 /// Save the subagent's final report as a handoff row. Prints nothing: SubagentStop output can
@@ -272,10 +346,41 @@ fn subagent_stop(input: &Value, h: Harness) -> Result<String> {
             ..Default::default()
         },
     )?;
+    // Its gist on the board too, for siblings reading what is new: a short summary entry that
+    // links the report, with the paths and handles it cites as handles.
+    let _ = crate::handoff::post(
+        &w,
+        &crate::handoff::Post {
+            project_id: p.id,
+            kind: "summary",
+            text: &summary_of(msg, report),
+            harness: Some(h.name()),
+            session: input["session_id"].as_str(),
+            agent,
+            evidence: Some(&crate::handoff::attachments(&w, p.id, &cited(msg), false)?).filter(|e| !e.is_empty()).map(String::as_str),
+            parent: Some(report),
+            ..Default::default()
+        },
+    );
     if let Some(id) = input["agent_id"].as_str().filter(|s| !s.is_empty()) {
         crate::agents::finish(&w, id, "done", Some(report))?;
     }
     Ok(String::new())
+}
+
+/// A report's opening, clipped to fit a swarm entry with the report's handle at its end.
+pub fn summary_of(report: &str, report_id: i64) -> String {
+    let tail = format!(" (report {})", crate::handoff::handle(report_id));
+    let room = crate::handoff::ENTRY_MAX - tail.chars().count();
+    let one: String = report.split_whitespace().collect::<Vec<_>>().join(" ");
+    format!("{}{tail}", query::clip(&one, room))
+}
+
+/// Handles and `path[:line]` mentions in a report, space-separated, first mention first.
+fn cited(text: &str) -> String {
+    static RE: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
+    let re = RE.get_or_init(|| regex::Regex::new(r"\b[hsfcdmagx]:[0-9a-f]+\b|[A-Za-z0-9_\-./]+\.[A-Za-z0-9]{1,6}(?::\d+)?").unwrap());
+    re.find_iter(text).take(40).map(|m| m.as_str()).collect::<Vec<_>>().join(" ")
 }
 
 /// Record the session or subagent in the agent registry. Best effort and silent: identity comes

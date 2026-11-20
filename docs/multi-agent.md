@@ -10,8 +10,9 @@ harness spawns its own `fox mcp` over stdio, so identity is per process: `FOXDB_
 the session it runs in, never the bare client name every session of a harness shares: Claude
 Code's `CLAUDE_CODE_SESSION_ID`, else the session the SessionStart hook registered for an
 ancestor process (the harness its MCP server and shell commands descend from), else
-`<client>-<harness pid>` for MCP and `cli-<shell pid>` for the CLI. Takes, `since=auto` cursors
-and post attribution all use this id. Set `FOXDB_AGENT` for an id that survives restarts.
+`<client>-<harness pid>` for MCP and `cli-<shell pid>` for the CLI. Takes, `since=me` cursors
+and post attribution all use this id, unless a call names itself with `agent=` (a subagent does: see
+[Swarm protocol](#swarm-protocol)). Set `FOXDB_AGENT` for an id that survives restarts.
 
 ```
 fox dispatch --harness codex|claude --task <text|h:ID> [--repo DIR] [--writer|--reviewer] [--label L] [--model M]
@@ -22,7 +23,7 @@ fox handoff render h:ID [--for claude|codex|t3] [--budget N]     fox handoff tak
 fox switch --to codex|claude [--handoff h:ID | --transcript PATH] [--inline] [--exec]
 fox switch --for t3 [--handoff h:ID] [--inline]       # a message to paste into a T3 Code thread
 fox swarm run <plan.toml> [--no-wait]     fox swarm status <swarm>     # see docs/swarm.md
-fox mem post <text> --topic T          fox mem read --since auto [--topic T]
+fox mem post <text> --topic T [--kind fact|failed|question]     fox mem read --since me [--topic T]
 ```
 
 - **Registry.** An agent has an id, harness, model, role, parent, repo, status
@@ -50,14 +51,61 @@ fox mem post <text> --topic T          fox mem read --since auto [--topic T]
 - **Writer leases** are advisory, one per repo root. A second `--writer` is refused with the
   holder's id. A lease is held while its holder's process lives and ends on release or death,
   never on a timer, so a long build does not let a second writer in.
-- **Board.** Posts carry a topic and the poster's agent id. `read --since auto` returns only rows
-  newer than this agent's cursor, minus its own posts, and advances the cursor. An agent's first
-  read starts at the newest rows that fit (with a `+N older` line), not the oldest.
+- **Board.** Posts carry a topic and the poster's agent id. `read --since me` (`auto` is the same)
+  returns only rows newer than this agent's cursor, minus its own posts, and advances the cursor.
+  An agent's first read starts at the newest rows that fit (with a `+N older` line), not the
+  oldest. `--since h:N` is the stateless form: rows after `h:N`, for whoever asks; every read
+  ends with the `since=h:N` to pass next.
+- **Swarm entries.** `fact`, `failed` (an approach that did not work, and why), `summary` and
+  `question` are kinds of their own: at most 600 characters each, shown whole on their board
+  row, so reading what is new costs one call. Their `evidence` holds handles: a path of an
+  indexed file becomes its `f:` handle, a handle that names nothing is refused, and
+  `fox_read target=h:N` lists what each handle points at. Open questions count with decisions
+  and requests in subagent briefs.
 - **Dedup** ("already sent") applies only to the CLI, per `FOXDB_SESSION` (a dispatched
   worker's id), and the PreCompact hook clears it. The MCP tools keep none: one server process
   serves a session and its subagents, which never saw each other's answers. What the tree
   shares is compute (one store and `foxd`'s warm cache) and handles: briefs point at packets
   instead of inlining them.
+
+## Swarm protocol
+
+Agents working one task share what they learn through the board, as an append-only log each
+reads incrementally (the design DeLM measured against native subagents). The rules every brief
+repeats:
+
+1. **Read what is new before each new lead**: `fox_memory op=read since=me`, or the `since=h:N`
+   the brief gives and then the one each read ends with. Repeated reads return only new rows.
+2. **Post as you learn**: `kind=fact` for a finding, `kind=failed` for an approach that did not
+   work and why (so no sibling repeats it), `kind=question` for an open question.
+3. **Attach handles, not content**: `evidence=f:1a c:2b` or paths; `fox_read` opens them.
+4. **Return handles**: a final answer with `path:line` and handles, not file contents.
+
+**Identity.** A dispatched worker runs its own `fox mcp` with `FOXDB_AGENT` set, so `since=me`
+and attribution need nothing more. A Claude Code subagent calls through its parent's MCP server,
+with the parent's environment, so the server cannot tell siblings apart: a subagent passes
+`agent=<its name>` on `op=post` and `op=read since=me`, or carries the stateless `since=h:N`. An
+explicit `agent` argument wins over `FOXDB_AGENT`.
+
+**SubagentStart** (Claude Code) adds to the brief:
+
+```
+parent packet h:30 - open decisions/requests (fox_read target=h:30)
+board: before each new lead, fox_memory op=read since=h:30, then the since=h:N it ends with. Post fact|failed (approach, why)|question with agent=<your name>, evidence=handles, not content.
+parent read (fox_read a handle, lines=a-b for a slice): f:1c src/search.rs, f:9 src/query.rs
+Final answer: findings and handles (path:line, s:/f:), not file contents; it is saved for the parent.
+```
+
+`h:30` is the parent's board snapshot, shared by siblings started together, so their briefs stay
+byte-identical. The `parent read` line lists indexed files the parent read (Claude Code `Read`
+calls and `fox_read` of a path, newest first), from the last 16 MB of the parent's transcript,
+as many as fit the 1,500-character brief cap; it names files, never their content. Codex
+subagents get no such line: Codex reads files through the shell, which the transcript does not
+record as reads.
+
+**SubagentStop** saves the final answer as a `report`, as before, and posts a `summary` entry
+that holds its opening (up to 600 characters), the report's handle, and the paths and handles it
+cites, as handles. Siblings reading the board get the gist without the report.
 
 ## Dispatch
 
@@ -246,7 +294,7 @@ as its memory-server overlays); its bridge strips credential-like and `DSH_*` va
 `AGENTS.md` pointer line, for any of them:
 
 ```md
-- Shared agent context lives in foxdb: `fox_memory op=read since=auto` for new board posts, `op=take id=h:…` before working a handoff, `op=post` for findings; packets via `fox handoff render h:…`.
+- Shared agent context lives in foxdb: `fox_memory op=read since=me` for new board posts, `op=take id=h:…` before working a handoff, `op=post` for findings; packets via `fox handoff render h:…`.
 ```
 
 ## Worked examples

@@ -2,13 +2,27 @@
 //! post for each other, scoped to a project. Text is redacted on the way in and rows stay short
 //! plain text. A request can be picked up exactly once; `take` adds a lease that another agent may
 //! retake once it expires. Rows carry a topic and a parent handoff (lineage).
+//!
+//! Swarm entries (`fact`, `failed`, `summary`, `question`) are short ([`ENTRY_MAX`]) and attach
+//! files and symbols by handle, never by pasted content (see [`attachments`]); the board shows
+//! their whole text on one row, so an agent's read of what is new to it stays one small call.
 
 use crate::{db, query, redact};
 use anyhow::{Result, bail};
 use rusqlite::{Connection, OptionalExtension, params};
 use std::fmt::Write;
 
-pub const KINDS: &[&str] = &["finding", "claim", "request", "decision", "report", "packet"];
+pub const KINDS: &[&str] = &["finding", "claim", "request", "decision", "report", "packet", "fact", "failed", "summary", "question"];
+
+/// The swarm entry kinds: a fact found, an approach that failed (and why), a worker's summary,
+/// an open question. Short, whole on their board row.
+pub const SWARM_KINDS: &[&str] = &["fact", "failed", "summary", "question"];
+
+/// Longest swarm entry: a claim plus handles, not a dump.
+pub const ENTRY_MAX: usize = 600;
+
+/// Most attachments kept on one entry.
+pub const ATTACH_MAX: usize = 8;
 
 /// Longest body kept; reports are summaries, not dumps.
 pub const BODY_MAX: usize = 4_000;
@@ -40,13 +54,18 @@ pub fn post(w: &Connection, p: &Post) -> Result<i64> {
     if !KINDS.contains(&p.kind) {
         bail!("kind must be one of {}", KINDS.join("|"));
     }
-    let text: String = redact::redact(p.text.trim()).chars().take(BODY_MAX).collect();
+    let swarm = SWARM_KINDS.contains(&p.kind);
+    let text = redact::redact(p.text.trim());
+    let text: String = if swarm { query::clip(&text, ENTRY_MAX) } else { text.chars().take(BODY_MAX).collect() };
     if text.is_empty() {
         bail!("text is empty");
     }
     let title = p.title.map(|t| redact::redact(t.trim())).unwrap_or_else(|| text.lines().next().unwrap_or("").to_string());
     let title: String = title.chars().take(100).collect();
-    let ev = p.evidence.map(redact::redact);
+    let ev = match p.evidence {
+        Some(e) if swarm => Some(attachments(w, p.project_id, e, true)?).filter(|e| !e.is_empty()),
+        e => e.map(redact::redact),
+    };
     let topic = p.topic.map(|t| t.trim().chars().take(40).collect::<String>()).filter(|t| !t.is_empty());
     w.execute(
         "INSERT INTO handoff(project_id, kind, title, body, scope, harness, session, agent, evidence, created_at, topic, parent_id)
@@ -62,7 +81,7 @@ pub fn post(w: &Connection, p: &Post) -> Result<i64> {
 pub fn read(c: &Connection, pid: i64, kind: Option<&str>, q: Option<&str>, budget: usize, cursor: usize) -> Result<String> {
     let like = q.map(|q| format!("%{}%", q.replace('%', "")));
     let mut s = c.prepare_cached(
-        "SELECT id, kind, title, created_at, COALESCE(agent, harness, ''), claimed_by, evidence, topic FROM handoff
+        "SELECT id, kind, title, created_at, COALESCE(agent, harness, ''), claimed_by, evidence, topic, body FROM handoff
          WHERE project_id = ?1 AND (?2 IS NULL OR kind = ?2) AND (?3 IS NULL OR title LIKE ?3 OR body LIKE ?3)
            AND scope IS NOT 'snapshot'
          ORDER BY id DESC LIMIT 200",
@@ -81,9 +100,18 @@ fn row_line(r: &rusqlite::Row) -> rusqlite::Result<String> {
     if let Some(t) = topic {
         let _ = write!(l, " #{t}");
     }
-    let _ = write!(l, "  {}", query::clip(&title, 90));
-    if let Some(e) = ev.filter(|e| !e.is_empty()) {
-        let _ = write!(l, "  @{}", query::clip(&e, 60));
+    if SWARM_KINDS.contains(&kind.as_str()) {
+        // A swarm entry is short: its whole text on one line, and its handles in full.
+        let body: String = r.get(8)?;
+        let _ = write!(l, "  {}", body.split_whitespace().collect::<Vec<_>>().join(" "));
+        if let Some(e) = ev.filter(|e| !e.is_empty()) {
+            let _ = write!(l, "  @{e}");
+        }
+    } else {
+        let _ = write!(l, "  {}", query::clip(&title, 90));
+        if let Some(e) = ev.filter(|e| !e.is_empty()) {
+            let _ = write!(l, "  @{}", query::clip(&e, 60));
+        }
     }
     if let Some(cb) = claimed {
         let _ = write!(l, "  [claimed by {cb}]");
@@ -114,7 +142,7 @@ pub fn read_since(w: &Connection, pid: i64, since: Since, kind: Option<&str>, to
         return read_newest(w, pid, me.unwrap_or_default(), kind, topic, budget);
     }
     let mut s = w.prepare_cached(
-        "SELECT id, kind, title, created_at, COALESCE(agent, harness, ''), claimed_by, evidence, topic FROM handoff
+        "SELECT id, kind, title, created_at, COALESCE(agent, harness, ''), claimed_by, evidence, topic, body FROM handoff
          WHERE project_id = ?1 AND id > ?2 AND (?3 IS NULL OR kind = ?3) AND (?4 IS NULL OR topic = ?4)
            AND (?5 IS NULL OR agent IS NULL OR agent != ?5) AND scope IS NOT 'snapshot'
          ORDER BY id LIMIT 200",
@@ -156,7 +184,7 @@ pub fn read_since(w: &Connection, pid: i64, since: Since, kind: Option<&str>, to
 /// cursor set past everything, so a new agent sees the latest decisions instead of the oldest rows.
 fn read_newest(w: &Connection, pid: i64, me: &str, kind: Option<&str>, topic: Option<&str>, budget: usize) -> Result<String> {
     let mut s = w.prepare_cached(
-        "SELECT id, kind, title, created_at, COALESCE(agent, harness, ''), claimed_by, evidence, topic FROM handoff
+        "SELECT id, kind, title, created_at, COALESCE(agent, harness, ''), claimed_by, evidence, topic, body FROM handoff
          WHERE project_id = ?1 AND (?2 IS NULL OR kind = ?2) AND (?3 IS NULL OR topic = ?3)
            AND (agent IS NULL OR agent != ?4) AND scope IS NOT 'snapshot'
          ORDER BY id DESC LIMIT 200",
@@ -191,6 +219,74 @@ fn read_newest(w: &Connection, pid: i64, me: &str, kind: Option<&str>, topic: Op
     )?;
     let _ = writeln!(text, "since={}", handle(last));
     Ok(text)
+}
+
+/// What a handle names: `f:1a file lib.rs src/lib.rs:1`, or `h:2 fact <title>`. None when the
+/// text is not a handle or names nothing.
+pub fn resolve(c: &Connection, h: &str) -> Option<String> {
+    let (pfx, hex) = h.split_once(':')?;
+    let id = i64::from_str_radix(hex, 16).ok()?;
+    match pfx {
+        "h" => c
+            .query_row("SELECT kind, title FROM handoff WHERE id = ?1", [id], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))
+            .ok()
+            .map(|(k, t)| format!("{h} {k} {}", query::clip(&t, 80))),
+        p if p.len() == 1 && "sfcdmagx".contains(p) => c
+            .query_row("SELECT kind, name, COALESCE(path, ''), COALESCE(line, 0) FROM node WHERE id = ?1", [id], |r| {
+                Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?, r.get::<_, String>(2)?, r.get::<_, i64>(3)?))
+            })
+            .ok()
+            .map(|(k, n, p, l)| match (p.is_empty(), l > 0) {
+                (true, _) => format!("{h} {k} {n}"),
+                (false, false) => format!("{h} {k} {n} {p}"),
+                (false, true) => format!("{h} {k} {n} {p}:{l}"),
+            }),
+        _ => None,
+    }
+}
+
+/// Does `t` look like a handle (`f:1a`, `h:2`), whether or not it names anything?
+fn looks_like_handle(t: &str) -> bool {
+    let b = t.as_bytes();
+    b.len() > 2 && b[1] == b':' && b"hsfcdmagx".contains(&b[0]) && b[2..].iter().all(u8::is_ascii_hexdigit)
+}
+
+/// A swarm entry's attachments as handles: a known handle stays, the path of an indexed file
+/// becomes its `f:` handle (`src/a.rs` and `src/a.rs:40` alike), any other word is kept as
+/// written. Split on whitespace and commas; at most [`ATTACH_MAX`]. An unknown handle is an error
+/// when `strict` (an agent's own post) and dropped otherwise, as are unindexed words (handles
+/// gathered from a report's prose).
+pub fn attachments(c: &Connection, pid: i64, raw: &str, strict: bool) -> Result<String> {
+    let mut out: Vec<String> = vec![];
+    for tok in raw.split(|ch: char| ch.is_whitespace() || ch == ',') {
+        let tok = tok.trim_matches(|ch: char| "()[]<>`'\";.".contains(ch));
+        if tok.is_empty() || out.len() >= ATTACH_MAX {
+            continue;
+        }
+        let t = if looks_like_handle(tok) {
+            if resolve(c, tok).is_none() {
+                if strict {
+                    bail!("unknown handle {tok}: attach handles from fox_find, fox_graph or fox_read rows");
+                }
+                continue;
+            }
+            tok.to_string()
+        } else {
+            let path = tok.split(':').next().unwrap_or(tok);
+            let id: Option<i64> = c
+                .query_row("SELECT id FROM node WHERE project_id = ?1 AND kind = 'file' AND path = ?2", params![pid, path], |r| r.get(0))
+                .optional()?;
+            match id {
+                Some(id) => query::handle("file", id),
+                None if strict => redact::redact(tok),
+                None => continue,
+            }
+        };
+        if !out.contains(&t) {
+            out.push(t);
+        }
+    }
+    Ok(out.join(" "))
 }
 
 /// Child handoffs (reports for a task, packets that continue a packet).
@@ -239,6 +335,13 @@ pub fn show(c: &Connection, id: i64) -> Result<String> {
     }
     if let Some(e) = ev {
         let _ = writeln!(s, "evidence: {e}");
+        let found: Vec<String> = e.split_whitespace().filter_map(|h| resolve(c, h)).collect();
+        if !found.is_empty() {
+            let _ = writeln!(s, "attached (fox_read target=<handle>):");
+            for f in found {
+                let _ = writeln!(s, "  {f}");
+            }
+        }
     }
     if let Some(x) = session {
         let _ = writeln!(s, "session: {x}");
@@ -377,7 +480,7 @@ fn snapshot_in_tx(w: &Connection, pid: i64, owner: &str, author: Option<&str>) -
     };
     if let Some((id, at)) = newest {
         let moved: bool = w.query_row(
-            "SELECT EXISTS(SELECT 1 FROM handoff WHERE project_id = ?1 AND id > ?2 AND kind IN ('decision','request'))",
+            "SELECT EXISTS(SELECT 1 FROM handoff WHERE project_id = ?1 AND id > ?2 AND kind IN ('decision','request','question'))",
             params![pid, id],
             |r| r.get(0),
         )?;
@@ -411,7 +514,7 @@ fn snapshot_in_tx(w: &Connection, pid: i64, owner: &str, author: Option<&str>) -
 /// The few most recent open requests and decisions, for subagent briefs. Deterministic.
 pub fn brief_lines(c: &Connection, pid: i64, n: usize) -> Vec<String> {
     let Ok(mut s) = c.prepare_cached(
-        "SELECT id, kind, title FROM handoff WHERE project_id = ?1 AND kind IN ('decision','request') AND claimed_by IS NULL
+        "SELECT id, kind, title FROM handoff WHERE project_id = ?1 AND kind IN ('decision','request','question') AND claimed_by IS NULL
          ORDER BY id DESC LIMIT ?2",
     ) else {
         return vec![];

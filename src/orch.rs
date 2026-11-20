@@ -101,7 +101,7 @@ pub fn dispatch_brief(packet: &str) -> String {
     format!(
         "You are a worker started by `fox dispatch`. Shared context for this task tree is in foxdb:\n\
          - parent packet {packet} - read it with fox_read target={packet} (or `fox handoff render {packet}`)\n\
-         - live board: fox_memory op=read since=auto; post findings with fox_memory op=post\n\
+         - live board: fox_memory op=read since=me before each new lead; post kind=fact|failed (approach, why)|question, evidence=handles, not content\n\
          Your final answer is your report for the parent, in the JSON format the harness enforces: \
          status, summary, files (path:line), tests (exact commands run, passed), decisions, next.\n\n--- task ---\n"
     )

@@ -71,7 +71,7 @@ settings have no field for extra servers today.
 
 After registering, start a new thread for each provider and ask it to run
 `fox_find query=<a symbol you know>`. The answers come from the same store, and a post one
-thread makes with `fox_memory op=post` is what another thread reads with `op=read since=auto`.
+thread makes with `fox_memory op=post` is what another thread reads with `op=read since=me`.
 For the hooks (session brief, subagent briefs), follow the Claude Code and Codex setup in
 [usage.md](usage.md#claude-code-setup) and [AGENTS-SETUP.md](../AGENTS-SETUP.md): they work the same under T3, because T3 runs those harnesses with their own settings.
 
@@ -85,9 +85,10 @@ after the MCP client and the parent process (`<client>-<pid>`; see
   ("One app-server serves many threads", `CodexAdapterV2.ts`). Its per-thread id goes only into
   the shell environment of commands the thread runs (`T3CODE_THREAD_ID`), not into MCP servers.
   So every Codex thread under one app-server shows up as the same agent (for example
-  `codex-mcp-client-41582`) and shares one `since=auto` cursor. One thread's
-  `op=read since=auto` then consumes posts another thread has not seen. Under T3, Codex threads
-  should read the board with an explicit `since=h:N` cursor; setting
+  `codex-mcp-client-41582`) and shares one `since=me` cursor. One thread's
+  `op=read since=me` then consumes posts another thread has not seen. Under T3, Codex threads
+  should read the board with an explicit `since=h:N` cursor, or name themselves with `agent=<name>`
+  on each read and post (as Claude Code subagents do); setting
   `FOXDB_AGENT` in the provider environment does not help, because it is still one value for all
   threads.
 - **Claude, OpenCode and ACP agents:** separate threads are separate agents only when the
