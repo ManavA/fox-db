@@ -7,10 +7,42 @@ First answers that were empty, wrong or padded in agent benchmark transcripts ar
 - `fox_read` also carries `anthropic/alwaysLoad`: with only `fox_find` and `fox_graph` loaded,
   agents read bodies with the native Read instead. The brief's tool line now names
   `fox_read target=<handle>` as the way to read a body.
-- `callers`, `refs` and `impact` no longer read as incomplete over mentions that cannot be
-  calls: a file naming the target only in comments, imports, C-family declarations
-  (`extern`, prototypes) or strings is listed under `also mentioned (not calls):` and left out
-  of the `may be incomplete` / `partial at d1` count.
+- `callers`, `refs` and `impact` account for every line that names the target as a whole word
+  in the code of its language, so the answer is a labelled superset of `rg -w name` there. The
+  first line counts them by group (`16 lines name `f`: 7 calls, 1 definition, 5 imports,
+  2 declarations/prototypes, 1 in 1 same-name definition elsewhere, 1 comment; all accounted
+  for in indexed Python code`, the code the verdict covers); every occurrence on a line needs its own reference or definition; comments and strings come from the file's tree-sitter parse, and names in strings are
+  counted as possible dynamic uses. It reads `all accounted for` only when every line is
+  positively classified, the scan was complete and the index is proven fresh (no cited file
+  changed, no code file added or edited since indexing that names it, none too big to index,
+  nothing pending); otherwise it says what is missing. A complete answer adds nothing else; an
+  incomplete one lists at most 20 rows (unresolved lines first, then references that are not
+  calls, declarations and imports) and counts the rest. The count is built once per index
+  generation on a few threads, capped at 5000 files, 200 MB or 2 s. A name with no indexed
+  definition lists its lines instead of answering nothing. On 80 scrapy commits that removed or
+  re-signed a function, the share of the lines those commits changed that callers plus refs
+  list went from 34% to 37% (only 20 rows are listed; the rest are counted in the first line).
+- A call through a module, another type's value or an unrelated receiver no longer resolves
+  with certainty to a same-name definition in its own file (`core.plan()` beside a local
+  `plan`, Go `s.inner.Plan()` inside `Server.Plan` or `x.plan()` on a local of another type,
+  Kotlin `i.plan()`); Swift calls reach Objective-C methods. Every project's references
+  re-score once (store schema 22).
+- Python `@overload` stubs and property setters/deleters beside their definition are no
+  symbols of their own, so the name has one match and calls to it are certain (`must_defer`
+  with three stubs said "4 matches" and every call was `guess 1 of 4`); the stub lines count as
+  declarations. Python files parse again once (store schema 21).
+- `fox_find` no longer pads an identifier's first page with the same attribute repeated in
+  every subclass: a field that only contains the name ranks lower, and each further symbol of
+  a name already shown counts less (`CrawlerProcess` listed nine `requires_crawler_process`
+  fields in its first twenty rows). Long prose queries (an issue's text) keep the identifiers
+  in them (`get_proxy`, `RetryMiddleware`, `fetch()`, anything in backticks) among their
+  search terms instead of only the longest words.
+- A qualifier naming a directory with a dot in it resolves: `yaml.v3.Marshal` and
+  `gopkg.in/yaml.v3.Marshal` reach `vendor/gopkg.in/yaml.v3`.
+- reStructuredText and AsciiDoc files are split into doc sections like Markdown, so
+  `fox_find` answers what the docs say about X in projects documented in `.rst` (scrapy,
+  Django); they are read again once. The server instructions and `fox_find` description say
+  it answers doc questions.
 - `impact` rows at d1 show the line that uses the target (`| :5 raise HttpError(401)`), not
   only the dependent's definition line, and d1 `(top)` rows show their first use line.
 - A Go target qualified by its package resolves: `pod.GetContainerStatus`, the repo path
@@ -37,9 +69,8 @@ First answers that were empty, wrong or padded in agent benchmark transcripts ar
   `IContains`) or only neighbour it in the call graph (the callees of `exec_simple_query`) are
   left out. Doc sections holding a snake_case name (`get_user`) stay. One lookup checks all
   rows at once.
-- When the name occurs in files an answer could not resolve, `callers`, `refs` and `impact` no
-  longer ask for `rg`: up to 15 such files are listed at the end as `unresolved mentions`
-  (`path:line | code`); more are counted.
+- When the name occurs in lines an answer could not resolve, `callers`, `refs` and `impact` no
+  longer ask for `rg`: they are listed at the end as `unresolved mentions` (`path:line | code`).
 - Answers carry code. `callers` and `refs` rows end in the call site's line (`  :338 Caller c:1f | return f(x)`),
   or list one `   :line | code` row per site for a caller with several; `impact` rows end in the
   dependent's definition line. The code is shown only when the line still names the target

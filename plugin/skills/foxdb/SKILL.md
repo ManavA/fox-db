@@ -9,11 +9,11 @@ Every session starts with a `foxdb · <project> ...` brief. The index is local a
 
 ## The loop
 
-1. **Find.** `fox_find q=<name or words>` for where X is. A row ends in `path:line` and starts with a handle (`c:1f3`).
+1. **Find.** `fox_find q=<name or words>` for where X is; `kind=doc` for what the docs or README say about X (Markdown, reST and AsciiDoc sections, read with `fox_read target=d:...`). A row ends in `path:line` and starts with a handle (`c:1f3`).
 2. **Trace.** `fox_graph target=<handle or name> rel=callers` for who calls X, `rel=impact` for what breaks if X changes, `rel=overrides` for subclass methods. In tree-sitter languages, callers, refs and impact rows carry the line of code.
 3. **Read.** `fox_read target=<handle>` returns that symbol's body; `fox_read target=<path>` returns the file's declarations with line ranges. Read a file whole only for lines these do not give you.
 
-Done when: every call site from `rel=callers` (or every `d1` row of `rel=impact`) is accounted for before you change a signature, and every `may be incomplete` or `partial` line is checked against the unresolved mentions it lists, which carry their code (no grep needed). Mentions under `also mentioned (not calls)` are comments, imports, declarations or strings.
+Done when: every call site from `rel=callers` (or every `d1` row of `rel=impact`) is accounted for before you change a signature. The first line counts every line naming the target (what `rg -w` finds in code) by group: calls, imports, declarations/prototypes, same-name definitions elsewhere, comments, strings. If it says `all accounted for in indexed <language> code`, no grep of that code is needed (other languages, such as templates, are out of its scope); on `may be incomplete` or `partial`, check the unresolved mentions it lists with their code; if it says the index is stale, reindex first.
 
 For a literal string, error message or config value, use Grep.
 

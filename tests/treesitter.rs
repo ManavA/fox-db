@@ -156,9 +156,19 @@ fn copy_dir(from: &Path, to: &Path) {
     }
 }
 
-/// An answer without its trailing `unresolved mentions:` rows.
+/// An answer without its accounting line and the groups at its end (unresolved mentions,
+/// same-name definitions elsewhere, imports, ...): its resolved rows.
 fn resolved(out: &str) -> String {
-    out.split("unresolved mentions:\n").next().unwrap_or(out).to_string()
+    const GROUPS: [&str; 7] = [
+        "unresolved mentions",
+        "references, not calls",
+        "declarations and prototypes",
+        "same-name definitions elsewhere",
+        "import lines",
+        "comment lines",
+        "strings (may be dynamic uses)",
+    ];
+    out.lines().skip(1).take_while(|l| !GROUPS.iter().any(|g| l.starts_with(g))).map(|l| format!("{l}\n")).collect()
 }
 
 fn fox_code(p: &project::Project, sym: &str, rel: &str, budget: usize) -> String {
@@ -329,7 +339,8 @@ fn c_calls_resolve_across_directories_and_static_stays_file_local() {
     assert!(out.contains("~c:") && out.contains("kernel/sched/core.c:1"), "{out}");
     assert!(out.contains("3 call sites in 3 files"), "{out}");
     assert!(out.contains("kthread.c (1)") && out.contains("exec.c (1)") && out.contains("core.c (1)"), "{out}");
-    assert!(!out.contains("may be incomplete"), "{out}");
+    // Two of the calls are guesses among same-name definitions: the verdict says so.
+    assert!(out.contains("may be incomplete: 2 lines reach the target only through a guess by name"), "{out}");
     // `src` leads with the definition, not the prototype or the tools/ copy.
     let out = fox_code(&p, "wake_task", "src", 800);
     assert!(out.contains("kernel/sched/core.c:1-1"), "{out}");
@@ -374,8 +385,8 @@ fn kotlin_receiver_chains_function_references_and_exact_case() {
     assert!(out.contains("Screen.total"), "{out}");
 }
 
-/// When the name occurs in more files than the resolved sites, one line says so; when the
-/// counts agree, nothing is added.
+/// Lines naming the function that are not calls (callbacks) are counted and listed apart;
+/// when every line is a call or the definition, nothing is listed.
 #[test]
 fn callers_say_when_the_name_occurs_in_unlisted_files() {
     let _g = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
@@ -385,17 +396,13 @@ fn callers_say_when_the_name_occurs_in_unlisted_files() {
         ("mm/b.c", "int use_b(void) { return queue_work(wake_task, 2); }\n"),
     ]);
     let out = fox_code(&p, "wake_task", "callers", 800);
-    assert!(
-        out.contains(
-            "1 call sites in 1 files
-may be incomplete: `wake_task` is also named in 2 other files, not resolved to it; unresolved mentions at the end"
-        ),
-        "{out}"
-    );
+    // Callbacks are references, not calls: counted and listed, and what calls through them is unknown.
+    assert!(out.starts_with("4 lines name `wake_task`: 1 call, 1 definition, 2 references, not calls; may be incomplete: 2 lines pass it as a value, and calls through them are not followed (rel=impact lists the code passing it)\n"), "{out}");
+    assert!(out.contains("1 call sites in 1 files\n"), "{out}");
     // The mentions are listed with their code, not left to a grep.
     assert!(
         out.contains(
-            "unresolved mentions:
+            "references, not calls (what is called through them is not followed):
   mm/a.c:2 | int use_a(void) { register_cb(wake_task); return 0; }
   mm/b.c:1 |"
         ),
@@ -406,11 +413,15 @@ may be incomplete: `wake_task` is also named in 2 other files, not resolved to i
     let out = fox_code(&p, "wake_task", "impact", 800);
     assert!(out.contains(":2 use_a c:") && out.contains(":1 use_b c:") && !out.contains("partial"), "{out}");
     let out = fox_code(&p, "run", "callers", 800);
-    assert!(!out.contains("may be incomplete"), "{out}");
+    assert!(
+        !out.contains("may be incomplete")
+            && out.starts_with("1 line names `run`: 0 calls, 1 definition; all accounted for in indexed C/C++/Objective-C/Swift code"),
+        "{out}"
+    );
 }
 
-/// Unresolved mentions that cannot be calls (a comment, an `extern` prototype, an import, a
-/// string) are listed apart and do not make the answer read as incomplete.
+/// Mentions that cannot be calls (a comment, an import, a string) are counted and listed by
+/// group and do not make the answer read as incomplete.
 #[test]
 fn non_call_mentions_do_not_read_as_incomplete() {
     let _g = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
@@ -422,28 +433,29 @@ fn non_call_mentions_do_not_read_as_incomplete() {
     ]);
     let out = fox_code(&p, "plan_query", "callers", 800);
     assert!(!out.contains("may be incomplete"), "{out}");
+    // The `#include "plan_query.h"` path is a string; files of another language (web/names.ts)
+    // are not counted; a complete answer lists no extra rows.
     assert!(
-        out.contains("`plan_query` is also named in 3 other files, only in comments, imports, declarations or strings (listed at the end); none of them is a call"),
+        out.starts_with(
+            "6 lines name `plan_query`: 1 call, 1 definition, 3 comments, 1 in strings (may be dynamic uses); all accounted for in indexed C/C++/Objective-C/Swift code\n"
+        ),
         "{out}"
     );
-    assert!(out.contains("also mentioned (not calls):\n  include/proto.h:1 | /* see plan_query */"), "{out}");
+    assert!(!out.contains("web/names.ts") && !out.contains("include/proto.h"), "{out}");
     let out = fox_code(&p, "plan_query", "impact", 800);
     assert!(!out.contains("partial"), "{out}");
-    // One file that may call it: counted alone, the others listed apart.
+    // A line that may call it reads as incomplete; the others are still accounted for.
     let (_h, _r, p) = inline_project(&[
         ("src/plan.c", "int plan_query(int q) { return q; }\nint run(void) { return plan_query(1); }\n"),
         ("include/proto.h", "#include \"plan_query.h\"\n"),
-        ("mm/b.c", "int use_b(void) { return queue_work(plan_query, 2); }\n"),
+        ("mm/b.c", "#define USE_B() plan_query(2)\n"),
     ]);
     let out = fox_code(&p, "plan_query", "callers", 800);
     assert!(
-        out.contains("may be incomplete: `plan_query` is also named in 1 other file, not resolved to it; unresolved mentions at the end (1 more file only in comments, imports, declarations or strings)"),
+        out.starts_with("4 lines name `plan_query`: 1 call, 1 definition, 1 in strings (may be dynamic uses), 1 unresolved; may be incomplete: 1 unresolved line may use it\n"),
         "{out}"
     );
-    assert!(
-        out.contains("unresolved mentions:\n  mm/b.c:1 |") && out.contains("also mentioned (not calls):\n  include/proto.h:1 |"),
-        "{out}"
-    );
+    assert!(out.contains("unresolved mentions:\n  mm/b.c:1 | #define USE_B() plan_query(2)") && !out.contains("include/proto.h"), "{out}");
 }
 
 /// A first-level impact row shows the line that uses the target, not only the dependent's
@@ -508,12 +520,23 @@ fn completeness_counts_one_word_names_and_uses_outside_symbols() {
     ]);
     // The argument in src/arg.c is a resolved reference: listed by `refs` and `impact`, still
     // unknown to `callers` (what `apply` calls through it is not followed).
-    for (rel, lead, n) in [("callers", "may be incomplete", 4), ("refs", "may be incomplete", 3), ("impact", "partial at d1", 3)] {
+    for (rel, head) in [
+        (
+            "callers",
+            "6 lines name `helper`: 1 call, 1 definition, 1 reference, not a call, 3 unresolved; may be incomplete: 3 unresolved lines",
+        ),
+        ("refs", "6 lines name `helper`: 2 refs, 1 definition, 3 unresolved; may be incomplete: 3 unresolved lines"),
+        ("impact", "6 lines name `helper`: 2 uses (d1), 1 definition, 3 unresolved; partial at d1: 3 unresolved lines"),
+    ] {
         let out = fox_code(&p, "helper", rel, 800);
-        assert!(out.contains(&format!("{lead}: `helper` is also named in {n} other files")), "{rel}: {out}");
+        assert!(out.starts_with(head), "{rel}: {out}");
+        assert!(
+            out.contains("unresolved mentions:\n  src/field.c:2 | void set(struct o *o) { o->cb = helper; }\n  src/fp.c:1 | static int (*fp)(int) = helper;\n  src/macro.c:1 | #define CALL(x) helper(x)\n"),
+            "{rel}: {out}"
+        );
     }
     let out = fox_code(&p, "simple_open", "refs", 800);
-    assert!(out.contains("may be incomplete: `simple_open` is also named in 1 other file,"), "{out}");
+    assert!(out.starts_with("2 lines name `simple_open`: 0 refs, 1 definition, 1 unresolved; may be incomplete"), "{out}");
 }
 
 /// Directories named `target` are build output only beside a build manifest (or with a cache
@@ -653,15 +676,15 @@ fn functions_passed_as_arguments_are_dependents() {
         ),
     ]);
     let out = fox_code(&p, "handle_one", "impact", 2000);
-    assert!(out.contains(":3 add_all c:") && !out.contains("pass_on"), "{out}");
+    assert!(out.contains(":3 add_all c:") && !resolved(&out).contains("pass_on"), "{out}");
     let out = fox_code(&p, "worker", "impact", 2000);
-    assert!(out.contains(":7 Run c:") && !out.contains("Other"), "{out}");
+    assert!(out.contains(":7 Run c:") && !resolved(&out).contains("Other"), "{out}");
     let out = fox_code(&p, "spider_opened", "impact", 2000);
     assert!(out.contains(":3 LogCount.from_crawler c:"), "{out}");
     let out = fox_code(&p, "spider_closed", "impact", 2000);
     assert!(out.contains(":3 LogCount.from_crawler c:"), "{out}");
     let out = fox_code(&p, "onError", "impact", 2000);
-    assert!(out.contains(":3 setup c:") && !out.contains("relay"), "{out}");
+    assert!(out.contains(":3 setup c:") && !resolved(&out).contains("relay"), "{out}");
 }
 
 /// Dispatch: a call through an interface (or base) method may reach each implementation, so
@@ -707,7 +730,7 @@ fn impact_follows_interface_dispatch() {
     assert!(out.contains(":5 Run c:") && out.contains(" via Getter.ToConfig"), "{out}");
     let out = resolved(&fox_code(&p, "Partial.ToConfig", "impact", 2000));
     assert!(!out.contains("Run"), "{out}");
-    let out = fox_code(&p, "Getter.ToConfig", "impact", 2000);
+    let out = resolved(&fox_code(&p, "Getter.ToConfig", "impact", 2000));
     assert!(out.contains("Flags.ToConfig") && !out.contains("Partial.ToConfig"), "{out}");
     // A type named in a class body (a field's type) is no supertype.
     let out = resolved(&fox_code(&p, "Service.save", "impact", 2000));
@@ -825,7 +848,7 @@ fn go_dispatch_needs_evidence_and_does_not_multiply_guesses() {
     // Shut reached Close only through a name guess: it is not followed to Main.
     assert!(!out.contains("Main"), "{out}");
     let out = fox_code(&p, "Closeable.Close", "impact", 2000);
-    assert!(out.contains("Conn.Close") && !out.contains("Writer.Close"), "{out}");
+    assert!(out.contains("Conn.Close") && !resolved(&out).contains("Writer.Close"), "{out}");
 }
 
 /// Go method sets include embedded interfaces; an interface embedding one that is not in the
@@ -845,8 +868,8 @@ fn go_interface_method_sets_expand_embeds_and_caps_are_reported() {
         ("pkg/many/many.go", many.as_str()),
     ]);
     let out = fox_code(&p, "ReadCloser.Close", "impact", 2000);
-    assert!(out.contains("Pipe.Close") && !out.contains("File.Close"), "{out}");
-    let out = fox_code(&p, "IOCloser.Close", "impact", 2000);
+    assert!(out.contains("Pipe.Close") && !resolved(&out).contains("File.Close"), "{out}");
+    let out = resolved(&fox_code(&p, "IOCloser.Close", "impact", 2000));
     assert!(!out.contains("Pipe.Close") && !out.contains("File.Close"), "{out}");
     // More same-name methods than the name lookup lists: ask by handle.
     let id: i64 = db::open_ro()
@@ -1078,7 +1101,7 @@ fn go_stdlib_imports_and_local_receivers_are_not_project_packages() {
         ("go1/models/user.go", "package models\n\ntype User struct{ Name string }\n\nfunc (u *User) Save() error {\n\treturn nil\n}\n"),
         ("go1/user/user.go", "package user\n\nfunc Save() error {\n\treturn nil\n}\n"),
     ]);
-    let out = fox_code(&p, "Logger.Printf", "impact", 2000);
+    let out = resolved(&fox_code(&p, "Logger.Printf", "impact", 2000));
     assert!(!out.contains("quiet.Printf"), "{out}");
     let out = fox_code(&p, "quiet.Printf", "impact", 2000);
     assert!(!out.contains("Use"), "{out}");
@@ -1349,6 +1372,74 @@ fn find_by_exact_name_drops_padding() {
     assert!(!out.contains("helper_a") && !out.contains("helper_b"), "{out}");
 }
 
+/// The same attribute repeated in every subclass (`requires_crawler_process` in each command)
+/// does not crowd the first page: a field that only contains the name ranks low, and each
+/// further symbol of a name already shown counts less.
+#[test]
+fn find_does_not_pad_with_repeated_fields() {
+    let _g = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    let mut files: Vec<(String, String)> = vec![
+        ("pkg/crawler.py".into(), "class CrawlerProcessBase:\n    pass\n\n\nclass CrawlerProcess(CrawlerProcessBase):\n    pass\n".into()),
+        (
+            "pkg/run.py".into(),
+            "from pkg.crawler import CrawlerProcess\n\n\ndef start_crawler_process():\n    return CrawlerProcess()\n".into(),
+        ),
+    ];
+    for i in 0..8 {
+        files.push((format!("pkg/commands/c{i}.py"), "class Command:\n    requires_crawler_process = True\n".into()));
+    }
+    files.push(("pkg/settings.py".into(), "FORCE_CRAWLER_PROCESS = False\n".into()));
+    files.push(("pkg/commands/base.py".into(), "class ScrapyCommand:\n    crawler_process = None\n".into()));
+    let refs: Vec<(&str, &str)> = files.iter().map(|(a, b)| (a.as_str(), b.as_str())).collect();
+    let (_h, _r, p) = inline_project(&refs);
+    let c = db::open_ro().unwrap();
+    let o = foxdb::query::FindOpts { kind: "any", all: false, budget: 800, limit: 20, offset: 0 };
+    let out = foxdb::query::find(&c, Some(&p), "CrawlerProcess", &o).unwrap();
+    let head: Vec<&str> = out.lines().take(6).collect();
+    assert!(head[0].contains("class CrawlerProcess  pkg/crawler.py:5"), "{out}");
+    assert!(head.iter().filter(|l| l.contains("requires_crawler_process")).count() <= 1, "{out}");
+    for want in ["CrawlerProcessBase", "start_crawler_process", "FORCE_CRAWLER_PROCESS", "ScrapyCommand.crawler_process"] {
+        assert!(head.iter().any(|l| l.contains(want)), "{want}: {out}");
+    }
+}
+
+/// A qualifier naming a directory with a dot in it (`gopkg.in/yaml.v3`) resolves, written as an
+/// import path or with dots alone (`yaml.v3.Marshal`).
+#[test]
+fn dotted_directory_qualifiers_resolve() {
+    let _g = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    let (_h, _r, p) = inline_project(&[
+        ("vendor/gopkg.in/yaml.v3/yaml.go", "package yaml\n\nfunc Marshal(v any) ([]byte, error) { return nil, nil }\n"),
+        ("vendor/gopkg.in/yaml.v2/yaml.go", "package yaml\n\nfunc Marshal(v any) ([]byte, error) { return nil, nil }\n"),
+        ("pkg/enc/enc.go", "package enc\n\nfunc Marshal(v any) ([]byte, error) { return nil, nil }\n"),
+    ]);
+    for q in ["yaml.v3.Marshal", "gopkg.in/yaml.v3.Marshal"] {
+        let out = fox_code(&p, q, "callers", 800);
+        assert!(out.contains("callers of ~c:") && out.contains("vendor/gopkg.in/yaml.v3/yaml.go:3"), "{q}: {out}");
+    }
+}
+
+/// reStructuredText and AsciiDoc files are split into sections like Markdown: a question about
+/// the docs finds the section, with its line.
+#[test]
+fn rst_and_asciidoc_docs_are_sections() {
+    let _g = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    let (_h, _r, p) = inline_project(&[
+        (
+            "docs/topics/settings.rst",
+            "========\nSettings\n========\n\nIntro text.\n\nDownload delay\n--------------\n\nThe amount of time the downloader waits between pages.\n\nConcurrency\n-----------\n\nHow many requests run at once.\n",
+        ),
+        ("docs/guide.adoc", "= Guide\n\n== Retry policy\n\nFailed requests are retried three times.\n"),
+        ("app.py", "def run():\n    pass\n"),
+    ]);
+    let c = db::open_ro().unwrap();
+    let o = foxdb::query::FindOpts { kind: "doc", all: false, budget: 800, limit: 10, offset: 0 };
+    let out = foxdb::query::find(&c, Some(&p), "how long does the downloader wait between pages", &o).unwrap();
+    assert!(out.lines().next().unwrap_or("").contains("Download delay") && out.contains("docs/topics/settings.rst:7"), "{out}");
+    let out = foxdb::query::find(&c, Some(&p), "retried failed requests", &o).unwrap();
+    assert!(out.lines().next().unwrap_or("").contains("Retry policy") && out.contains("docs/guide.adoc:3"), "{out}");
+}
+
 // ---- answers carry code ----
 
 /// Each caller row carries its call site's code: inline after ` | ` for one site, one
@@ -1372,8 +1463,8 @@ fn callers_rows_carry_the_call_site_code() {
     let out = fox_code(&p, "wake_task", "impact", 800);
     assert!(out.contains(":2 run c:") && out.contains(" | :3 int a = wake_task(1);"), "{out}");
     // A budget the code does not fit in: locations only, and a note.
-    let out = fox_code(&p, "wake_task", "callers", 66);
-    assert!(out.len() <= 66 * 4 + 80, "{} bytes: {out}", out.len());
+    let out = fox_code(&p, "wake_task", "callers", 85);
+    assert!(out.len() <= 85 * 4 + 80, "{} bytes: {out}", out.len());
     assert!(out.contains("kthread_start") && !out.contains(" | ") && out.contains("code left out to fit the budget"), "{out}");
 }
 

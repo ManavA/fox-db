@@ -2,6 +2,7 @@
 //! (name-resolved, not compiler-resolved). Output is grouped under file headers so paths are
 //! never repeated, and call sites are line numbers, not code.
 
+use crate::account;
 use crate::project::Project;
 use crate::query::{clip, page};
 use crate::tsindex::{is_callable_kind, is_type_kind};
@@ -118,78 +119,82 @@ pub fn qual_matches(t: &TSym, qual: &str) -> Option<(bool, usize)> {
 /// [`qual_matches`] for a symbol at `path` inside `parent`.
 pub fn qual_matches_at(path: &str, parent: Option<&str>, qual: &str) -> Option<(bool, usize)> {
     let qual = qual.trim_start_matches('.');
-    // (location segments, container segments); an import path's location ends at its last `/`
-    // plus one segment, and only what follows is a container.
-    let (loc_fixed, conts): (Option<Vec<&str>>, Vec<&str>) = match qual.rsplit_once('/') {
+    // Readings of the qualifier as (location segments, container segments). An import path's
+    // location ends at its last `/` plus one segment, which may itself hold dots
+    // (`gopkg.in/yaml.v3`): each split of what follows the `/` is a reading.
+    let mut readings: Vec<(Option<Vec<String>>, Vec<&str>)> = vec![];
+    match qual.rsplit_once('/') {
         Some((head, tail)) => {
-            let mut it = tail.split('.');
-            let first = it.next().unwrap_or("");
-            let mut loc: Vec<&str> = head.split('/').filter(|x| !x.is_empty()).collect();
-            loc.push(first);
-            (Some(loc), it.collect())
+            let parts: Vec<&str> = tail.split('.').collect();
+            for j in 1..=parts.len() {
+                let mut loc: Vec<String> = head.split('/').filter(|x| !x.is_empty()).map(str::to_string).collect();
+                loc.push(parts[..j].join("."));
+                readings.push((Some(loc), parts[j..].to_vec()));
+            }
         }
-        None => (None, qual.split('.').filter(|x| !x.is_empty()).collect()),
-    };
+        None => readings.push((None, qual.split('.').filter(|x| !x.is_empty()).collect())),
+    }
     let ps: Vec<&str> = parent.unwrap_or("").split('.').filter(|x| !x.is_empty()).collect();
     let go = crate::lang::for_path(path).is_some_and(|l| l.family == "go");
     let dir: Vec<&str> = crate::tsindex::dir_of(path).split('/').filter(|x| !x.is_empty()).collect();
+    // The directory with its dotted segments split (`gopkg.in/yaml.v3` -> gopkg, in, yaml, v3),
+    // for a dotted qualifier naming a dotted directory (`yaml.v3.Marshal`).
+    let flat: Vec<&str> = dir.iter().flat_map(|d| d.split('.')).filter(|x| !x.is_empty()).collect();
     let module: Vec<&str> = path.rsplit_once('.').map_or(path, |x| x.0).split('/').filter(|x| !x.is_empty()).collect();
-    // Score of `loc` as the symbol's location: segments matched, or None.
-    let place = |loc: &[&str]| -> Option<usize> {
-        if loc.is_empty() {
-            return Some(0);
-        }
-        let suffix = |have: &[&str]| have.len() >= loc.len() && have[have.len() - loc.len()..] == *loc;
-        if suffix(&dir) || !go && suffix(&module) {
-            return Some(loc.len());
-        }
-        // An import path longer than the directory: the directory ends it. A one-segment
-        // directory says little about a longer path.
-        if loc_fixed.is_some() && !dir.is_empty() && loc.len() > dir.len() && loc[loc.len() - dir.len()..] == *dir {
-            return Some(if dir.len() == 1 { 0 } else { dir.len() });
-        }
-        None
-    };
     let mut best: Option<(bool, usize)> = None;
-    let ks: Vec<usize> = match &loc_fixed {
-        Some(_) => vec![conts.len()],
-        None => (0..=conts.len().min(ps.len())).rev().collect(),
-    };
-    for k in ks {
-        if k > ps.len() {
-            continue;
-        }
-        let (want, have) = (&conts[conts.len() - k..], &ps[ps.len() - k..]);
-        if !want.iter().zip(have).all(|(a, b)| a.eq_ignore_ascii_case(b)) {
-            continue;
-        }
-        let exact = want.iter().zip(have).all(|(a, b)| a == b);
-        let loc: Vec<&str> = match &loc_fixed {
-            Some(l) => l.clone(),
-            None => conts[..conts.len() - k].to_vec(),
+    for (loc_fixed, conts) in &readings {
+        // Score of `loc` as the symbol's location: segments matched, or None.
+        let place = |loc: &[&str]| -> Option<usize> {
+            if loc.is_empty() {
+                return Some(0);
+            }
+            let suffix = |have: &[&str]| have.len() >= loc.len() && have[have.len() - loc.len()..] == *loc;
+            if suffix(&dir) || !go && suffix(&module) || loc_fixed.is_none() && flat.len() > dir.len() && suffix(&flat) {
+                return Some(loc.len());
+            }
+            // An import path longer than the directory: the directory ends it. A one-segment
+            // directory says little about a longer path.
+            if loc_fixed.is_some() && !dir.is_empty() && loc.len() > dir.len() && loc[loc.len() - dir.len()..] == *dir {
+                return Some(if dir.len() == 1 { 0 } else { dir.len() });
+            }
+            None
         };
-        if let Some(sc) = place(&loc) {
-            let cand = (exact, k * 2 + sc);
-            if best.is_none_or(|b| cand > b) {
-                best = Some(cand);
+        let ks: Vec<usize> = match loc_fixed {
+            Some(_) => vec![conts.len()],
+            None => (0..=conts.len().min(ps.len())).rev().collect(),
+        };
+        for k in ks {
+            if k > ps.len() {
+                continue;
+            }
+            let (want, have) = (&conts[conts.len() - k..], &ps[ps.len() - k..]);
+            if !want.iter().zip(have).all(|(a, b)| a.eq_ignore_ascii_case(b)) {
+                continue;
+            }
+            let exact = want.iter().zip(have).all(|(a, b)| a == b);
+            let loc: Vec<&str> = match loc_fixed {
+                Some(l) => l.iter().map(String::as_str).collect(),
+                None => conts[..conts.len() - k].to_vec(),
+            };
+            if let Some(sc) = place(&loc) {
+                let cand = (exact, k * 2 + sc);
+                if best.is_none_or(|b| cand > b) {
+                    best = Some(cand);
+                }
             }
         }
     }
     best
 }
 
+/// (sites, their files, their lines, guessed sites, weak guesses left out).
+type Sites = (usize, HashSet<String>, HashSet<account::Line>, usize, usize);
+
 /// Call or reference sites of `targets`, grouped by file: `path (n)` then `  :line Caller c:h`.
 /// A site whose target was guessed by name among several same-name definitions ends in
 /// `guess 1 of N`; one guessed among more than [`WEAK_GUESS`] is only counted. Returns (sites,
-/// their files, guessed sites, weak guesses left out).
-fn sites(
-    c: &Connection,
-    root: &std::path::Path,
-    name: &str,
-    targets: &[i64],
-    calls_only: bool,
-    lines: &mut Vec<String>,
-) -> Result<(usize, HashSet<String>, usize, usize)> {
+/// their files, their lines, guessed sites, weak guesses left out).
+fn sites(c: &Connection, root: &std::path::Path, name: &str, targets: &[i64], calls_only: bool, lines: &mut Vec<String>) -> Result<Sites> {
     let ids = targets.iter().map(i64::to_string).collect::<Vec<_>>().join(",");
     let kind = if calls_only { "AND r.kind = 'call'" } else { "" };
     let sql = format!(
@@ -204,6 +209,7 @@ fn sites(
     let mut by: BTreeMap<String, Vec<Who>> = BTreeMap::new();
     let mut seen = HashSet::new();
     let (mut n, mut guessed, mut weak) = (0, 0, 0);
+    let mut at: HashSet<(String, i64)> = HashSet::new();
     let mut imports = FileImportNames::default();
     for (path, line, src, sname, sparent, amb, recv, via, dparent, dpath, pid) in q
         .query_map([], |r| {
@@ -232,6 +238,7 @@ fn sites(
             weak += 1;
             continue;
         }
+        at.insert((path.clone(), line));
         let who = match (sname, sparent) {
             (Some(nm), Some(p)) if !p.is_empty() => format!("{p}.{nm} c:{src:x}"),
             (Some(nm), _) => format!("{nm} c:{src:x}"),
@@ -270,8 +277,11 @@ fn sites(
         }),
         lines,
     );
-    Ok((n, files, guessed, weak))
+    Ok((n, files, at, guessed, weak))
 }
+
+/// Bytes kept for the accounting line that leads `callers`, `refs` and `impact`.
+const HEAD_RESERVE: usize = 300;
 
 /// Most sites or dependents whose code an answer carries; past this, rows are locations only.
 const CODE_SITES_MAX: usize = 400;
@@ -321,7 +331,7 @@ impl<'a> SrcLines<'a> {
 }
 
 /// `line` when it names `name`, clipped to [`CODE_CHARS`] around the first mention; else None.
-fn clip_around(line: &str, name: &str) -> Option<String> {
+pub(crate) fn clip_around(line: &str, name: &str) -> Option<String> {
     let at = word_at(line, name)?;
     let chars: Vec<char> = line.chars().collect();
     if chars.len() <= CODE_CHARS {
@@ -339,7 +349,7 @@ fn clip_around(line: &str, name: &str) -> Option<String> {
 }
 
 /// Byte offset of `name` in `line` as a whole word: a call (`name(`) first, else the first.
-fn word_at(line: &str, name: &str) -> Option<usize> {
+pub(crate) fn word_at(line: &str, name: &str) -> Option<usize> {
     let w = |ch: Option<char>| ch.is_some_and(|ch| ch.is_alphanumeric() || ch == '_');
     let mut from = 0;
     let mut first = None;
@@ -377,7 +387,8 @@ fn mention_rows(root: &std::path::Path, files: &[String], name: &str) -> Vec<Str
 /// before, and a last line names the budget that shows the code, when there is one (at most
 /// 4000 tokens); a larger budget never shows less.
 fn fit_code(lines: &mut Vec<String>, budget: usize) {
-    let room = budget.clamp(32, 4000) * 4 - 64;
+    // The accounting line goes in front afterwards: room for it is kept, the same on every page.
+    let room = (budget.clamp(32, 4000) * 4).saturating_sub(64 + HEAD_RESERVE);
     let size = |v: &[String]| v.iter().map(|l| l.len() + 1).sum::<usize>();
     let full = size(lines);
     if full <= room {
@@ -393,7 +404,7 @@ fn fit_code(lines: &mut Vec<String>, budget: usize) {
         return;
     }
     // The smallest budget whose room holds the answer with code.
-    let need = (full + 64).div_ceil(4);
+    let need = (full + 64 + HEAD_RESERVE).div_ceil(4);
     // Near the top, so the first page carries it.
     plain.insert(
         plain.len().min(2),
@@ -466,104 +477,6 @@ fn weak_note(weak: usize) -> String {
         1 => ", 1 weak guess left out".into(),
         n => format!(", {n} weak guesses left out"),
     }
-}
-
-/// One line when `top`'s name occurs in more files than `listed` (its resolved sites) and its
-/// own file: `{lead}: `name` also appears in N other files; confirm with: rg -nw name`. None when
-/// the counts agree. Read from the index only (no file is opened): files with a reference of
-/// that name not resolved with certainty to another symbol, and files holding it as a whole word.
-/// With `calls_only`, a file that only names `top` as a value (a callback) still counts: what
-/// it calls through that value is unknown.
-fn completeness(
-    c: &Connection,
-    p: &Project,
-    top: &TSym,
-    listed: &HashSet<String>,
-    calls_only: bool,
-    lead: &str,
-) -> Result<(Option<String>, Vec<String>)> {
-    let files = unlisted_files(c, p.id, top, listed, calls_only)?;
-    if files.is_empty() || files.len() > MENTION_FILES {
-        return Ok(mentions(p, &top.name, &files, lead, "not resolved to it"));
-    }
-    // Files whose every mention is a comment, an import, a declaration or a string cannot hold
-    // a call: listed apart, and they do not make the answer read as incomplete.
-    let mut src = SrcLines::new(&p.root, true);
-    let (quiet, open): (Vec<String>, Vec<String>) = files.into_iter().partition(|f| {
-        src.text(f).is_some_and(|t| t.iter().filter(|l| word_at(l, &top.name).is_some()).all(|l| no_call(l.trim(), &top.name, f)))
-    });
-    let (head, mut rows) = mentions(p, &top.name, &open, lead, "not resolved to it");
-    let nq = quiet.len();
-    if nq == 0 {
-        return Ok((head, rows));
-    }
-    let s = if nq == 1 { "" } else { "s" };
-    let head = match head {
-        Some(h) => format!("{h} ({nq} more file{s} only in comments, imports, declarations or strings)"),
-        None => format!(
-            "`{}` is also named in {nq} other file{s}, only in comments, imports, declarations or strings (listed at the end); none of them is a call",
-            top.name
-        ),
-    };
-    let quiet_rows = mention_rows(&p.root, &quiet, &top.name);
-    if !quiet_rows.is_empty() {
-        rows.push("also mentioned (not calls):".into());
-        rows.extend(quiet_rows);
-    }
-    Ok((Some(head), rows))
-}
-
-/// True when the line naming `name` cannot call or pass it: a comment (whole or trailing), an
-/// import, a C-family declaration (`extern`, or a prototype with only a type before the name)
-/// or a string literal. Conservative: anything else may be a call.
-fn no_call(line: &str, name: &str, path: &str) -> bool {
-    if let Some(d) = line.strip_prefix('#') {
-        // `#define` bodies may call it; `#include`, `#if`, `# comment` do not.
-        return !d.trim_start().starts_with("define");
-    }
-    if ["//", "/*", "*", "--", "<!--"].iter().any(|p| line.starts_with(p)) {
-        return true;
-    }
-    if ["import ", "from ", "use ", "pub use ", "using ", "package ", "extern "].iter().any(|p| line.starts_with(p))
-        || line.starts_with("export {") && line.contains(" from ")
-    {
-        return true;
-    }
-    // Strip string literals, then a trailing comment; what is left must still name it.
-    let mut bare = String::with_capacity(line.len());
-    let ext = path.rsplit_once('.').map(|x| x.1);
-    // A Rust lifetime (`'a`) opens no string; a template literal (`${f()}`) may call.
-    let quotes: &[char] = if ext == Some("rs") { &['"'] } else { &['"', '\''] };
-    let mut quote: Option<char> = None;
-    let mut esc = false;
-    for ch in line.chars() {
-        match quote {
-            Some(q) => {
-                if esc {
-                    esc = false;
-                } else if ch == '\\' {
-                    esc = true;
-                } else if ch == q {
-                    quote = None;
-                    bare.push(' ');
-                }
-            }
-            None if quotes.contains(&ch) => quote = Some(ch),
-            None => bare.push(ch),
-        }
-    }
-    let hash = matches!(ext, Some("py" | "rb" | "sh" | "bash" | "pl" | "r" | "R"));
-    let cut = ["//", "/*"].iter().chain(if hash { &["#"][..] } else { &[][..] }).filter_map(|m| bare.find(m)).min();
-    let bare = &bare[..cut.unwrap_or(bare.len())];
-    let Some(at) = word_at(bare, name) else { return true };
-    // A C-family prototype: only type words before the name, a parameter list after.
-    let cfam = matches!(ext, Some("h" | "hh" | "hpp" | "hxx" | "c" | "cc" | "cpp" | "cxx"));
-    let before = bare[..at].trim();
-    const NOT_TYPES: &[&str] = &["return", "else", "case", "do", "new", "delete", "throw", "goto", "sizeof", "co_return", "co_await"];
-    cfam && !before.is_empty()
-        && bare[at + name.len()..].trim_start().starts_with('(')
-        && before.chars().all(|ch| ch.is_alphanumeric() || matches!(ch, '_' | ' ' | '\t' | '*' | '&' | ':'))
-        && !before.split(|ch: char| !(ch.is_alphanumeric() || ch == '_')).any(|w| NOT_TYPES.contains(&w))
 }
 
 /// One `may be incomplete` line when precise (SCIP) references in files `listed` leaves out go to
@@ -682,7 +595,7 @@ fn unlisted_files(c: &Connection, pid: i64, top: &TSym, listed: &HashSet<String>
 
 /// Files whose indexed symbol text holds `name` as a whole word, for a name of several parts
 /// (a single word is also a part of longer names in that index).
-fn body_paths(c: &Connection, pid: i64, name: &str) -> Result<Vec<String>> {
+pub(crate) fn body_paths(c: &Connection, pid: i64, name: &str) -> Result<Vec<String>> {
     let word: String = name.chars().filter(|ch| *ch != '_').collect::<String>().to_lowercase();
     if crate::search::ident_parts(name).len() < 2 {
         return Ok(vec![]);
@@ -730,7 +643,13 @@ pub fn run(c: &Connection, p: &Project, sym: &str, rel: &str, depth: usize, curs
         return outline_file(c, p, sym.trim_start_matches("./"), cursor, budget);
     }
     let cands = resolve(c, p.id, sym)?;
-    let Some(top) = cands.first() else { return Ok(None) };
+    let Some(top) = cands.first() else {
+        let bare = sym.split('(').next().unwrap_or(sym);
+        if sym.starts_with("c:") || bare.contains(['.', ':', '/']) {
+            return Ok(None);
+        }
+        return name_only(c, p, bare, rel, cursor, budget);
+    };
     let mut lines: Vec<String> = vec![];
     // A qualified target matched equally well by several definitions (vendored copies): say so.
     if let Some((qual, _)) = sym.split('(').next().unwrap_or(sym).rsplit_once('.')
@@ -752,6 +671,8 @@ pub fn run(c: &Connection, p: &Project, sym: &str, rel: &str, depth: usize, curs
     }
     // Rows that go last: files naming the target that the answer could not resolve.
     let mut tail: Vec<String> = vec![];
+    // The accounting of every line naming it (`callers`, `refs`, `impact`).
+    let mut ledger: Option<(HashSet<account::Line>, Vec<i64>, account::Mode, usize)> = None;
     match rel {
         "callers" | "refs" | "impact" if top.kind == crate::tsindex::FIELD => {
             // A field is no reference target: its reads and writes are not resolved, so the
@@ -791,18 +712,16 @@ pub fn run(c: &Connection, p: &Project, sym: &str, rel: &str, depth: usize, curs
             let calls = rel == "callers" && is_callable_kind(&top.kind);
             lines.push(format!("{rel} of {}", top.row()));
             let at = lines.len();
-            let (n, files, guessed, weak) = sites(c, &p.root, &top.name, &[top.id], calls, &mut lines)?;
+            let (n, files, at_lines, guessed, weak) = sites(c, &p.root, &top.name, &[top.id], calls, &mut lines)?;
             let g = if guessed > 0 { format!(", {guessed} guessed by name") } else { String::new() } + &weak_note(weak);
             lines.insert(at, format!("{n} {} in {} files{g}", if calls { "call sites" } else { "refs" }, files.len()));
-            let (head, rows) = completeness(c, p, top, &files, calls, "may be incomplete")?;
-            if let Some(l) = head {
-                lines.insert(at + 1, l);
-                tail.extend(rows);
-            } else if weak > 0 {
+            if weak > 0 {
                 lines.insert(at + 1, format!("may be incomplete: {}", weak_left_out(weak)));
             } else if let Some(l) = dispatched_elsewhere(c, p.id, top, &files)? {
                 lines.insert(at + 1, l);
             }
+            let mode = if calls { account::Mode::Calls } else { account::Mode::Refs };
+            ledger = Some((at_lines, vec![], mode, guessed));
         }
         "callees" => {
             let mut q = c.prepare_cached(&format!(
@@ -857,7 +776,10 @@ pub fn run(c: &Connection, p: &Project, sym: &str, rel: &str, depth: usize, curs
                 lines.push(format!("{}\t{}", i + 1, clip(l, 220)));
             }
         }
-        "impact" => impact(c, p, top, depth, &mut lines, &mut tail)?,
+        "impact" => {
+            let (d1, implementations) = impact(c, p, top, depth, &mut lines)?;
+            ledger = Some((d1, implementations, account::Mode::Impact, 0));
+        }
         "overrides" if is_callable_kind(&top.kind) => method_overrides(c, p.id, top, &mut lines)?,
         "conforms" | "subtypes" | "extensions" | "overrides" => {
             // Supertype references (`reference.implementation` / `reference.class`) resolved to this type.
@@ -876,6 +798,31 @@ pub fn run(c: &Connection, p: &Project, sym: &str, rel: &str, depth: usize, curs
     if matches!(rel, "callers" | "refs" | "impact") {
         fit_code(&mut lines, budget);
     }
+    if let Some((at_lines, linked, mode, guessed)) = ledger {
+        let l = account::account(c, p, &top.name, Some(top), &at_lines, &linked, mode)?;
+        lines.insert(0, l.head(guessed).unwrap_or_else(|| format!("no line names `{}` in the indexed code", top.name)));
+        ledger_rows(&mut lines, &l);
+    }
+    Ok(Some(page(&lines, cursor, budget)))
+}
+
+/// The ledger's few listed rows (imports, declarations, some unresolved lines), before the
+/// answer's last line.
+fn ledger_rows(lines: &mut Vec<String>, l: &account::Ledger) {
+    let rows = l.tail();
+    let at = lines.len().saturating_sub(1);
+    lines.splice(at..at, rows);
+}
+
+/// No definition of `name` is indexed: when grep would find it, the lines naming it, by group.
+fn name_only(c: &Connection, p: &Project, name: &str, rel: &str, cursor: usize, budget: usize) -> Result<Option<String>> {
+    if !matches!(rel, "callers" | "refs" | "impact") {
+        return Ok(None);
+    }
+    let l = account::account(c, p, name, None, &HashSet::new(), &[], account::Mode::Name)?;
+    let Some(head) = l.head(0) else { return Ok(None) };
+    let mut lines = vec![head, format!("{rel} of `{name}`: no indexed definition"), "~ tree-sitter, by name".to_string()];
+    ledger_rows(&mut lines, &l);
     Ok(Some(page(&lines, cursor, budget)))
 }
 
@@ -974,7 +921,8 @@ fn merge_disp(a: &mut Disp, b: Disp) {
 /// makes its file a dependent; it has no symbol to expand further. Lines starting `partial` say
 /// where the answer may be missing something: names used in files it does not list, dependents
 /// found only through name guesses, or a walk that stopped early.
-fn impact(c: &Connection, p: &Project, top: &TSym, depth: usize, lines: &mut Vec<String>, tail: &mut Vec<String>) -> Result<()> {
+/// Returns the lines its d1 rows stand for and the implementations it lists at d1.
+fn impact(c: &Connection, p: &Project, top: &TSym, depth: usize, lines: &mut Vec<String>) -> Result<(HashSet<account::Line>, Vec<i64>)> {
     let (pid, root) = (p.id, p.root.as_path());
     let mut guess: HashMap<i64, Guess> = HashMap::from([(top.id, None)]);
     let mut top_seen: HashSet<String> = HashSet::new();
@@ -1011,6 +959,8 @@ fn impact(c: &Connection, p: &Project, top: &TSym, depth: usize, lines: &mut Vec
         }
     }
     let mut d1_paths: HashSet<String> = dsp.down.iter().map(|m| m.path.clone()).collect();
+    // The lines the d1 rows stand for.
+    let mut d1_lines: HashSet<(String, i64)> = HashSet::new();
     let max = depth.clamp(1, IMPACT_MAX_DEPTH);
     let mut cut = None;
     for d in 0..max {
@@ -1073,6 +1023,7 @@ fn impact(c: &Connection, p: &Project, top: &TSym, depth: usize, lines: &mut Vec
             let via = if amb > 0 { Some(amb) } else { guess.get(&dst).copied().flatten().map(|_| 0) };
             if d == 0 {
                 d1_paths.insert(path.clone());
+                d1_lines.insert((path.clone(), line));
             }
             if src == 0 {
                 if top_seen.contains(&path) {
@@ -1158,11 +1109,6 @@ fn impact(c: &Connection, p: &Project, top: &TSym, depth: usize, lines: &mut Vec
         listed.extend(v.iter().map(|s| s.path.clone()));
     }
     let t0 = std::time::Instant::now();
-    let (head, rows) = completeness(c, p, top, &listed, false, "partial at d1")?;
-    lines.extend(head);
-    tail.extend(rows);
-    crate::tsindex::trace("impact: completeness", t0);
-    let t0 = std::time::Instant::now();
     lines.extend(guessed_elsewhere(c, pid, &syms, &guess, &listed)?);
     crate::tsindex::trace("impact: guessed elsewhere", t0);
     lines.extend(cut);
@@ -1204,7 +1150,7 @@ fn impact(c: &Connection, p: &Project, top: &TSym, depth: usize, lines: &mut Vec
             lines.extend(rows.into_iter().map(|r| r.1));
         }
     }
-    Ok(())
+    Ok((d1_lines, dsp.down.iter().map(|m| m.id).collect()))
 }
 
 /// Same-name methods `top` is dispatched with: `up`, the interface or base methods it implements
@@ -1601,38 +1547,6 @@ fn outline_file(c: &Connection, p: &Project, rel: &str, cursor: usize, budget: u
 
 #[cfg(test)]
 mod tests {
-    /// Comments, imports, declarations and strings cannot call; anything else may.
-    #[test]
-    fn non_call_lines() {
-        let n = "plan";
-        for (l, p) in [
-            ("/* plan hook */", "a.c"),
-            ("* `plan` can handle it", "a.ts"),
-            ("extern PlannedStmt *plan(Query *q);", "a.h"),
-            ("PlannedStmt *plan(Query *q, int f);", "a.h"),
-            ("static int plan(void);", "a.c"),
-            ("import { plan, other } from './x'", "a.ts"),
-            ("from x import plan", "a.py"),
-            ("use crate::x::plan;", "a.rs"),
-            ("group('plan', () => {", "a.ts"),
-            ("x = 1  # calls plan later", "a.py"),
-            ("#include \"plan.h\"", "a.c"),
-        ] {
-            assert!(super::no_call(l, n, p), "{l}");
-        }
-        for (l, p) in [
-            ("return plan(q);", "a.c"),
-            ("int x = plan(q);", "a.c"),
-            ("register_cb(plan);", "a.c"),
-            ("#define P(q) plan(q)", "a.c"),
-            ("const s = `${plan(1)}`", "a.ts"),
-            ("fn go<'a>(x: &'a str) { plan(x) }", "a.rs"),
-            ("plan(1) // plan", "a.py"),
-        ] {
-            assert!(!super::no_call(l, n, p), "{l}");
-        }
-    }
-
     /// Name resolution is the hot step of every `fox code` call. It must seek the name index, not
     /// walk every tree-sitter symbol of the project (15 ms on a 28k-symbol Kotlin app).
     #[test]

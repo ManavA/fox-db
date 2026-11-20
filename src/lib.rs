@@ -1,4 +1,5 @@
 //! foxdb: local code + memory index for Claude Code sessions.
+pub mod account;
 pub mod agents;
 pub mod bg;
 pub mod cli;

@@ -106,7 +106,7 @@ fn mcp_tool_definitions_are_frozen() {
     assert_eq!(tools, mcp::tools().to_string());
 }
 
-const FROZEN_TOOLS_HASH: &str = "0268dada10b84813";
+const FROZEN_TOOLS_HASH: &str = "3e1a740de4a3c65d";
 
 fn fnv_hex(s: &str) -> String {
     // FNV-1a 64: dependency-free and stable across platforms; collisions are irrelevant here.
