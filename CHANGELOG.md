@@ -1,6 +1,6 @@
 # Changelog
 
-## 0.2.3 (unreleased)
+## 0.2.3 (2026-11-19)
 
 First answers that were empty, wrong or padded in agent benchmark transcripts are fixed.
 

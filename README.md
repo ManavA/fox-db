@@ -53,10 +53,10 @@ the tools and hooks run twice.
 
 ## Manual install (5 minutes)
 
-You need Linux or macOS and git. Where the release has a prebuilt binary for your machine (v0.2.2:
-Linux x86_64; later releases: Linux and macOS, x86_64 and arm64), the installer downloads it with
+You need Linux or macOS and git. Where the release has a prebuilt binary for your machine (from v0.2.3:
+Linux and macOS, x86_64 and arm64; v0.2.2: Linux x86_64 only), the installer downloads it with
 curl (or wget) and checks its sha256; elsewhere you need a Rust toolchain (`cargo`) to build from
-source, which takes several minutes. No GitHub login is needed. Release tarballs after v0.2.2
+source, which takes several minutes. No GitHub login is needed. Release tarballs from v0.2.3
 also carry a GitHub build provenance attestation; to check a downloaded one, run
 `gh attestation verify foxdb-<version>-<target>.tar.gz --repo ManavA/foxdb`.
 
@@ -256,7 +256,7 @@ Measured trade-offs and open targets: [docs/benchmarks.md](docs/benchmarks.md),
 
 ## Status
 
-0.2.2, used daily by one developer on large Kotlin, Swift and Rust codebases. It is
+0.2.3, used daily by one developer on large Kotlin, Swift and Rust codebases. It is
 single-machine and single-user, the call graph outside Swift is name-resolved unless you import
 a SCIP index (treat `callers` as a lower bound), and some performance targets are still open;
 see [docs/benchmarks.md](docs/benchmarks.md) and the limitations in
