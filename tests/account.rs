@@ -56,24 +56,24 @@ fn python_lines_are_accounted_for_by_group() {
     let out = fox_code(&p, "Fetcher.fetch_page", "callers", 2000);
     assert_eq!(
         first(&out),
-        "8 lines name `fetch_page`: 1 call (1 guessed), 1 definition, 1 import, 2 in 1 same-name definition elsewhere, 2 comments, 1 in strings (may be dynamic uses); all accounted for in indexed Python code",
+        "8 lines name `fetch_page`: 1 call (1 guessed), 1 definition, 1 import, 2 in 1 same-name definition elsewhere, 2 comments, 1 in strings (may be dynamic uses); may be incomplete: 1 line reaches the target only through a guess by name (marked guess); confirm it",
         "{out}"
     );
     assert!(out.contains("callers of ~c:") && out.contains(":8 run c:"), "{out}");
-    // A complete answer lists no extra rows: the counts say it all.
-    assert!(!out.contains("import lines:") && !out.contains("lib/other.py") && !out.contains("app/run.py:6"), "{out}");
-    assert!(!out.contains("unresolved mentions") && !out.contains("may be incomplete"), "{out}");
+    // Only the guess keeps it from reading complete: comments, strings and the other class's
+    // method are counted, not listed.
+    assert!(!out.contains("lib/other.py") && !out.contains("app/run.py:6") && !out.contains("unresolved mentions"), "{out}");
     // `refs` and `impact` account for the same lines.
     let out = fox_code(&p, "Fetcher.fetch_page", "refs", 2000);
     assert!(
         first(&out).starts_with("8 lines name `fetch_page`: 1 ref (1 guessed), 1 definition,")
-            && first(&out).contains("; all accounted for in indexed "),
+            && first(&out).contains("; may be incomplete: 1 line reaches the target only through a guess by name"),
         "{out}"
     );
     let out = fox_code(&p, "Fetcher.fetch_page", "impact", 2000);
     assert!(
         first(&out).starts_with("8 lines name `fetch_page`: 1 use (d1), 1 definition,")
-            && first(&out).contains("; all accounted for in indexed "),
+            && first(&out).contains("; partial at d1: 1 line reaches the target only through a guess by name"),
         "{out}"
     );
     assert!(out.contains("impact of ~c:"), "{out}");
@@ -369,7 +369,7 @@ fn freshness_is_proven() {
     t.set_modified(std::time::SystemTime::now() + std::time::Duration::from_secs(5)).unwrap();
     drop(t);
     let out = fox_code(&p, "Fetcher.fetch_page", "callers", 2000);
-    assert!(ends_complete(&out), "touched only: {out}");
+    assert!(!first(&out).contains("stale") && first(&out).contains("guess by name"), "touched only: {out}");
     let bump = || {
         let c = db::open_rw().unwrap();
         db::bump_generation(&c).unwrap();
@@ -626,11 +626,6 @@ fn every_occurrence_on_a_line_is_covered() {
     for (what, q, rel, files) in cases {
         let (_h, _r, p) = inline_project(files);
         let out = fox_code(&p, q, rel, 2000);
-        // The call beside the import is listed either way: as a (guessed) row, or unresolved.
-        if *what == "import and call" {
-            assert!(out.contains("from other import plan; o.plan()"), "{what}: {out}");
-            continue;
-        }
         assert!(!ends_complete(&out), "{what}: {out}");
     }
 }

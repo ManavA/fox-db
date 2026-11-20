@@ -339,7 +339,8 @@ fn c_calls_resolve_across_directories_and_static_stays_file_local() {
     assert!(out.contains("~c:") && out.contains("kernel/sched/core.c:1"), "{out}");
     assert!(out.contains("3 call sites in 3 files"), "{out}");
     assert!(out.contains("kthread.c (1)") && out.contains("exec.c (1)") && out.contains("core.c (1)"), "{out}");
-    assert!(!out.contains("may be incomplete"), "{out}");
+    // Two of the calls are guesses among same-name definitions: the verdict says so.
+    assert!(out.contains("may be incomplete: 2 lines reach the target only through a guess by name"), "{out}");
     // `src` leads with the definition, not the prototype or the tools/ copy.
     let out = fox_code(&p, "wake_task", "src", 800);
     assert!(out.contains("kernel/sched/core.c:1-1"), "{out}");

@@ -107,6 +107,9 @@ pub struct Ledger {
     fresh: Fresh,
     /// (files read, files naming it) when the scan stopped at a cap.
     capped: Option<(usize, usize)>,
+    /// Resolved lines whose use of the target is only a guess by name: they keep the verdict
+    /// from reading complete.
+    guessed: usize,
     /// (file, size, mtime) of every file the scan read, and the changed-files listing it used:
     /// a cached ledger is rebuilt when either moved.
     seen: Vec<(String, u64, i64)>,
@@ -186,6 +189,8 @@ struct FileOut {
     /// Lines the answer resolves that hold another, unsettled occurrence: counted in their
     /// group instead.
     demoted: usize,
+    /// Lines the answer resolves only through a guess by name.
+    guessed: usize,
     /// Its content differs from what was indexed.
     stale: bool,
 }
@@ -227,6 +232,7 @@ fn build(
         more: 0,
         fresh: Fresh::default(),
         capped: None,
+        guessed: 0,
         seen: vec![],
         changed_sig: 0,
         checked: Mutex::new(Instant::now()),
@@ -345,6 +351,7 @@ fn build(
         }
         l.resolved += out.linked;
         l.resolved -= out.demoted.min(l.resolved);
+        l.guessed += out.guessed;
         for (n, (cat, row, same_def)) in out.lines.into_iter().enumerate() {
             *l.counts.entry(cat).or_default() += 1;
             l.same_defs += same_def as usize;
@@ -704,6 +711,10 @@ fn scan_file(cx: &Ctx, p: &Project, path: &str, raw: &[u8]) -> FileOut {
         let mut not_call = false;
         let mut import = false;
         let mut other_ref = false;
+        // A guess by name covers its occurrence for the listing, not for the verdict.
+        if resolved_line && rs.iter().any(|r| r.1 == cx.top_id) && rs.iter().filter(|r| r.1 == cx.top_id).all(|r| r.2 > 0) {
+            out.guessed += 1;
+        }
         if code_occ > covered {
             unresolved = Some(" more uses on the line");
         }
@@ -1046,6 +1057,13 @@ impl Ledger {
             format!(
                 "may be incomplete: {} it as a value, and calls through {} are not followed (rel=impact lists the code passing it)",
                 plural(k, "line passes", "lines pass"),
+                if k == 1 { "it" } else { "them" }
+            )
+        } else if self.guessed > 0 {
+            let k = self.guessed;
+            format!(
+                "{incomplete}: {} the target only through a guess by name (marked guess); confirm {}",
+                plural(k, "line reaches", "lines reach"),
                 if k == 1 { "it" } else { "them" }
             )
         } else {
