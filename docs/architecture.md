@@ -11,13 +11,13 @@ method of its struct. Fields, functions and typedefs keep their type in `meta.t`
 tags and typedef names in separate namespaces (`S:inode`, `T:irq_chip_t`). A call through a
 member (`inode->i_mapping->a_ops->bmap(...)`) stores the receiver as a type path
 (`ts_ref.rtype`, `S:inode|i_mapping|a_ops|bmap`). Its base is the declared type of a parameter,
-local or file-level variable (locals are scoped to their block or `case`), a cast, or a
-function's return type. Each field on the way gives the next type, through typedefs. Resolution
+local or file-level variable (locals are scoped to their block; parameter names of a nested prototype or cast declare nothing), a cast, or a
+function's return type. Each field on the way gives the next type, through typedefs; a typedef or field defined twice with different types gives none. Resolution
 follows the path to the member, which then is the call's target with certainty. When the
 receiver's type is unknown, the call is a guess among at most three same-name function-pointer
 members, else unresolved. It never reaches a free function or another struct's member, and a
 member is no definition that hides a free function's prototype. A function stored in a member
-(`.bmap = ext4_bmap`, `chip->irq_mask = foo_mask;`) records that member as its `ts_ref.slot`
+(`.bmap = ext4_bmap`, `chip->irq_mask = foo_mask;`) (only a function, never a type of the same name) records that member as its `ts_ref.slot`
 (negative when the member is a guess). `impact` treats it like interface dispatch: calls through
 the member reach the function, and the functions stored in a member are its first-level
 dependents. A re-parse of a C file re-scores the references that store a function in its

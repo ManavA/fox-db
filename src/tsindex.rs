@@ -286,12 +286,40 @@ fn is_ident(k: &str) -> bool {
 }
 
 /// Nodes that open a scope for parameters and locals: functions (any depth, so a lambda's
-/// parameter hides a name only inside that lambda), Python comprehensions, and C blocks, `case`
-/// arms and `for` statements (a local declared there is visible only there).
+/// parameter hides a name only inside that lambda), Python comprehensions, and C blocks and `for`
+/// statements (a local declared there is visible only there; an unbraced `case` arm is part of
+/// its `switch` block).
 fn is_scope(k: &str, c_lang: bool) -> bool {
     FN_KINDS.contains(&k)
         || matches!(k, "list_comprehension" | "set_comprehension" | "dictionary_comprehension" | "generator_expression")
-        || c_lang && matches!(k, "compound_statement" | "case_statement" | "for_statement")
+        || c_lang && matches!(k, "compound_statement" | "for_statement")
+}
+
+/// C: is the innermost parameter list among `anc` (ancestors, parent last) another declarator's
+/// (a prototype, a function-pointer variable or a cast inside a body), not the parameters of the
+/// function definition it belongs to? Its names are declared nowhere in the body.
+fn c_foreign_param(anc: &[tree_sitter::Node]) -> bool {
+    // Only a few levels up (a parameter's own declarators), so a deep tree stays linear.
+    let mut i = None;
+    for (k, a) in anc.iter().enumerate().rev().take(12) {
+        match a.kind() {
+            "parameter_list" => {
+                i = Some(k);
+                break;
+            }
+            "compound_statement" | "declaration" | "field_declaration" | "function_definition" => return false,
+            _ => {}
+        }
+    }
+    let Some(i) = i else { return false };
+    for a in anc[..i].iter().rev() {
+        match a.kind() {
+            "function_definition" => return false,
+            "function_declarator" | "pointer_declarator" | "parenthesized_declarator" | "attributed_declarator" => {}
+            _ => return true,
+        }
+    }
+    true
 }
 
 /// A name declared twice in one C scope with different types (`#ifdef` arms): no type.
@@ -349,7 +377,7 @@ fn walk_tree<'t>(root: tree_sitter::Node<'t>, src: &[u8], c_lang: bool) -> Walk<
             let file_ok = scope != 0
                 || !anc.iter().any(|a| PARAM_LISTS.contains(&a.kind()))
                     && !anc.last().is_some_and(|p| p.kind() == "assignment" && anc.iter().any(|a| a.kind() == "module"));
-            if file_ok && declares(n, &anc, src) {
+            if file_ok && !(c_lang && c_foreign_param(&anc)) && declares(n, &anc, src) {
                 scopes[scope].1.insert(name.to_string());
                 if c_lang
                     && let Some(d) = anc.iter().rev().find(|a| matches!(a.kind(), "parameter_declaration" | "declaration"))
@@ -1451,6 +1479,7 @@ fn fill_rest(tx: &Connection, sink: &Sink, pid: i64, emitted: &HashSet<i64>) -> 
 }
 
 /// A candidate definition, with what scoring needs precomputed.
+#[derive(Clone)]
 struct Cand {
     id: i64,
     path: String,
@@ -1563,40 +1592,48 @@ impl CTypes {
     }
 
     /// `t` and the types it is a typedef of, nearest first: `T:irq_chip_t` -> `S:irq_chip`. A
-    /// struct tag (`S:`) is no alias of anything.
-    fn aliases(&mut self, t: &str, fetch: &mut dyn FnMut(&str) -> Vec<CSym>) -> Vec<String> {
+    /// struct tag (`S:`) is no alias of anything. None when a typedef on the way names two
+    /// different types (two definitions of one name): the type is unknown.
+    fn aliases(&mut self, t: &str, fetch: &mut dyn FnMut(&str) -> Vec<CSym>) -> Option<Vec<String>> {
         let mut out = vec![t.to_string()];
         for _ in 0..C_ALIAS_STEPS {
             let cur = out.last().cloned().unwrap_or_default();
             let Some(name) = cur.strip_prefix("T:") else { break };
             self.load(name, fetch);
-            let next = self.named.get(name).and_then(|v| v.iter().find(|(k, t)| k == "type" && t.is_some())).and_then(|x| x.1.clone());
-            match next {
+            let targets: HashSet<&String> =
+                self.named.get(name).into_iter().flatten().filter(|(k, _)| k == "type").filter_map(|(_, t)| t.as_ref()).collect();
+            if targets.len() > 1 {
+                return None;
+            }
+            match targets.into_iter().next().cloned() {
                 Some(n) if !out.contains(&n) => out.push(n),
                 _ => break,
             }
         }
-        out
+        Some(out)
     }
 
-    /// Members named `name` of type `t` (through its typedefs).
-    fn members(&mut self, t: &str, name: &str, fetch: &mut dyn FnMut(&str) -> Vec<CSym>) -> Vec<CSym> {
+    /// Members named `name` of type `t` (through its typedefs). None when the type is unknown.
+    fn members(&mut self, t: &str, name: &str, fetch: &mut dyn FnMut(&str) -> Vec<CSym>) -> Option<Vec<CSym>> {
         self.load(name, fetch);
-        for t in self.aliases(t, fetch) {
+        for t in self.aliases(t, fetch)? {
             if let Some(m) = self.member.get(&(t, name.to_string())) {
-                return m.clone();
+                return Some(m.clone());
             }
         }
-        vec![]
+        Some(vec![])
     }
 
     /// The type of field `name` read from a value of type `t`; with `t` unknown (or not found),
-    /// the one type every field of that name has.
+    /// the one type every field of that name has. A struct defined twice whose field of that
+    /// name has two types gives none.
     fn field_type(&mut self, t: Option<&str>, name: &str, fetch: &mut dyn FnMut(&str) -> Vec<CSym>) -> Option<String> {
-        if let Some(t) = t
-            && let Some(f) = self.members(t, name, fetch).first()
-        {
-            return f.ty.clone();
+        if let Some(t) = t {
+            let m = self.members(t, name, fetch)?;
+            if !m.is_empty() {
+                let tys: HashSet<&Option<String>> = m.iter().map(|f| &f.ty).collect();
+                return if tys.len() == 1 { m[0].ty.clone() } else { None };
+            }
         }
         self.load(name, fetch);
         match self.field_tys.get(name).map(Vec::as_slice) {
@@ -1624,7 +1661,7 @@ impl CTypes {
             ty = self.field_type(ty.as_deref(), m, fetch);
         }
         if let Some(t) = &ty {
-            let m = self.members(t, last, fetch);
+            let m = self.members(t, last, fetch).unwrap_or_default();
             if !m.is_empty() {
                 let mut ids: Vec<i64> = m.iter().filter(|s| s.fnptr).map(|s| s.id).collect();
                 ids.sort_unstable();
@@ -2280,19 +2317,21 @@ pub(crate) fn resolve_scoped_c(
             }
             // C type paths through a changed type: by their base (a function's return value)
             // through the index, by a field on the way through a scan of the paths alone.
+            // No `INDEXED BY`: a store may lack the index (see `db::migrate`), then it scans.
             let mut rowids: Vec<i64> = vec![];
-            let mut by_base = tx.prepare_cached(
-                "SELECT rowid FROM ts_ref INDEXED BY ts_ref_rtype WHERE project_id = ?1 AND rtype IS NOT NULL AND rtype >= ?2 AND rtype < ?3",
-            )?;
             let mut funcs: Vec<&String> = c.funcs.iter().collect();
             funcs.sort();
-            for f in funcs {
-                rowids.extend(by_base.query_map(params![pid, format!("F:{f}|"), format!("F:{f}}}")], |r| r.get::<_, i64>(0))?.flatten());
+            if !funcs.is_empty() {
+                let mut by_base = tx.prepare_cached(
+                    "SELECT rowid FROM ts_ref WHERE project_id = ?1 AND rtype IS NOT NULL AND rtype >= ?2 AND rtype < ?3",
+                )?;
+                for f in funcs {
+                    rowids
+                        .extend(by_base.query_map(params![pid, format!("F:{f}|"), format!("F:{f}}}")], |r| r.get::<_, i64>(0))?.flatten());
+                }
             }
             if c.all || !c.fields.is_empty() {
-                let mut q = tx.prepare_cached(
-                    "SELECT rowid, rtype FROM ts_ref INDEXED BY ts_ref_rtype WHERE project_id = ?1 AND rtype IS NOT NULL",
-                )?;
+                let mut q = tx.prepare_cached("SELECT rowid, rtype FROM ts_ref WHERE project_id = ?1 AND rtype IS NOT NULL")?;
                 let touches = |t: &str| c.all || t.split('|').any(|seg| c.fields.contains(seg.split_once(':').map_or(seg, |x| x.1)));
                 rowids.extend(
                     q.query_map([pid], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?)))?
@@ -2463,7 +2502,14 @@ pub(crate) fn resolve_scoped_c(
                 let (d, a) = c_member_score(c);
                 return (d, a, 0);
             }
-            let (d, a) = score(r, cands.get(&r.name).map(Vec::as_slice).unwrap_or(&[]), imports.get(&r.path));
+            let all = cands.get(&r.name).map(Vec::as_slice).unwrap_or(&[]);
+            // A value stored in a member (`x->f = name`, `.f = name`) is a function or nothing.
+            let (d, a) = if r.rtype.is_some() && r.kind == "ref" {
+                let callable: Vec<Cand> = all.iter().filter(|s| is_callable_kind(&s.kind)).cloned().collect();
+                score(r, &callable, imports.get(&r.path))
+            } else {
+                score(r, all, imports.get(&r.path))
+            };
             let slot = c.filter(|_| d != 0).map_or(0, c_slot_id);
             (d, a, slot)
         })

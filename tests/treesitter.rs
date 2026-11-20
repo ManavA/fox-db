@@ -1991,3 +1991,101 @@ fn c_uncertain_member_stores_are_guesses() {
         assert!(row.contains("guess") && row.contains(" via "), "{f}: {out}");
     }
 }
+
+/// A store that reached schema 23 without the type-path index (an earlier build of it) still
+/// indexes: opening it adds the index, and a missing one never stops a run.
+#[test]
+fn indexing_works_without_the_type_path_index() {
+    let _g = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    let (_h, repo, p) = inline_project(&[
+        ("web/a.ts", "export function a() { return 1 }\n"),
+        ("c/ops.h", "struct o_ops {\n\tint (*op)(int);\n};\nstruct w {\n\tstruct o_ops *ops;\n};\n"),
+        ("c/use.c", "#include \"ops.h\"\nint u(struct w *x) { return x->ops->op(1); }\n"),
+    ]);
+    let mut c = db::open_rw().unwrap();
+    c.execute_batch("DROP INDEX ts_ref_rtype;").unwrap();
+    std::fs::write(repo.path().join("web/a.ts"), "export function a() { return 2 }\n").unwrap();
+    std::fs::write(repo.path().join("c/ops.h"), "struct o_ops {\n\tint (*op)(long);\n};\nstruct w {\n\tstruct o_ops *ops;\n\tint n;\n};\n")
+        .unwrap();
+    inventory::index_project(&mut c, &p).unwrap();
+    assert_eq!(tsindex::index_project(&mut c, &p).unwrap().parsed, 2);
+    c.execute_batch("DROP INDEX IF EXISTS ts_ref_rtype; PRAGMA user_version = 23;").unwrap();
+    drop(c);
+    let c = db::open_rw().unwrap();
+    let n: i64 = c.query_row("SELECT COUNT(*) FROM sqlite_master WHERE name = 'ts_ref_rtype'", [], |r| r.get(0)).unwrap();
+    assert_eq!(n, 1);
+}
+
+/// A typedef name or a field defined twice with different types has no known type: a member call
+/// through it is a guess, not certain to the first definition.
+#[test]
+fn c_conflicting_type_definitions_leave_member_calls_guessed() {
+    let _g = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    let (_h, _r, p) = inline_project(&[
+        ("ops.h", "struct a_ops {\n\tint (*op)(int);\n};\nstruct b_ops {\n\tint (*op)(int);\n};\n"),
+        ("d1/t.h", "typedef struct a_ops ops_t;\nstruct h {\n\tstruct a_ops *ops;\n};\n"),
+        ("d2/t.h", "typedef struct b_ops ops_t;\nstruct h {\n\tstruct b_ops *ops;\n};\n"),
+        ("u.c", "int u(ops_t *x) { return x->op(1); }\nint v(struct h *p) { return p->ops->op(2); }\n"),
+    ]);
+    for t in ["a_ops.op", "b_ops.op"] {
+        let out = fox_code(&p, t, "callers", 4000);
+        assert!(out.contains(" call sites in ") && certain_calls(&out) == 0, "{t}: {out}");
+    }
+}
+
+/// Parameter names of a prototype, a function-pointer local or a cast inside a body are no locals
+/// of the body: they never shadow the function's own parameter.
+#[test]
+fn c_nested_parameter_names_do_not_shadow_the_functions_own() {
+    let _g = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    let (_h, _r, p) = inline_project(&[
+        ("ops.h", "struct foo {\n\tint (*run)(int);\n};\nstruct bar {\n\tint (*run)(int);\n};\n"),
+        (
+            "f.c",
+            "int f(struct foo *x)\n{\n\tint (*cb)(struct bar *x) = 0;\n\textern int h(struct bar *x);\n\tvoid *q = (void *)(int (*)(struct bar *x))0;\n\treturn x->run(1);\n}\n",
+        ),
+    ]);
+    let out = fox_code(&p, "foo.run", "callers", 4000);
+    assert!(resolved(&out).contains("1 call sites in 1 files") && certain_calls(&out) == 1, "{out}");
+    let out = fox_code(&p, "bar.run", "callers", 4000);
+    assert!(resolved(&out).contains("0 call sites"), "{out}");
+}
+
+/// A value stored in a member (`create->node = node;`) is a function or nothing: never a struct,
+/// enum or type that happens to share its name.
+#[test]
+fn c_member_stores_reach_only_callables() {
+    let _g = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    let (_h, _r, p) = inline_project(&[
+        ("t.h", "struct node {\n\tint a;\n};\nstruct kci {\n\tint node;\n\tint (*fn)(int);\n};\n"),
+        (
+            "k.c",
+            "#include \"t.h\"\nvoid g(struct kci *create)\n{\n\tcreate->node = node;\n}\nstatic struct kci k = {\n\t.node = node,\n};\n",
+        ),
+    ]);
+    let c = db::open_ro().unwrap();
+    let n: i64 = c
+        .query_row(
+            "SELECT COUNT(*) FROM ts_ref r JOIN node n ON n.id = r.dst WHERE r.project_id = ?1 AND r.name = 'node' AND r.dst != 0",
+            [p.id],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(n, 0);
+}
+
+/// A local declared in an unbraced `case` arm belongs to the whole `switch` block: later arms
+/// see it with its type.
+#[test]
+fn c_unbraced_case_locals_reach_later_arms() {
+    let _g = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    let (_h, _r, p) = inline_project(&[
+        ("ops.h", "struct a_ops {\n\tint (*op)(int);\n};\nstruct b_ops {\n\tint (*op)(int);\n};\n"),
+        (
+            "sw.c",
+            "int g(int k)\n{\n\tswitch (k) {\n\tcase 1:\n\t\t;\n\t\tstruct a_ops *y = 0;\n\t\ty->op(3);\n\t\tbreak;\n\tcase 2:\n\t\treturn y->op(4);\n\t}\n\treturn 0;\n}\n",
+        ),
+    ]);
+    let out = fox_code(&p, "a_ops.op", "callers", 4000);
+    assert!(resolved(&out).contains("2 call sites in 1 files") && certain_calls(&out) == 2, "{out}");
+}

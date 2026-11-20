@@ -454,6 +454,13 @@ pub(crate) fn migrate(c: &Connection) -> Result<()> {
              PRAGMA user_version = 23;",
         )?;
     }
+    if v < 24 {
+        // A store that reached schema 23 through an earlier build of it has no type-path index.
+        c.execute_batch(
+            "CREATE INDEX IF NOT EXISTS ts_ref_rtype ON ts_ref(project_id, rtype) WHERE rtype IS NOT NULL;
+             PRAGMA user_version = 24;",
+        )?;
+    }
     // Cheap when already set: the setting lives in each table's own config.
     for t in MERGE_TABLES {
         defer_merges(c, t)?;
@@ -755,7 +762,7 @@ pub fn minority(c: &Connection, ranges: &[(i64, i64)]) -> bool {
 }
 
 /// The schema version this build writes.
-pub const LATEST: i64 = 23;
+pub const LATEST: i64 = 24;
 
 /// Read-only connection for the hot paths. None if the store does not exist yet.
 pub fn open_ro() -> Option<Connection> {
