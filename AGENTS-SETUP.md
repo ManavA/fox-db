@@ -151,13 +151,17 @@ adds two settings to its entry:
 mkdir -p ~/.codex
 [ ! -f ~/.codex/config.toml ] || [ -f ~/.codex/config.toml.foxdb-backup ] || cp ~/.codex/config.toml ~/.codex/config.toml.foxdb-backup
 codex mcp add foxdb -- "$HOME/.foxdb/bin/fox" mcp
-grep -q '"FOXDB_SESSION"' ~/.codex/config.toml || sed -i '/^\[mcp_servers\.foxdb\]$/a env_vars = ["FOXDB_AGENT", "FOXDB_PARENT", "FOXDB_HOME", "FOXDB_SESSION"]\ntool_timeout_sec = 60' ~/.codex/config.toml
+grep -q '"FOXDB_SESSION"' ~/.codex/config.toml || {
+  awk '{ print } $0 == "[mcp_servers.foxdb]" { print "env_vars = [\"FOXDB_AGENT\", \"FOXDB_PARENT\", \"FOXDB_HOME\", \"FOXDB_SESSION\"]"; print "tool_timeout_sec = 60" }' \
+    ~/.codex/config.toml > ~/.codex/config.toml.foxdb-new &&
+  cat ~/.codex/config.toml.foxdb-new > ~/.codex/config.toml && rm ~/.codex/config.toml.foxdb-new
+}
 codex mcp get foxdb
 ```
 
 The `env_vars` line forwards the agent identity variables (Codex passes a server only the
 variables it names); `tool_timeout_sec = 60` covers `fox_memory op=wait`, which returns within
-50 s. On macOS use `sed -i ''` instead of `sed -i`.
+50 s. The edit uses awk rather than `sed -i`, whose syntax differs between Linux and macOS.
 
 ### opencode
 

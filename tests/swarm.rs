@@ -15,11 +15,11 @@ out=""; prev=""
 for a in "$@"; do [ "$prev" = "-o" ] && out="$a"; prev="$a"; done
 prompt=$(cat)
 printf '%s\n' "$prompt" > "$STUB_LOG/prompt-$FOXDB_AGENT"
-echo "start $FOXDB_AGENT $(date +%s%N)" >> "$STUB_LOG/times"
+echo "start $FOXDB_AGENT $(perl -MTime::HiRes=time -e 'printf "%.0f", time() * 1e9')" >> "$STUB_LOG/times"
 nap="$STUB_SLEEP"
 case "$0" in *claude) [ -n "$STUB_SLEEP_CLAUDE" ] && nap="$STUB_SLEEP_CLAUDE";; esac
 [ -n "$nap" ] && sleep "$nap"
-echo "end $FOXDB_AGENT $(date +%s%N)" >> "$STUB_LOG/times"
+echo "end $FOXDB_AGENT $(perl -MTime::HiRes=time -e 'printf "%.0f", time() * 1e9')" >> "$STUB_LOG/times"
 case "$prompt" in *"$STUB_FAIL"*) [ -n "$STUB_FAIL" ] && exit 1;; esac
 st=done
 case "$prompt" in *"$STUB_REJECT"*) [ -n "$STUB_REJECT" ] && st=blocked;; esac
@@ -307,11 +307,30 @@ fn wait_log(e: &Env, prefix: &str, n: usize) {
     }
 }
 
-/// User plus system CPU ticks a process has used so far.
+/// User plus system CPU time a process has used so far, in hundredths of a second.
+#[cfg(target_os = "linux")]
 fn cpu_ticks(pid: u32) -> u64 {
+    // Fields 14 and 15 of /proc/<pid>/stat, in clock ticks (100 a second on Linux).
     let s = fs::read_to_string(format!("/proc/{pid}/stat")).unwrap();
     let f: Vec<&str> = s.rsplit_once(')').unwrap().1.split_whitespace().collect();
     f[11].parse::<u64>().unwrap() + f[12].parse::<u64>().unwrap()
+}
+
+/// User plus system CPU time a process has used so far, in hundredths of a second, from
+/// `ps -o time=` (`[[dd-]hh:]mm:ss.cc` on macOS and the BSDs).
+#[cfg(not(target_os = "linux"))]
+fn cpu_ticks(pid: u32) -> u64 {
+    let out = std::process::Command::new("ps").args(["-o", "time=", "-p", &pid.to_string()]).output().unwrap();
+    let t = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    let (rest, days) = match t.split_once('-') {
+        Some((d, r)) => (r.to_string(), d.parse::<u64>().unwrap()),
+        None => (t.clone(), 0),
+    };
+    let mut secs = 0.0f64;
+    for part in rest.split(':') {
+        secs = secs * 60.0 + part.parse::<f64>().unwrap_or_else(|_| panic!("ps time {t:?}"));
+    }
+    ((days as f64 * 86_400.0 + secs) * 100.0).round() as u64
 }
 
 #[test]

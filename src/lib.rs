@@ -24,6 +24,7 @@ pub mod memcheck;
 pub mod orch;
 pub mod outbox;
 pub mod packet;
+pub mod procinfo;
 pub mod project;
 pub mod query;
 pub mod redact;

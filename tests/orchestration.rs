@@ -630,32 +630,32 @@ fn call(id: i64, args: serde_json::Value) -> serde_json::Value {
     json!({"jsonrpc":"2.0","id":id,"method":"tools/call","params":{"name":"fox_memory","arguments":args}})
 }
 
+/// A process that runs its arguments as a child and waits, standing in for a harness: not a
+/// shell (those never stand for an agent), and on every platform (`timeout` is GNU coreutils).
+const HARNESS: &[&str] = &["perl", "-e", "exit(system(@ARGV) >> 8)"];
+
 #[test]
 fn sessions_without_foxdb_agent_get_their_own_identity() {
     let _g = SERIAL.lock().unwrap_or_else(|x| x.into_inner());
     let e = setup();
     let req = handle_in(&ok(&e, &["mem", "post", "Do the thing", "--kind", "request"], &[]));
-    // Two Claude sessions (each `timeout` stands in for its harness process), same client name.
+    // Two Claude sessions (each `HARNESS` process stands in for its harness), same client name.
     let a = mcp(
         &e,
-        &["timeout", "30"],
+        HARNESS,
         &[],
         &[init("claude-code"), call(1, json!({"op":"take","id":req})), call(2, json!({"op":"post","text":"A found it"}))],
     );
     assert!(a[1].starts_with("claimed"), "{a:?}");
-    let b = mcp(
-        &e,
-        &["timeout", "30"],
-        &[],
-        &[init("claude-code"), call(1, json!({"op":"take","id":req})), call(2, json!({"op":"read","since":"auto"}))],
-    );
+    let b =
+        mcp(&e, HARNESS, &[], &[init("claude-code"), call(1, json!({"op":"take","id":req})), call(2, json!({"op":"read","since":"auto"}))]);
     assert!(b[1].contains("already_taken"), "second session took it too: {b:?}");
     assert!(b[2].contains("A found it"), "A's post hidden from B: {b:?}");
-    // The CLI: two shells (two `timeout` parents) are two takers.
+    // The CLI: two shells (two `HARNESS` parents) are two takers.
     let req2 = handle_in(&ok(&e, &["mem", "post", "Another", "--kind", "request"], &[]));
-    let take = |w: &str| {
-        let mut c = env_cmd(&e, "timeout", e.repo.path());
-        c.args([w, FOX, "handoff", "take", &req2]);
+    let take = |_: &str| {
+        let mut c = env_cmd(&e, HARNESS[0], e.repo.path());
+        c.args(&HARNESS[1..]).args([FOX, "handoff", "take", &req2]);
         String::from_utf8_lossy(&c.output().unwrap().stdout).into_owned()
     };
     assert!(take("30").starts_with("claimed"));
@@ -666,7 +666,7 @@ fn sessions_without_foxdb_agent_get_their_own_identity() {
     let script = format!("{FOX} hook session-start --harness claude < '{}' > /dev/null; {FOX} mcp", hook_in.display());
     let r = mcp(
         &e,
-        &["timeout", "30", "sh", "-c", &script],
+        &[HARNESS, &["sh", "-c", &script]].concat(),
         &[],
         &[init("claude-code"), call(1, json!({"op":"post","text":"from the hooked session"}))],
     );
