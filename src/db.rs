@@ -428,6 +428,16 @@ pub(crate) fn migrate(c: &Connection) -> Result<()> {
              PRAGMA user_version = 21;",
         )?;
     }
+    if v < 22 {
+        // 0.2.3: a call through a module, another type's value or an unrelated receiver no
+        // longer resolves with certainty to a same-name definition of its own file. Every
+        // project's references re-score once.
+        c.execute_batch(
+            "INSERT OR REPLACE INTO meta(k, v)
+               SELECT 'rescore:' || p.id, 1 FROM project p WHERE EXISTS (SELECT 1 FROM ts_ref r WHERE r.project_id = p.id);
+             PRAGMA user_version = 22;",
+        )?;
+    }
     // Cheap when already set: the setting lives in each table's own config.
     for t in MERGE_TABLES {
         defer_merges(c, t)?;
@@ -729,7 +739,7 @@ pub fn minority(c: &Connection, ranges: &[(i64, i64)]) -> bool {
 }
 
 /// The schema version this build writes.
-pub const LATEST: i64 = 21;
+pub const LATEST: i64 = 22;
 
 /// Read-only connection for the hot paths. None if the store does not exist yet.
 pub fn open_ro() -> Option<Connection> {

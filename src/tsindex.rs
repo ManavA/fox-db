@@ -1518,8 +1518,16 @@ fn score(r: &RefRow, cands: &[Cand], imp: Option<&FileImports>) -> (i64, i64) {
         // A value (not a call) through any receiver inside the candidate's own type
         // (`connect(o.spider_opened)` in a method of that type) counts as its own too.
         let own_receiver = via.is_some_and(|v| SELF_NAMES.contains(&v) || via_match(v, &s.parent) == 20)
-            || !call && s.pid != 0 && s.pid == r.caller_parent;
-        let same_file = s.path == r.path && !(r.recv && member && (dynamic || !call) && !own_receiver);
+            || !call && s.pid != 0 && s.pid == r.caller_parent
+            // Go: a method's receiver parameter (`func (s *Server) a() { s.b() }`), or a local
+            // value, reaching a method of its own file.
+            || fam == "go" && r.recv_local;
+        // Through a receiver or qualifier, a same-file definition is certain only through its
+        // own: a member through `self`/`this`/its type or its method's receiver, a free function
+        // through nothing that names another module (`core.plan()`, `inner::plan()` are not this
+        // file's `plan`; `self::plan`, `crate::plan` are).
+        let same_file =
+            s.path == r.path && (!r.recv || if member { own_receiver } else { via.is_none_or(|v| matches!(v, "self" | "crate" | "this")) });
         // A definition inside a function is visible only inside that function; C `static` ones
         // only in their own file.
         if s.local && (s.path != r.path || !r.enclosing.contains(&s.pid)) || s.path != r.path && s.file_local || has_def && s.decl {

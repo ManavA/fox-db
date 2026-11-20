@@ -159,13 +159,14 @@ fn copy_dir(from: &Path, to: &Path) {
 /// An answer without its accounting line and the groups at its end (unresolved mentions,
 /// same-name definitions elsewhere, imports, ...): its resolved rows.
 fn resolved(out: &str) -> String {
-    const GROUPS: [&str; 6] = [
+    const GROUPS: [&str; 7] = [
         "unresolved mentions",
         "references, not calls",
-        "declarations/prototypes",
+        "declarations and prototypes",
         "same-name definitions elsewhere",
-        "imports",
-        "comments/strings",
+        "import lines",
+        "comment lines",
+        "strings (may be dynamic uses)",
     ];
     out.lines().skip(1).take_while(|l| !GROUPS.iter().any(|g| l.starts_with(g))).map(|l| format!("{l}\n")).collect()
 }
@@ -427,12 +428,10 @@ fn non_call_mentions_do_not_read_as_incomplete() {
     ]);
     let out = fox_code(&p, "plan_query", "callers", 800);
     assert!(!out.contains("may be incomplete"), "{out}");
-    assert!(
-        out.starts_with("8 lines name `plan_query`: 1 call, 1 definition, 2 imports, 4 comments/strings; all accounted for\n"),
-        "{out}"
-    );
-    assert!(out.contains("import lines:\n  include/proto.h:3 | #include \"plan_query.h\"\n  web/names.ts:1 |"), "{out}");
-    assert!(out.contains("comments and strings:\n  include/proto.h:1 | /* see plan_query */"), "{out}");
+    assert!(out.starts_with("6 lines name `plan_query`: 1 call, 1 definition, 1 import, 3 comments; all accounted for\n"), "{out}");
+    // Files of another language (web/names.ts) are not counted.
+    assert!(out.contains("import lines:\n  include/proto.h:3 | #include \"plan_query.h\"\n") && !out.contains("web/names.ts"), "{out}");
+    assert!(out.contains("comment lines:\n  include/proto.h:1 | /* see plan_query */"), "{out}");
     let out = fox_code(&p, "plan_query", "impact", 800);
     assert!(!out.contains("partial"), "{out}");
     // A line that may call it reads as incomplete; the others are still accounted for.

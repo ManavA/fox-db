@@ -280,6 +280,9 @@ fn sites(c: &Connection, root: &std::path::Path, name: &str, targets: &[i64], ca
     Ok((n, files, at, guessed, weak))
 }
 
+/// Bytes kept for the accounting line that leads `callers`, `refs` and `impact`.
+const HEAD_RESERVE: usize = 300;
+
 /// Most sites or dependents whose code an answer carries; past this, rows are locations only.
 const CODE_SITES_MAX: usize = 400;
 /// Longest code shown on a row.
@@ -384,7 +387,8 @@ fn mention_rows(root: &std::path::Path, files: &[String], name: &str) -> Vec<Str
 /// before, and a last line names the budget that shows the code, when there is one (at most
 /// 4000 tokens); a larger budget never shows less.
 fn fit_code(lines: &mut Vec<String>, budget: usize) {
-    let room = budget.clamp(32, 4000) * 4 - 64;
+    // The accounting line goes in front afterwards: room for it is kept, the same on every page.
+    let room = (budget.clamp(32, 4000) * 4).saturating_sub(64 + HEAD_RESERVE);
     let size = |v: &[String]| v.iter().map(|l| l.len() + 1).sum::<usize>();
     let full = size(lines);
     if full <= room {
@@ -400,7 +404,7 @@ fn fit_code(lines: &mut Vec<String>, budget: usize) {
         return;
     }
     // The smallest budget whose room holds the answer with code.
-    let need = (full + 64).div_ceil(4);
+    let need = (full + 64 + HEAD_RESERVE).div_ceil(4);
     // Near the top, so the first page carries it.
     plain.insert(
         plain.len().min(2),
@@ -668,7 +672,7 @@ pub fn run(c: &Connection, p: &Project, sym: &str, rel: &str, depth: usize, curs
     // Rows that go last: files naming the target that the answer could not resolve.
     let mut tail: Vec<String> = vec![];
     // The accounting of every line naming it (`callers`, `refs`, `impact`).
-    let mut ledger: Option<account::Ledger> = None;
+    let mut ledger: Option<(HashSet<account::Line>, Vec<i64>, account::Mode, usize)> = None;
     match rel {
         "callers" | "refs" | "impact" if top.kind == crate::tsindex::FIELD => {
             // A field is no reference target: its reads and writes are not resolved, so the
@@ -717,9 +721,7 @@ pub fn run(c: &Connection, p: &Project, sym: &str, rel: &str, depth: usize, curs
                 lines.insert(at + 1, l);
             }
             let mode = if calls { account::Mode::Calls } else { account::Mode::Refs };
-            let mut l = account::account(c, p, &top.name, Some(top), &at_lines, &[], mode)?;
-            l.set_guessed(guessed);
-            ledger = Some(l);
+            ledger = Some((at_lines, vec![], mode, guessed));
         }
         "callees" => {
             let mut q = c.prepare_cached(&format!(
@@ -776,7 +778,7 @@ pub fn run(c: &Connection, p: &Project, sym: &str, rel: &str, depth: usize, curs
         }
         "impact" => {
             let (d1, implementations) = impact(c, p, top, depth, &mut lines)?;
-            ledger = Some(account::account(c, p, &top.name, Some(top), &d1, &implementations, account::Mode::Impact)?);
+            ledger = Some((d1, implementations, account::Mode::Impact, 0));
         }
         "overrides" if is_callable_kind(&top.kind) => method_overrides(c, p.id, top, &mut lines)?,
         "conforms" | "subtypes" | "extensions" | "overrides" => {
@@ -791,26 +793,45 @@ pub fn run(c: &Connection, p: &Project, sym: &str, rel: &str, depth: usize, curs
         }
         _ => bail!("unsupported --rel {rel}"),
     }
-    if let Some(h) = ledger.as_ref().and_then(account::Ledger::head) {
-        lines.insert(0, h);
-    }
     lines.extend(tail);
     lines.push("~ tree-sitter, name-resolved".into());
+    // What the code rows add when they ride along: a budget that lists the ledger's rows must
+    // hold them too.
+    let before_fit: usize = lines.iter().map(|l| l.len() + 1).sum();
     if matches!(rel, "callers" | "refs" | "impact") {
         fit_code(&mut lines, budget);
     }
-    if let Some(l) = ledger {
-        ledger_rows(&mut lines, &l, budget);
+    let code_extra = before_fit.saturating_sub(lines.iter().map(|l| l.len() + 1).sum());
+    if let Some((at_lines, linked, mode, guessed)) = ledger {
+        // A later page that ends before the groups needs no ledger: its rows are the answer's
+        // own, at the same places (the accounting line counted as the first).
+        if cursor > 0 {
+            let probe: Vec<String> = std::iter::once(String::new()).chain(lines.iter().cloned()).collect();
+            let text = page(&probe, cursor, budget);
+            let next = text.rsplit_once("cursor=").and_then(|x| x.1.trim().parse::<usize>().ok());
+            if next.is_some_and(|k| k < probe.len() - 1) {
+                return Ok(Some(text));
+            }
+        }
+        let mut l = account::account(c, p, &top.name, Some(top), &at_lines, &linked, mode)?;
+        l.set_guessed(guessed);
+        lines.insert(0, l.head().unwrap_or_else(|| format!("no line names `{}` in the indexed code", top.name)));
+        ledger_rows(&mut lines, &l, budget, code_extra);
     }
     Ok(Some(page(&lines, cursor, budget)))
 }
 
-/// The ledger's groups before the last line, trimmed to what the budget leaves (none trimmed
-/// at the largest budget: the cursor pages through them).
-fn ledger_rows(lines: &mut Vec<String>, l: &account::Ledger, budget: usize) {
+/// The ledger's groups before the last line, trimmed to what the budget leaves on the page
+/// they start (a third of a page at least).
+fn ledger_rows(lines: &mut Vec<String>, l: &account::Ledger, budget: usize, code_extra: usize) {
     let main: usize = lines.iter().map(|l| l.len() + 1).sum();
-    let room = (budget < 4000).then(|| (budget.clamp(32, 4000) * 4).saturating_sub(64 + main));
-    let rows = l.tail(room, main);
+    let page_bytes = budget.clamp(32, 4000) * 4;
+    let room = if main + 64 <= page_bytes {
+        page_bytes - 64 - main
+    } else {
+        page_bytes.saturating_sub(64 + main % page_bytes).max(page_bytes / 3)
+    };
+    let rows = l.tail(room, main + code_extra);
     let at = lines.len().saturating_sub(1);
     lines.splice(at..at, rows);
 }
@@ -823,7 +844,7 @@ fn name_only(c: &Connection, p: &Project, name: &str, rel: &str, cursor: usize, 
     let l = account::account(c, p, name, None, &HashSet::new(), &[], account::Mode::Name)?;
     let Some(head) = l.head() else { return Ok(None) };
     let mut lines = vec![head, format!("{rel} of `{name}`: no indexed definition"), "~ tree-sitter, by name".to_string()];
-    ledger_rows(&mut lines, &l, budget);
+    ledger_rows(&mut lines, &l, budget, 0);
     Ok(Some(page(&lines, cursor, budget)))
 }
 
