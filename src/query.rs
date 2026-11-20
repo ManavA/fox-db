@@ -280,12 +280,26 @@ pub fn section_text(root: &std::path::Path, rel: &str, line: i64, end: i64) -> S
 /// in `context-budget.json`.
 pub const BRIEF_TOOLS_LINE: &str = "To find or trace code here, call fox_find q=<name>, fox_graph target=<name> rel=callers|impact first, then fox_read target=<handle> for a body (Read only the lines they return); fox_memory op=recall for past decisions. CLI: fox find|code|mem";
 
+/// The brief's reads of `node` that depend on the project's size. Each must reach its rows through
+/// the (project, kind) index: a read of every row of the project (a sum over all kinds, a walk in
+/// path order to skip a sort) took about a second on a kernel-sized store, past the hook's
+/// deadline. `?1` is the project id.
+pub const BRIEF_NODE_SQL: [&str; 4] = [
+    "SELECT COUNT(*) FROM node WHERE project_id = ?1 AND kind = 'file'",
+    "SELECT COUNT(*) FROM node WHERE project_id = ?1 AND kind IN ('doc_section', 'milestone')",
+    // Open milestones: latest sections in an open state, newest first (by file order).
+    "SELECT n.id, n.name, json_extract(n.meta,'$.state'), json_extract(n.meta,'$.date'), json_extract(n.meta,'$.title'), n.path, n.line
+     FROM node n INDEXED BY node_project_kind WHERE n.project_id = ?1 AND n.kind = 'milestone' AND json_extract(n.meta,'$.pinned') = 0
+     ORDER BY n.path, n.line DESC LIMIT 400",
+    // The current gate: the pinned milestone-log section.
+    "SELECT n.id, n.path, n.line, COALESCE(n.end_line, n.line + 40) FROM node n INDEXED BY node_project_kind
+     WHERE n.project_id = ?1 AND n.kind = 'milestone' AND json_extract(n.meta, '$.pinned') = 1 ORDER BY n.id LIMIT 1",
+];
+
 pub fn brief(c: &Connection, p: &Project, branch: Option<&str>, budget: usize) -> Result<String> {
     let mut out = Out::new(budget);
-    let (files, docs): (i64, i64) =
-        c.query_row("SELECT SUM(kind='file'), SUM(kind IN ('doc_section','milestone')) FROM node WHERE project_id = ?1", [p.id], |r| {
-            Ok((r.get::<_, Option<i64>>(0)?.unwrap_or(0), r.get::<_, Option<i64>>(1)?.unwrap_or(0)))
-        })?;
+    let count = |sql: &str| -> Result<i64> { Ok(c.query_row(sql, [p.id], |r| r.get(0))?) };
+    let (files, docs) = (count(BRIEF_NODE_SQL[0])?, count(BRIEF_NODE_SQL[1])?);
     // No clocks or relative ages: the brief must be byte-identical while nothing changes.
     let idx = if p.indexed_at.is_none() { " · indexing in background" } else { "" };
     out.line(&format!("foxdb · {} ({}) · {} files, {} doc sections{}", p.name, branch.unwrap_or("no git"), files, docs, idx));
@@ -297,14 +311,8 @@ pub fn brief(c: &Connection, p: &Project, branch: Option<&str>, budget: usize) -
     out.line(BRIEF_TOOLS_LINE);
 
     // Current gate: pinned milestone-log section, first 3 meaningful lines.
-    let gate: Option<(i64, String, i64, i64)> = c
-        .query_row(
-            "SELECT n.id, n.path, n.line, COALESCE(n.end_line, n.line + 40) FROM node n
-         WHERE n.project_id = ?1 AND n.kind = 'milestone' AND json_extract(n.meta, '$.pinned') = 1 ORDER BY n.id LIMIT 1",
-            [p.id],
-            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
-        )
-        .ok();
+    let gate: Option<(i64, String, i64, i64)> =
+        c.query_row(BRIEF_NODE_SQL[3], [p.id], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?))).ok();
     if let Some((id, path, line, end)) = gate {
         let body = section_text(&p.root, &path, line, end);
         out.line(&format!("current gate ({path}:{line}, {}):", handle("milestone", id)));
@@ -344,12 +352,7 @@ pub fn brief(c: &Connection, p: &Project, branch: Option<&str>, budget: usize) -
         }
     }
 
-    // Open milestones: latest sections in an open state, newest first (by file order).
-    let mut s = c.prepare_cached(
-        "SELECT n.id, n.name, json_extract(n.meta,'$.state'), json_extract(n.meta,'$.date'), json_extract(n.meta,'$.title'), n.path, n.line
-         FROM node n WHERE n.project_id = ?1 AND n.kind = 'milestone' AND json_extract(n.meta,'$.pinned') = 0
-         ORDER BY n.path, n.line DESC LIMIT 400",
-    )?;
+    let mut s = c.prepare_cached(BRIEF_NODE_SQL[2])?;
     type Row = (i64, String, Option<String>, Option<String>, Option<String>, String, i64);
     let rows: Vec<Row> =
         s.query_map([p.id], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?, r.get(6)?)))?.flatten().collect();

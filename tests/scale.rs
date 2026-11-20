@@ -91,6 +91,42 @@ fn indexing_leaves_planner_statistics_so_per_file_deletes_use_the_path_index() {
     assert!(!plan.contains("node_sym_probe"), "per-file delete scans every project symbol: {plan}");
 }
 
+/// The session brief reads `node` only through the (project, kind) index, never every row of a
+/// project: on a kernel-sized store (millions of symbols) a sum over all kinds and a walk in path
+/// order each took about a second, so the SessionStart hook missed its deadline and said nothing.
+#[test]
+fn brief_reads_reach_their_rows_through_the_kind_index() {
+    let _g = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    let _h = home();
+    let repo = tempfile::tempdir().unwrap();
+    go_repo(repo.path());
+    let mut c = db::open_rw().unwrap();
+    let (p, _) = index(&mut c, repo.path());
+    // Many symbols and files, a few milestones, then planner statistics like an indexed store's.
+    c.execute_batch(&format!(
+        "WITH RECURSIVE n(i) AS (SELECT 0 UNION ALL SELECT i + 1 FROM n WHERE i < 30000)
+         INSERT INTO node(project_id, kind, key, name, path, line, source, meta, updated_at)
+           SELECT {pid}, CASE WHEN i % 20 = 0 THEN 'file' WHEN i % 5000 = 1 THEN 'milestone' ELSE 'symbol' END,
+                  'k' || i, 'n' || i, 'd' || (i % 300) || '/f' || i || '.c', i, 'treesitter', '{{\"pinned\":0}}', 0 FROM n;
+         ANALYZE;",
+        pid = p.id
+    ))
+    .unwrap();
+    for sql in query::BRIEF_NODE_SQL {
+        let plan: String = c
+            .prepare(&format!("EXPLAIN QUERY PLAN {sql}"))
+            .unwrap()
+            .query_map([p.id], |r| r.get::<_, String>(3))
+            .unwrap()
+            .flatten()
+            .collect::<Vec<_>>()
+            .join("; ");
+        assert!(plan.contains("node_project_kind (project_id=? AND kind=?)"), "{sql}: {plan}");
+    }
+    let b = query::brief(&c, &p, Some("main"), 400).unwrap();
+    assert!(b.contains("files, "), "{b}");
+}
+
 /// FTS5 flushes its pending terms to a new segment whenever a row's id is below the previous
 /// one (merges are deferred, see `db::fts_merge`). `fts_word` rowids are path hashes, so writing
 /// them in file order flushed a segment for about every other file, and a cold index of a large
