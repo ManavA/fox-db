@@ -237,6 +237,14 @@ fn is_live(a: &Agent, now: i64) -> bool {
     now - last <= stale_secs()
 }
 
+/// How many `running` children of `parent` are alive (see `is_live`): a session with live
+/// subagents shares its MCP server, and so its identity, with them.
+pub fn live_children(c: &Connection, parent: &str) -> usize {
+    let now = db::now();
+    let Ok(mut s) = c.prepare_cached(&format!("SELECT {COLS} FROM agent WHERE parent = ?1 AND status = 'running'")) else { return 0 };
+    s.query_map([parent], row).map(|it| it.flatten().filter(|a| is_live(a, now)).count()).unwrap_or(0)
+}
+
 /// Mark `running` agents whose process died (or whose heartbeat lapsed) as `stale`; free their
 /// leases. Returns how many changed.
 pub fn refresh(w: &Connection) -> Result<usize> {

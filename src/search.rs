@@ -818,28 +818,37 @@ fn neighbours(c: &Connection, anchor: i64, k: usize) -> Result<Vec<i64>> {
 /// [`EXPAND_CEILING`] of its best anchor (unless it already scored more). Both carry their own
 /// feature boost (tests and vendored code stay down). Deterministic: anchors are taken by score,
 /// then id; neighbours by connection count, then id.
-fn expand(c: &Connection, scored: &mut Vec<(Hit, f64)>, f: &Filter, q: &str, ident: Option<&str>) -> Result<()> {
+/// Returns, for each neighbour the walk lifted (one that did not already outscore the ceiling on
+/// its own), the anchor that bounds it, for [`keep_below_anchors`].
+fn expand(c: &Connection, scored: &mut Vec<(Hit, f64)>, f: &Filter, q: &str, ident: Option<&str>) -> Result<HashMap<i64, i64>> {
+    let mut bound: HashMap<i64, i64> = HashMap::new();
     let usable = |h: &Hit| h.kind == "symbol" && !h.path.as_deref().is_some_and(|p| is_test_path(p) || is_vendor_or_generated(p));
     let mut order: Vec<(f64, i64)> = scored.iter().filter(|(h, _)| usable(h)).map(|(h, s)| (*s, h.id)).collect();
     order.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap().then(a.1.cmp(&b.1)));
-    let Some(&(best, _)) = order.first() else { return Ok(()) };
-    // Per neighbour: the summed gain, and the best anchor that links it (its ceiling).
-    let mut gain: HashMap<i64, (f64, f64)> = HashMap::new();
+    let Some(&(best, _)) = order.first() else { return Ok(bound) };
+    // Per neighbour: the summed gain, and the best anchor that links it (score and id).
+    let mut gain: HashMap<i64, (f64, f64, i64)> = HashMap::new();
     for &(s, a) in order.iter().filter(|(s, _)| *s >= best * ANCHOR_MIN).take(EXPAND_ANCHORS) {
         for (r, nb) in neighbours(c, a, EXPAND_PER_ANCHOR)?.into_iter().enumerate() {
-            let e = gain.entry(nb).or_default();
+            let e = gain.entry(nb).or_insert((0.0, f64::MIN, 0));
             e.0 += s * W_EXPAND / (1.0 + r as f64 * 0.25);
-            e.1 = e.1.max(s);
+            // Anchors come best first, so the first to link a neighbour is its best.
+            if s > e.1 {
+                (e.1, e.2) = (s, a);
+            }
         }
     }
     let mut fresh: Vec<i64> = vec![];
     let at: HashMap<i64, usize> = scored.iter().enumerate().map(|(i, (h, _))| (h.id, i)).collect();
-    for (id, &(g, top)) in &gain {
+    for (id, &(g, top, anchor)) in &gain {
         match at.get(id) {
             Some(&i) => {
                 let own = scored[i].1;
-                let b = feature_boost(&scored[i].0, q, ident);
-                scored[i].1 = own.max((own + g * b).min(top * EXPAND_CEILING));
+                if own < top * EXPAND_CEILING {
+                    let b = feature_boost(&scored[i].0, q, ident);
+                    scored[i].1 = (own + g * b).min(top * EXPAND_CEILING);
+                    bound.insert(*id, anchor);
+                }
             }
             None => fresh.push(*id),
         }
@@ -848,12 +857,44 @@ fn expand(c: &Connection, scored: &mut Vec<(Hit, f64)>, f: &Filter, q: &str, ide
     let mut loaded = load_hits(c, &fresh, f)?;
     for id in fresh {
         if let Some(h) = loaded.remove(&id) {
-            let (g, top) = gain[&id];
+            let (g, top, anchor) = gain[&id];
             let s = g.min(top * EXPAND_CEILING) * feature_boost(&h, q, ident);
             scored.push((h, s));
+            bound.insert(id, anchor);
         }
     }
-    Ok(())
+    Ok(bound)
+}
+
+/// After same-file damping, which can lower an anchor below the neighbours it lifted: each lifted
+/// neighbour moves to just after its anchor if it came first, so expansion never puts a callee
+/// above the definition the question describes. Order is otherwise kept; a neighbour whose anchor
+/// is not shown (or a cycle of them) ends the list in its own order.
+fn keep_below_anchors(hits: Vec<Hit>, bound: &HashMap<i64, i64>) -> Vec<Hit> {
+    if bound.is_empty() {
+        return hits;
+    }
+    let mut out: Vec<Hit> = Vec::with_capacity(hits.len());
+    let mut shown: HashSet<i64> = HashSet::new();
+    let mut waiting: HashMap<i64, Vec<(usize, Hit)>> = HashMap::new();
+    let mut stack: Vec<(usize, Hit)> = vec![];
+    for (i, h) in hits.into_iter().enumerate() {
+        match bound.get(&h.id) {
+            Some(a) if !shown.contains(a) => waiting.entry(*a).or_default().push((i, h)),
+            _ => stack.push((i, h)),
+        }
+        // Emitting a hit releases what waits on it, depth first, in arrival order.
+        while let Some((_, h)) = stack.pop() {
+            shown.insert(h.id);
+            let released = waiting.remove(&h.id).unwrap_or_default();
+            out.push(h);
+            stack.extend(released.into_iter().rev());
+        }
+    }
+    let mut rest: Vec<(usize, Hit)> = waiting.into_values().flatten().collect();
+    rest.sort_by_key(|x| x.0);
+    out.extend(rest.into_iter().map(|x| x.1));
+    out
 }
 
 pub fn is_test_path(p: &str) -> bool {
@@ -1357,11 +1398,13 @@ fn ranked(
         })
         .collect();
     // A question in words folds in the neighbours of its best symbol hits (see `EXPAND_ANCHORS`).
+    let mut bound = HashMap::new();
     if cur.is_some() && route == Route::Text && matches!(o.kind, "any" | "symbol") && expansion_on() {
-        expand(c, &mut scored, &f, q, ident.as_deref())?;
+        bound = expand(c, &mut scored, &f, q, ident.as_deref())?;
         trace("search expand", t0);
     }
-    let mut hits = damp_same_file(scored, if route == Route::Text { DAMP_TEXT } else { DAMP_NAMES }, ident.as_deref());
+    let hits = damp_same_file(scored, if route == Route::Text { DAMP_TEXT } else { DAMP_NAMES }, ident.as_deref());
+    let mut hits = keep_below_anchors(hits, &bound);
     if let Some(id) = ident.as_deref()
         && route != Route::Text
         && matches!(o.kind, "any" | "symbol")

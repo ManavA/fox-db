@@ -19,6 +19,22 @@ fn client_name() -> Option<String> {
     CLIENT.get().cloned()
 }
 
+/// The identity this call would borrow when it names none and its session (or dispatched
+/// worker) has live subagents: they call through this same server, so without `agent=` a
+/// subagent and its parent and siblings are one agent.
+fn shared_identity(a: &Value) -> Option<String> {
+    if arg_s(a, "agent").is_some() {
+        return None;
+    }
+    let id = agent_id(a)?;
+    let c = db::open_ro()?;
+    (crate::agents::live_children(&c, &id) > 0).then_some(id)
+}
+
+/// Hint for a `since=me` read that cannot tell its caller from its subagents.
+pub const SHARED_READ_HINT: &str =
+    "since=me needs agent=<your name> while this session has running subagents (they share its identity); or pass since=h:N";
+
 /// The caller's agent identity: an explicit `agent` argument, else `FOXDB_AGENT` from the env the
 /// harness gave this server process (each harness spawns its own `fox mcp`), else the session it
 /// serves (see [`crate::agents::ambient_id`]): never the bare client name, which every session of
@@ -387,7 +403,12 @@ fn memory_tool(ro: Option<Connection>, a: &Value, budget: usize, cursor: usize) 
                 let w = db::open_rw()?;
                 let Some(p) = current_project(None) else { bail!("not in a project") };
                 let client = client_name();
-                let who = agent_id(a);
+                // Unnamed while subagents share this identity: tagged, so the session's own
+                // `since=me` reads (which skip its posts) still show it.
+                let who = match shared_identity(a) {
+                    Some(id) => Some(format!("{id}/unnamed")),
+                    None => agent_id(a),
+                };
                 let sess = std::env::var("FOXDB_SESSION").ok();
                 let kind = arg_s(a, "kind").unwrap_or("finding");
                 let id = crate::handoff::post(
@@ -426,6 +447,8 @@ fn memory_tool(ro: Option<Connection>, a: &Value, budget: usize, cursor: usize) 
                         let me = agent_id(a).unwrap_or_else(|| "agent".into());
                         let since = match crate::handoff::parse_handle(s) {
                             Some(n) => crate::handoff::Since::After(n),
+                            // A cursor shared with live subagents would move for all of them.
+                            None if shared_identity(a).is_some() => bail!("{SHARED_READ_HINT}"),
                             None => crate::handoff::Since::Auto(&me),
                         };
                         crate::handoff::read_since(&w, p.id, since, arg_s(a, "kind"), arg_s(a, "topic"), budget)

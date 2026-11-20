@@ -24,6 +24,9 @@ pub const ENTRY_MAX: usize = 600;
 /// Most attachments kept on one entry.
 pub const ATTACH_MAX: usize = 8;
 
+/// Longest attachment list kept on one swarm entry, in bytes: handles and paths, not text.
+pub const EVIDENCE_MAX: usize = 400;
+
 /// Longest body kept; reports are summaries, not dumps.
 pub const BODY_MAX: usize = 4_000;
 
@@ -155,6 +158,14 @@ pub fn read_since(w: &Connection, pid: i64, since: Since, kind: Option<&str>, to
     let mut shown = 0;
     for (id, l) in &rows {
         if used + l.len() + 1 > max {
+            // The first row always shows, clipped, so a row longer than the budget cannot
+            // freeze the cursor (`fox_read` of its handle gives all of it).
+            if shown == 0 {
+                text.push_str(&query::clip(l, max.saturating_sub(3)));
+                text.push('\n');
+                last = *id;
+                shown = 1;
+            }
             break;
         }
         text.push_str(l);
@@ -183,25 +194,31 @@ pub fn read_since(w: &Connection, pid: i64, since: Since, kind: Option<&str>, to
 /// An agent's first `since=auto` read: the newest rows that fit, shown oldest first, and the
 /// cursor set past everything, so a new agent sees the latest decisions instead of the oldest rows.
 fn read_newest(w: &Connection, pid: i64, me: &str, kind: Option<&str>, topic: Option<&str>, budget: usize) -> Result<String> {
+    // The cursor first, and only rows up to it: a post landing between the two reads is left for
+    // the next read instead of being skipped.
+    let last: i64 = w.query_row("SELECT COALESCE(MAX(id), 0) FROM handoff WHERE project_id = ?1", [pid], |r| r.get(0))?;
     let mut s = w.prepare_cached(
         "SELECT id, kind, title, created_at, COALESCE(agent, harness, ''), claimed_by, evidence, topic, body FROM handoff
          WHERE project_id = ?1 AND (?2 IS NULL OR kind = ?2) AND (?3 IS NULL OR topic = ?3)
-           AND (agent IS NULL OR agent != ?4) AND scope IS NOT 'snapshot'
+           AND (agent IS NULL OR agent != ?4) AND scope IS NOT 'snapshot' AND id <= ?5
          ORDER BY id DESC LIMIT 200",
     )?;
     let rows: Vec<(i64, String)> =
-        s.query_map(params![pid, kind, topic, me], |r| Ok((r.get::<_, i64>(0)?, row_line(r)?)))?.flatten().collect();
+        s.query_map(params![pid, kind, topic, me, last], |r| Ok((r.get::<_, i64>(0)?, row_line(r)?)))?.flatten().collect();
     let max = budget.max(32) * 4;
     let mut used = 0usize;
-    let mut shown: Vec<&String> = vec![];
+    let mut shown: Vec<String> = vec![];
     for (_, l) in &rows {
         if used + l.len() + 1 > max {
+            // The newest row always shows, clipped (see `read_since`).
+            if shown.is_empty() {
+                shown.push(query::clip(l, max.saturating_sub(3)));
+            }
             break;
         }
         used += l.len() + 1;
-        shown.push(l);
+        shown.push(l.clone());
     }
-    let last: i64 = w.query_row("SELECT COALESCE(MAX(id), 0) FROM handoff WHERE project_id = ?1", [pid], |r| r.get(0))?;
     let mut text = String::new();
     if shown.is_empty() {
         text.push_str("nothing new\n");
@@ -209,7 +226,7 @@ fn read_newest(w: &Connection, pid: i64, me: &str, kind: Option<&str>, topic: Op
         let _ = writeln!(text, "+{} older (fox_memory op=read)", rows.len() - shown.len());
     }
     for l in shown.into_iter().rev() {
-        text.push_str(l);
+        text.push_str(&l);
         text.push('\n');
     }
     w.execute(
@@ -252,9 +269,10 @@ fn looks_like_handle(t: &str) -> bool {
 }
 
 /// A swarm entry's attachments as handles: a known handle stays, the path of an indexed file
-/// becomes its `f:` handle (`src/a.rs` and `src/a.rs:40` alike), any other word is kept as
-/// written. Split on whitespace and commas; at most [`ATTACH_MAX`]. An unknown handle is an error
-/// when `strict` (an agent's own post) and dropped otherwise, as are unindexed words (handles
+/// becomes its `f:` handle (`src/a.rs` and `src/a.rs:40` alike), another path is kept as written, and
+/// other words are dropped. Split on whitespace and commas; at most [`ATTACH_MAX`] items and
+/// [`EVIDENCE_MAX`] bytes. Handle prefixes are case-insensitive. An unknown handle is an error
+/// when `strict` (an agent's own post) and dropped otherwise, as are unindexed paths (handles
 /// gathered from a report's prose).
 pub fn attachments(c: &Connection, pid: i64, raw: &str, strict: bool) -> Result<String> {
     let mut out: Vec<String> = vec![];
@@ -263,14 +281,19 @@ pub fn attachments(c: &Connection, pid: i64, raw: &str, strict: bool) -> Result<
         if tok.is_empty() || out.len() >= ATTACH_MAX {
             continue;
         }
-        let t = if looks_like_handle(tok) {
-            if resolve(c, tok).is_none() {
+        // `F:1A` is the handle `f:1a`.
+        let lower = tok.to_ascii_lowercase();
+        let t = if looks_like_handle(&lower) {
+            if resolve(c, &lower).is_none() {
                 if strict {
                     bail!("unknown handle {tok}: attach handles from fox_find, fox_graph or fox_read rows");
                 }
                 continue;
             }
-            tok.to_string()
+            lower
+        } else if !looks_like_path(tok) {
+            // Prose is not an attachment: it would carry content past the entry cap.
+            continue;
         } else {
             let path = tok.split(':').next().unwrap_or(tok);
             let id: Option<i64> = c
@@ -282,11 +305,18 @@ pub fn attachments(c: &Connection, pid: i64, raw: &str, strict: bool) -> Result<
                 None => continue,
             }
         };
-        if !out.contains(&t) {
+        if !out.contains(&t) && out.iter().map(|x| x.len() + 1).sum::<usize>() + t.len() <= EVIDENCE_MAX {
             out.push(t);
         }
     }
     Ok(out.join(" "))
+}
+
+/// A path or `path:line` someone may attach: no wider than a path, with a `/` or an extension.
+fn looks_like_path(t: &str) -> bool {
+    t.len() <= 200
+        && (t.contains('/')
+            || t.rsplit_once('.').is_some_and(|(a, e)| !a.is_empty() && (1..=6).contains(&e.split(':').next().unwrap_or("").len())))
 }
 
 /// Child handoffs (reports for a task, packets that continue a packet).

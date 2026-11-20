@@ -95,7 +95,8 @@ guesses, and compiler-resolved edges), callers and callees alike, eight neighbou
 most connected first. Each neighbour earns its anchor's score, less a quarter for each place
 further down the anchor's list, summed over anchors, but never more than 0.97 of the best
 anchor that links it (so the definition a question describes stays above the helpers it
-calls), then re-ranked like any hit. So "where is
+calls), then re-ranked like any hit; a neighbour the walk lifted still follows its anchor
+after same-file damping, which can lower the anchor. So "where is
 the code that does X" also returns the files the matching code calls into or is called from,
 in the same call, even when they share no words with the question. Identifiers are not
 expanded: an exact name is already answered precisely, and expanding names with no definition

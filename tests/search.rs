@@ -265,3 +265,44 @@ fn identifier_queries_are_not_expanded() {
         assert_eq!(with, without, "{q}");
     }
 }
+
+/// Expansion never lifts a helper above the definition that calls it. The definition here is the
+/// second hit in its file, so same-file damping lowers it; its callees, lifted by the walk, must
+/// still rank after it (a kubernetes question once put `TaintToleration.Filter`'s callees first).
+#[test]
+fn expansion_keeps_the_definition_above_its_callees_after_damping() {
+    let _g = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    let home = tempfile::tempdir().unwrap();
+    let repo = tempfile::tempdir().unwrap();
+    unsafe {
+        std::env::set_var("FOXDB_HOME", home.path());
+        std::env::set_var("FOXDB_CLAUDE_PROJECTS", home.path().join("no-claude"));
+    }
+    let r = repo.path();
+    write(
+        r,
+        "sched/taint.py",
+        "from sched.helpers.a import tolerates\nfrom sched.helpers.b import fits\nfrom sched.helpers.c import ready\n\n\n\
+         def scheduler_filter_nodes_by_taint_toleration(node):\n    \"\"\"Scheduler: filter nodes by taint toleration.\"\"\"\n    return 0\n\n\n\
+         def check(pod, nodes):\n    \"\"\"Filter nodes by taint toleration for the pod.\"\"\"\n    return [n for n in nodes if tolerates(pod, n) and fits(pod, n) and ready(n)]\n",
+    );
+    for (f, name) in [("a", "tolerates"), ("b", "fits"), ("c", "ready")] {
+        write(r, &format!("sched/helpers/{f}.py"), &format!("def {name}(*args):\n    return True\n"));
+    }
+    let mut c = db::open_rw().unwrap();
+    let p = project::ensure(&c, &project::locate(r)).unwrap();
+    inventory::index_project(&mut c, &p).unwrap();
+    tsindex::index_project(&mut c, &p).unwrap();
+    let p = project::find(&c, &project::locate(r)).unwrap().unwrap();
+    let e = Env { _home: home, repo, c, p };
+    let q = "where does the scheduler filter nodes by taint toleration";
+    let with = find(&e, q, "any");
+    let pos = |name: &str| with.lines().position(|l| l.contains(&format!(" {name} "))).unwrap_or_else(|| panic!("{name} missing:\n{with}"));
+    let def = pos("check");
+    for helper in ["tolerates", "fits", "ready"] {
+        assert!(pos(helper) > def, "{helper} above the definition that calls it:\n{with}");
+    }
+    let without = search::with_expansion(false, || find(&e, q, "any"));
+    let def_off = without.lines().position(|l| l.contains(" check ")).unwrap();
+    assert_eq!(def, def_off, "expansion moved the definition:\n{with}\n---\n{without}");
+}

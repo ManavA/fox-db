@@ -59,7 +59,8 @@ fox mem post <text> --topic T [--kind fact|failed|question]     fox mem read --s
 - **Swarm entries.** `fact`, `failed` (an approach that did not work, and why), `summary` and
   `question` are kinds of their own: at most 600 characters each, shown whole on their board
   row, so reading what is new costs one call. Their `evidence` holds handles: a path of an
-  indexed file becomes its `f:` handle, a handle that names nothing is refused, and
+  indexed file becomes its `f:` handle, other paths stay, other words are dropped (at most 8
+  items, 400 bytes), a handle that names nothing is refused, and
   `fox_read target=h:N` lists what each handle points at. Open questions count with decisions
   and requests in subagent briefs.
 - **Dedup** ("already sent") applies only to the CLI, per `FOXDB_SESSION` (a dispatched
@@ -85,7 +86,11 @@ repeats:
 and attribution need nothing more. A Claude Code subagent calls through its parent's MCP server,
 with the parent's environment, so the server cannot tell siblings apart: a subagent passes
 `agent=<its name>` on `op=post` and `op=read since=me`, or carries the stateless `since=h:N`. An
-explicit `agent` argument wins over `FOXDB_AGENT`.
+explicit `agent` argument wins over `FOXDB_AGENT`. While a session (or worker) has running
+subagents, a `since=me` read that names no `agent` is refused with that hint, since its cursor
+would be every sibling's, and a post that names none is attributed to `<session>/unnamed`, so
+the session's own reads still show it. A read whose first row is longer than its budget shows
+that row clipped and moves past it.
 
 **SubagentStart** (Claude Code) adds to the brief:
 

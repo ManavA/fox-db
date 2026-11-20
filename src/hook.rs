@@ -275,7 +275,6 @@ pub fn parent_reads(transcript: &Path, root: &Path) -> Vec<String> {
         return vec![];
     }
     let text = String::from_utf8_lossy(&buf);
-    let root = root.to_string_lossy();
     let mut seen: Vec<String> = vec![];
     // A tail that starts mid-line skips that line.
     for l in text.lines().skip(usize::from(start > 0)).filter(|l| l.contains("\"tool_use\"")) {
@@ -288,19 +287,20 @@ pub fn parent_reads(transcript: &Path, root: &Path) -> Vec<String> {
                 _ => None,
             };
             let Some(path) = path else { continue };
-            let rel = match path.strip_prefix(root.as_ref()) {
-                Some(r) => r.trim_start_matches('/'),
-                None if !path.starts_with('/') => path,
-                None => continue,
+            // Component-wise: `/repo-old/a.rs` is not under `/repo`.
+            let rel = match Path::new(path).strip_prefix(root) {
+                Ok(r) => r.to_string_lossy().into_owned(),
+                Err(_) if !path.starts_with('/') => path.to_string(),
+                Err(_) => continue,
             };
             if !rel.is_empty() {
-                seen.retain(|x| x != rel);
-                seen.push(rel.to_string());
+                seen.push(rel);
             }
         }
     }
-    seen.reverse();
-    seen
+    // Newest first, each path once.
+    let mut once = std::collections::HashSet::new();
+    seen.into_iter().rev().filter(|p| once.insert(p.clone())).collect()
 }
 
 /// `parent read (...): f:1a src/a.rs, f:2b src/b.rs` for the indexed files among the parent's
@@ -312,6 +312,10 @@ fn parent_read_line(c: &Connection, p: &project::Project, transcript: &Path, roo
     };
     let mut line = HEAD.to_string();
     for rel in parent_reads(transcript, &p.root) {
+        // No item fits in under ` f:1 x`: stop looking files up once the line is full.
+        if line.chars().count() + 8 > room {
+            break;
+        }
         let Ok(id) = s.query_row(rusqlite::params![p.id, rel], |r| r.get::<_, i64>(0)) else { continue };
         let item = format!("{}{} {rel}", if line.len() == HEAD.len() { " " } else { ", " }, query::handle("file", id));
         if line.chars().count() + item.chars().count() + 1 > room {
@@ -358,7 +362,8 @@ fn subagent_stop(input: &Value, h: Harness) -> Result<String> {
             text: &summary_of(msg, report),
             harness: Some(h.name()),
             session: input["session_id"].as_str(),
-            agent,
+            // The subagent itself, not its type: siblings of one type are different posters.
+            agent: input["agent_id"].as_str().filter(|s| !s.is_empty()).or(agent),
             evidence: Some(cites.as_str()).filter(|e| !e.is_empty()),
             parent: Some(report),
             ..Default::default()

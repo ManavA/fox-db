@@ -458,8 +458,108 @@ fn subagent_stop_posts_a_summary_entry_with_handles() {
     assert!(body.chars().count() <= handoff::ENTRY_MAX, "{} chars", body.chars().count());
     let f = node_handle(&c, "file", "lib.rs");
     assert_eq!(ev, f, "cited paths become handles; unknown handles are dropped");
+    let who: String = c.query_row("SELECT agent FROM handoff WHERE id = ?1", [sid], |r| r.get(0)).unwrap();
+    assert_eq!(who, "a9", "the summary is the subagent's own, not its type's");
     let board = handoff::read_since(&c, p.id, handoff::Since::After(0), Some("summary"), None, 500).unwrap();
     assert!(board.contains(&handoff::handle(sid)) && board.contains("Found it"), "{board}");
     let (out, err) = read_call(&f);
     assert!(!err && out.contains("alpha"), "{out}");
+}
+
+/// Evidence on a swarm entry is handles and paths only, and short: prose there would carry
+/// content past the 600-character cap. Handle prefixes are case-insensitive.
+#[test]
+fn evidence_keeps_handles_and_paths_only_within_its_cap() {
+    let _g = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    let (_h, _r, c, p) = setup_ts();
+    let s = node_handle(&c, "symbol", "alpha");
+    let f = node_handle(&c, "file", "lib.rs");
+    let prose: String = (0..300).map(|i| format!("word{i} ")).collect();
+    let raw = format!("{prose} src/lib.rs:1 {} docs/not-indexed.md", s.to_uppercase());
+    let id = handoff::post(&c, &handoff::Post { project_id: p.id, kind: "fact", text: "x", evidence: Some(&raw), ..Default::default() })
+        .unwrap();
+    let ev: String = c.query_row("SELECT evidence FROM handoff WHERE id = ?1", [id], |r| r.get(0)).unwrap();
+    assert_eq!(ev, format!("{f} {s} docs/not-indexed.md"), "prose dropped, upper-case handle accepted");
+    // Many long paths stop at the byte cap.
+    let paths: String = (0..8).map(|i| format!("dir{i}/{}.rs ", "p".repeat(120))).collect();
+    let id = handoff::post(&c, &handoff::Post { project_id: p.id, kind: "fact", text: "y", evidence: Some(&paths), ..Default::default() })
+        .unwrap();
+    let ev: String = c.query_row("SELECT evidence FROM handoff WHERE id = ?1", [id], |r| r.get(0)).unwrap();
+    assert!(!ev.is_empty() && ev.len() <= handoff::EVIDENCE_MAX, "{} bytes", ev.len());
+}
+
+/// A row longer than the whole budget still shows, clipped, and the cursor moves past it: a long
+/// entry can never leave an agent reading "nothing new" forever.
+#[test]
+fn a_row_longer_than_the_budget_still_shows_and_moves_the_cursor() {
+    let _g = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    let (_h, _r, c, p) = setup();
+    let long = |tag: &str| format!("{tag} {}", "long text ".repeat(55));
+    let post = |t: &str| {
+        handoff::post(&c, &handoff::Post { project_id: p.id, kind: "fact", text: t, agent: Some("other"), ..Default::default() }).unwrap()
+    };
+    let a = post(&long("first"));
+    let r = handoff::read_since(&c, p.id, handoff::Since::Auto("me"), None, None, 32).unwrap();
+    assert!(r.contains(&handoff::handle(a)) && r.contains("first"), "a first read shows the newest row: {r}");
+    let b = post(&long("second"));
+    let r = handoff::read_since(&c, p.id, handoff::Since::Auto("me"), None, None, 32).unwrap();
+    assert!(r.contains(&handoff::handle(b)) && !r.contains("nothing new"), "{r}");
+    assert!(r.lines().next().unwrap().len() <= 32 * 4, "clipped to the budget: {r}");
+    assert!(r.trim_end().ends_with(&format!("since={}", handoff::handle(b))), "{r}");
+    let r = handoff::read_since(&c, p.id, handoff::Since::Auto("me"), None, None, 32).unwrap();
+    assert!(r.contains("nothing new"), "{r}");
+}
+
+/// Without `agent=`, a session with running subagents is one identity with all of them: a
+/// `since=me` read would move every sibling's cursor. It is refused with the fix, and an unnamed
+/// post is tagged so the session's own reads still show it.
+#[test]
+fn since_me_without_agent_is_refused_while_subagents_share_the_session() {
+    let _g = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    let (_h, repo, c, _p) = setup();
+    std::env::set_current_dir(repo.path()).unwrap();
+    let saved = std::env::var("CLAUDE_CODE_SESSION_ID").ok();
+    unsafe {
+        std::env::remove_var("FOXDB_AGENT");
+        std::env::set_var("CLAUDE_CODE_SESSION_ID", "sess-1");
+    }
+    let start = json!({"hook_event_name": "SubagentStart", "session_id": "sess-1", "cwd": repo.path(), "agent_id": "sub-1", "agent_type": "worker"});
+    hook::run("subagent-start", &start.to_string(), hook::Harness::Claude);
+    let (t, err) = memory_call(json!({"op": "read", "since": "me"}));
+    assert!(err && t.contains("agent=") && t.contains("since=h:"), "{t}");
+    let (t, err) = memory_call(json!({"op": "read", "since": "me", "agent": "sub-1"}));
+    assert!(!err, "{t}");
+    let (t, err) = memory_call(json!({"op": "post", "kind": "fact", "text": "posted without a name"}));
+    assert!(!err, "{t}");
+    let who: String = c.query_row("SELECT agent FROM handoff WHERE id = ?1", [posted(&t)], |r| r.get(0)).unwrap();
+    assert_eq!(who, "sess-1/unnamed");
+    // Once the subagent stops, the session reads as itself, and sees the tagged post.
+    let stop = json!({"hook_event_name": "SubagentStop", "session_id": "sess-1", "cwd": repo.path(), "agent_id": "sub-1",
+        "agent_type": "worker", "last_assistant_message": "done"});
+    hook::run("subagent-stop", &stop.to_string(), hook::Harness::Claude);
+    let (t, err) = memory_call(json!({"op": "read", "since": "me"}));
+    assert!(!err && t.contains("posted without a name"), "{t}");
+    unsafe {
+        match saved {
+            Some(v) => std::env::set_var("CLAUDE_CODE_SESSION_ID", v),
+            None => std::env::remove_var("CLAUDE_CODE_SESSION_ID"),
+        }
+    }
+}
+
+/// The parent's reads, newest first and each once; a sibling directory that only shares the
+/// root's name prefix is not under the root.
+#[test]
+fn parent_reads_are_newest_first_once_and_under_the_root_only() {
+    let repo = tempfile::tempdir().unwrap();
+    let tx = tempfile::tempdir().unwrap();
+    let r = repo.path().to_string_lossy();
+    let read = |p: String| {
+        json!({"type": "assistant", "message": {"role": "assistant", "content": [{"type": "tool_use", "id": "t", "name": "Read", "input": {"file_path": p}}]}})
+            .to_string()
+    };
+    let lines = [read(format!("{r}/a.rs")), read(format!("{r}/b.rs")), read(format!("{r}-old/c.rs")), read(format!("{r}/a.rs"))];
+    let t = tx.path().join("t.jsonl");
+    fs::write(&t, lines.join("\n") + "\n").unwrap();
+    assert_eq!(hook::parent_reads(&t, repo.path()), ["a.rs", "b.rs"]);
 }
