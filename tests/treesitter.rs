@@ -132,6 +132,15 @@ fn kotlin_kinds_are_specific() {
 
 // ---- store-level tests ----
 
+/// Call sites a callers answer lists as certain: all of them less those guessed by name. A tie
+/// between same-score candidates is a guess, whichever of them it lands on.
+fn certain_calls(out: &str) -> usize {
+    let line = out.lines().find(|l| l.contains(" call sites in ")).unwrap_or("");
+    let n = |s: &str| s.split_whitespace().next().and_then(|w| w.parse::<usize>().ok()).unwrap_or(0);
+    let guessed = line.split_once(", ").map_or(0, |x| n(x.1));
+    n(line) - guessed
+}
+
 fn setup(src: &Path) -> (tempfile::TempDir, tempfile::TempDir, project::Project) {
     let home = tempfile::tempdir().unwrap();
     // SAFETY: tests touching FOXDB_HOME hold SERIAL.
@@ -497,8 +506,9 @@ fn go_embedded_field_call_reaches_the_named_type() {
     ]);
     let out = fox_code(&p, "Evaluator.Preempt", "callers", 800);
     assert!(out.contains("1 call sites in 1 files") && out.contains("Plugin.PostFilter"), "{out}");
+    // `pl.group.Preempt()` (an interface field) is a tie: at most a guess here.
     let out = fox_code(&p, "GroupEvaluator.Preempt", "callers", 800);
-    assert!(out.contains("0 call sites"), "{out}");
+    assert!(out.contains(" call sites in ") && certain_calls(&out) == 0, "{out}");
 }
 
 /// A one-word name whose other uses have no reference row (a function-pointer initializer, a
@@ -753,7 +763,8 @@ fn impact_says_when_the_walk_was_cut_or_guessed() {
             "int f0(void) { return 0; }\nint f1(void) { return f0(); }\nint f2(void) { return f1(); }\nint f3(void) { return f2(); }\nint f4(void) { return f3(); }\nint f5(void) { return f4(); }\n",
         ),
         ("lib/core.c", "int base(void) { return 0; }\n"),
-        ("x/a.c", "int pick_one(void) { return base(); }\n"),
+        // Sorts after y/: the z/ tie breaks to y/b.c's `pick_one`, not this one.
+        ("zz/a.c", "int pick_one(void) { return base(); }\n"),
         ("y/b.c", "int pick_one(void) { return 1; }\n"),
         ("y/sub/use.c", "int user(void) { return pick_one(); }\n"),
         ("z/use.c", "int other(void) { return pick_one(); }\n"),
@@ -1075,8 +1086,9 @@ fn supertypes_follow_explicit_imports() {
     ]);
     let out = fox_code(&p, "Child.run", "impact", 2000);
     assert!(!out.contains("Base.start"), "{out}");
+    // `h.handle()` is a tie between the local interface and `ExtHandler`: at most a guess.
     let out = fox_code(&p, "ExtHandler.handle", "impact", 2000);
-    assert!(!out.contains("useLocal"), "{out}");
+    assert!(out.lines().filter(|l| l.contains("useLocal")).all(|l| l.contains("guess")), "{out}");
 }
 
 /// Go: a standard library import (`"log"`) is no evidence for, nor a call into, a project

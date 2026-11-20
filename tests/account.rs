@@ -9,10 +9,20 @@ static SERIAL: Mutex<()> = Mutex::new(());
 
 /// A project from inline files under a scratch FOXDB_HOME, indexed.
 fn inline_project(files: &[(&str, &str)]) -> (tempfile::TempDir, tempfile::TempDir, project::Project) {
+    inline_project_written(files, false)
+}
+
+/// Like [`inline_project`], with the files written last to first when `reversed` (directory
+/// listings on tmpfs and btrfs follow the order files were created in).
+fn inline_project_written(files: &[(&str, &str)], reversed: bool) -> (tempfile::TempDir, tempfile::TempDir, project::Project) {
     let home = tempfile::tempdir().unwrap();
     // SAFETY: tests touching FOXDB_HOME hold SERIAL.
     unsafe { std::env::set_var("FOXDB_HOME", home.path()) };
     let repo = tempfile::tempdir().unwrap();
+    let mut files = files.to_vec();
+    if reversed {
+        files.reverse();
+    }
     for (path, text) in files {
         let f = repo.path().join(path);
         std::fs::create_dir_all(f.parent().unwrap()).unwrap();
@@ -28,6 +38,15 @@ fn inline_project(files: &[(&str, &str)]) -> (tempfile::TempDir, tempfile::TempD
 fn fox_code(p: &project::Project, sym: &str, rel: &str, budget: usize) -> String {
     let c = db::open_ro().unwrap();
     code::run(&c, p, sym, &code::CodeOpts { rel, depth: 2, budget, cursor: 0, fallback: false }).unwrap()
+}
+
+/// Call sites a callers answer lists as certain: all of them less those guessed by name. A tie
+/// between same-score candidates is a guess, whichever of them it lands on.
+fn certain_calls(out: &str) -> usize {
+    let line = out.lines().find(|l| l.contains(" call sites in ")).unwrap_or("");
+    let n = |s: &str| s.split_whitespace().next().and_then(|w| w.parse::<usize>().ok()).unwrap_or(0);
+    let guessed = line.split_once(", ").map_or(0, |x| n(x.1));
+    n(line) - guessed
 }
 
 fn first(out: &str) -> &str {
@@ -314,7 +333,8 @@ fn qualified_calls_do_not_resolve_to_the_same_file_definition() {
         ),
     ]);
     let out = fox_code(&p, "core.plan", "callers", 2000);
-    assert!(out.contains(" wrap.py (2)") || out.contains("wrap.py:6") && out.contains("wrap.py:10"), "{out}");
+    // `import core` makes `core.plan()` that module's function, not a guess.
+    assert!(out.contains("wrap.py (2)") && !out.contains("guess"), "{out}");
     let (_h, _r, p) = inline_project(&[
         (
             "Outer.kt",
@@ -323,7 +343,7 @@ fn qualified_calls_do_not_resolve_to_the_same_file_definition() {
         ("Inner.kt", "class Inner {\n    fun plan(): Int = 1\n}\n"),
     ]);
     let out = fox_code(&p, "Outer.plan", "callers", 2000);
-    assert!(out.contains("0 call sites"), "{out}");
+    assert!(out.contains(" call sites in ") && certain_calls(&out) == 0, "{out}");
     let (_h, _r, p) = inline_project(&[
         ("go.mod", "module ex.com/gor\ngo 1.21\n"),
         ("server.go", "package main\n\ntype Server struct{ inner *Inner }\n\nfunc (s *Server) Plan() int {\n\treturn s.inner.Plan()\n}\n"),
@@ -331,6 +351,45 @@ fn qualified_calls_do_not_resolve_to_the_same_file_definition() {
     ]);
     let out = fox_code(&p, "Server.Plan", "callers", 2000);
     assert!(out.contains("0 call sites"), "{out}");
+}
+
+/// The answer does not depend on the order the directory lists the files in: a tie between
+/// same-score candidates breaks the same way on every filesystem.
+#[test]
+fn answers_do_not_depend_on_file_order() {
+    let _g = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    let cases: &[(&[(&str, &str)], &str)] = &[
+        (
+            &[
+                ("core.py", "def plan():\n    return 1\n"),
+                (
+                    "wrap.py",
+                    "import core\n\n\nclass A:\n    def plan(self):\n        return core.plan()\n\n\ndef plan():\n    return core.plan()\n",
+                ),
+            ],
+            "core.plan",
+        ),
+        (
+            &[
+                (
+                    "Outer.kt",
+                    "class Outer(val inner: Inner) {\n    fun plan(): Int {\n        return inner.plan()\n    }\n}\n\nfun main() {\n    val i = Inner()\n    println(listOf(1).map { i.plan() })\n}\n",
+                ),
+                ("Inner.kt", "class Inner {\n    fun plan(): Int = 1\n}\n"),
+            ],
+            "Outer.plan",
+        ),
+    ];
+    for (files, q) in cases {
+        let answers: Vec<String> = [false, true]
+            .into_iter()
+            .map(|rev| {
+                let (_h, _r, p) = inline_project_written(files, rev);
+                fox_code(&p, q, "callers", 2000)
+            })
+            .collect();
+        assert_eq!(answers[0], answers[1], "{q}");
+    }
 }
 
 /// A renamed import (`plan as p`, a default import under another name) may bind the target

@@ -812,6 +812,10 @@ pub fn index_project_with(c: &mut Connection, p: &Project, delta: Option<&crate:
             })
             .collect()
     };
+    // Path order, not the directory listing's: new definitions get ids in that order, and ids
+    // break ties between same-score candidates, so the answer is the same on every filesystem.
+    let mut files = files;
+    files.sort();
     let old: HashMap<String, (String, i64, i64)> = if let Some(paths) = only {
         let mut q = c.prepare_cached("SELECT path, hash, size, mtime FROM ts_file WHERE project_id = ?1 AND path = ?2")?;
         let mut m = HashMap::new();
@@ -1312,6 +1316,8 @@ struct FileImports {
     lasts: HashSet<String>,
     /// JS and Python: the module each imported name comes from (`./errors`, `pkg.core`).
     sources: HashMap<String, String>,
+    /// Python: modules imported whole (`import core`), so `core.plan()` names that module's `plan`.
+    modules: HashSet<String>,
 }
 
 /// Where an explicitly imported name's module puts a candidate.
@@ -1338,6 +1344,8 @@ impl FileImports {
             }
         } else if let Some(src) = source.filter(|x| !x.is_empty() && *x != name) {
             self.sources.insert(name.to_string(), src.to_string());
+        } else {
+            self.modules.insert(name.to_string());
         }
         self.lasts.insert(i.last.clone());
         self.all.push(i);
@@ -1345,8 +1353,13 @@ impl FileImports {
     /// JS and Python: where the module `name` was imported from puts candidate `s`. None when the
     /// name was not imported by name with a known module.
     fn source(&self, fam: &str, name: &str, from: &str, s: &Cand) -> Option<Source> {
-        let src = self.sources.get(name)?;
         let stem = s.path.rsplit_once('.').map_or(s.path.as_str(), |x| x.0);
+        let src = match self.sources.get(name) {
+            Some(src) => src,
+            // `import core` then `core.plan()`: the module is the name itself.
+            None if fam == "python" && self.modules.contains(name) => name,
+            None => return None,
+        };
         let module = match fam {
             "js" => {
                 if !src.starts_with('.') {
@@ -1501,6 +1514,8 @@ fn score(r: &RefRow, cands: &[Cand], imp: Option<&FileImports>) -> (i64, i64) {
     let pkg_qualified = fam == "go" && !r.recv_local && via.is_some_and(|v| imp.is_some_and(|i| i.lasts.contains(v)));
     // (score, id, candidates at that score, same file, member, score without the receiver match)
     let mut best = (0i32, 0i64, 0usize, false, false, 0i32);
+    // The best candidate is in the module the receiver was imported from (`core.plan()`).
+    let mut best_module = false;
     let mut eligible = 0i64;
     // The best candidate is a function-holding field reached without receiver evidence.
     let mut field_fn_guess = false;
@@ -1591,7 +1606,8 @@ fn score(r: &RefRow, cands: &[Cand], imp: Option<&FileImports>) -> (i64, i64) {
             if !r.recv && s.pid != 0 && s.pid != r.caller_parent {
                 score -= 25;
             }
-            if r.recv && !member {
+            // A module's function through the module's name (`core.plan()`) is no such call.
+            if r.recv && !member && source != Some(Source::Match) {
                 score -= 20;
             }
         }
@@ -1602,6 +1618,7 @@ fn score(r: &RefRow, cands: &[Cand], imp: Option<&FileImports>) -> (i64, i64) {
         if score > best.0 {
             best = (score, s.id, 1, same_file, member, score - via_bonus);
             field_fn_guess = s.field_fn && !same_file && !own_receiver;
+            best_module = r.recv && via.is_some() && source == Some(Source::Match);
         } else if score == best.0 {
             best.2 += 1;
         }
@@ -1620,8 +1637,9 @@ fn score(r: &RefRow, cands: &[Cand], imp: Option<&FileImports>) -> (i64, i64) {
     let few = name_only && call && best.2 <= GUESS_MAX && (r.recv && best.4 && distinctive || c_fam && !r.recv);
     let via_guess = via_only && distinctive && best.2 == 1;
     let dst = if best.0 >= 20 && !via_only || via_guess || unique || few { best.1 } else { 0 };
-    let guess =
-        dst != 0 && !best.3 && (eligible > 1 && (best.2 > 1 || call && r.recv || name_only) || name_only && call && r.recv || via_only);
+    let guess = dst != 0
+        && !best.3
+        && (eligible > 1 && (best.2 > 1 || call && r.recv && !best_module || name_only) || name_only && call && r.recv || via_only);
     let guess = guess || dst != 0 && field_fn_guess;
     (dst, if guess { eligible.max(1) } else { 0 })
 }
