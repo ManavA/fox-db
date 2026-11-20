@@ -3,7 +3,8 @@
 (declaration type: (union_specifier name: (type_identifier) @name)) @definition.class
 (function_definition declarator: [(function_declarator declarator: (identifier) @name)
   (pointer_declarator declarator: (function_declarator declarator: (identifier) @name))]) @definition.function
-(declaration declarator: (function_declarator declarator: (identifier) @name)) @definition.function
+(declaration declarator: [(function_declarator declarator: (identifier) @name)
+  (pointer_declarator declarator: (function_declarator declarator: (identifier) @name))]) @definition.function
 (type_definition declarator: (type_identifier) @name) @definition.type
 (enum_specifier name: (type_identifier) @name) @definition.enum
 (call_expression function: (identifier) @name) @reference.call
@@ -14,7 +15,13 @@
 ; (`walk(handle_one, &cb)`): a reference. Parameters and locals are dropped at extraction.
 (initializer_list (identifier) @name) @reference.ref
 (argument_list (identifier) @name) @reference.ref
+; A function stored in a member (`chip->irq_mask = foo_mask;`): a reference.
+(assignment_expression left: (field_expression) right: (identifier) @name) @reference.ref
 ; A struct or union field, also behind pointers and arrays: found by name, never a call target.
 (field_declaration declarator: [(field_identifier) @name
   (pointer_declarator declarator: [(field_identifier) @name (pointer_declarator declarator: (field_identifier) @name)])
-  (array_declarator declarator: (field_identifier) @name)]) @definition.field
+  (array_declarator declarator: (field_identifier) @name)
+  ; A function-pointer member (`void (*irq_mask)(struct irq_data *)`, also returning a pointer):
+  ; indexed as a method of its struct, the target of calls through it.
+  (function_declarator declarator: (parenthesized_declarator (pointer_declarator declarator: (field_identifier) @name)))
+  (pointer_declarator declarator: (function_declarator declarator: (parenthesized_declarator (pointer_declarator declarator: (field_identifier) @name))))]) @definition.field

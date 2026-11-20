@@ -835,7 +835,7 @@ const OVERRIDE_STEPS: usize = 8;
 fn method_overrides(c: &Connection, pid: i64, top: &TSym, lines: &mut Vec<String>) -> Result<()> {
     lines.push(format!("overrides of {}", top.row()));
     let (mut up, mut down, mut capped) = (vec![], vec![], None);
-    if crate::lang::for_path(&top.path).is_some_and(|l| l.family == "go") {
+    if crate::lang::for_path(&top.path).is_some_and(|l| l.family == "go" || l.name == "c") {
         let d = dispatch(c, pid, top)?;
         (up, down, capped) = (d.up, d.down, d.capped);
     } else if top.parent.as_deref().is_some_and(|p| !p.is_empty()) {
@@ -1174,6 +1174,9 @@ const DISPATCH_SAME_MAX: usize = 2000;
 const SYM_PID: &str = "COALESCE(json_extract(n.meta, '$.pid'), 0)";
 
 fn dispatch(c: &Connection, pid: i64, top: &TSym) -> Result<Dispatch> {
+    if crate::lang::for_path(&top.path).is_some_and(|l| l.name == "c") {
+        return c_dispatch(c, top);
+    }
     let mut d = Dispatch { up: vec![], down: vec![], capped: None };
     if !is_callable_kind(&top.kind) || top.parent.as_deref().is_none_or(str::is_empty) {
         return Ok(d);
@@ -1230,6 +1233,33 @@ fn dispatch(c: &Connection, pid: i64, top: &TSym) -> Result<Dispatch> {
             Some(t) if downs.contains(&t) => d.down.push(s.clone()),
             _ => {}
         }
+    }
+    Ok(d)
+}
+
+/// C: a function is dispatched through the function-pointer members it is stored in
+/// (`.bmap = ext4_bmap`, `chip->irq_mask = foo_mask`), `up`; a member dispatches to the
+/// functions stored in it, `down`.
+fn c_dispatch(c: &Connection, top: &TSym) -> Result<Dispatch> {
+    let mut d = Dispatch { up: vec![], down: vec![], capped: None };
+    let sql = if top.kind == "function" {
+        "SELECT DISTINCT slot FROM ts_ref WHERE dst = ?1 AND dst != 0 AND slot != 0"
+    } else if top.kind == "method" {
+        "SELECT DISTINCT dst FROM ts_ref INDEXED BY ts_ref_slot WHERE slot = ?1 AND slot != 0 AND dst != 0"
+    } else {
+        return Ok(d);
+    };
+    let mut q = c.prepare_cached(&format!("{sql} LIMIT {}", DISPATCH_SAME_MAX + 1))?;
+    let ids: Vec<i64> = q.query_map([top.id], |r| r.get(0))?.flatten().collect();
+    if ids.len() > DISPATCH_SAME_MAX {
+        d.capped = Some(format!("partial at d1: dispatch read the first {DISPATCH_SAME_MAX} functions stored in it; there are more"));
+    }
+    let mut v: Vec<TSym> = ids.into_iter().take(DISPATCH_SAME_MAX).filter(|&i| i != top.id).filter_map(|i| by_id(c, i)).collect();
+    v.sort_by(|a, b| (&a.path, a.line, a.id).cmp(&(&b.path, b.line, b.id)));
+    if top.kind == "function" {
+        d.up = v
+    } else {
+        d.down = v
     }
     Ok(d)
 }

@@ -512,8 +512,8 @@ fn go_embedded_field_call_reaches_the_named_type() {
 }
 
 /// A one-word name whose other uses have no reference row (a function-pointer initializer, a
-/// field assignment, a macro body, an argument) still gets the completeness line, from every
-/// identifier of every file, not only from indexed symbol text.
+/// macro body) still gets the completeness line, from every identifier of every file, not only
+/// from indexed symbol text.
 #[test]
 fn completeness_counts_one_word_names_and_uses_outside_symbols() {
     let _g = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
@@ -528,20 +528,23 @@ fn completeness_counts_one_word_names_and_uses_outside_symbols() {
         ("lib/fs.c", "int simple_open(void) { return 0; }\n"),
         ("drivers/x.c", "#define FOPS(n) static const struct fops n = { .open = simple_open }\n"),
     ]);
-    // The argument in src/arg.c is a resolved reference: listed by `refs` and `impact`, still
-    // unknown to `callers` (what `apply` calls through it is not followed).
+    // The argument in src/arg.c and the member assignment in src/field.c are resolved references:
+    // listed by `refs` and `impact`, still unknown to `callers` (what is called through them is
+    // not followed).
     for (rel, head) in [
         (
             "callers",
-            "6 lines name `helper`: 1 call, 1 definition, 1 reference, not a call, 3 unresolved; may be incomplete: 3 unresolved lines",
+            "6 lines name `helper`: 1 call, 1 definition, 2 references, not calls, 2 unresolved; may be incomplete: 2 unresolved lines",
         ),
-        ("refs", "6 lines name `helper`: 2 refs, 1 definition, 3 unresolved; may be incomplete: 3 unresolved lines"),
-        ("impact", "6 lines name `helper`: 2 uses (d1), 1 definition, 3 unresolved; partial at d1: 3 unresolved lines"),
+        ("refs", "6 lines name `helper`: 3 refs, 1 definition, 2 unresolved; may be incomplete: 2 unresolved lines"),
+        ("impact", "6 lines name `helper`: 3 uses (d1), 1 definition, 2 unresolved; partial at d1: 2 unresolved lines"),
     ] {
         let out = fox_code(&p, "helper", rel, 800);
         assert!(out.starts_with(head), "{rel}: {out}");
         assert!(
-            out.contains("unresolved mentions:\n  src/field.c:2 | void set(struct o *o) { o->cb = helper; }\n  src/fp.c:1 | static int (*fp)(int) = helper;\n  src/macro.c:1 | #define CALL(x) helper(x)\n"),
+            out.contains(
+                "unresolved mentions:\n  src/fp.c:1 | static int (*fp)(int) = helper;\n  src/macro.c:1 | #define CALL(x) helper(x)\n"
+            ),
             "{rel}: {out}"
         );
     }
@@ -1740,4 +1743,118 @@ fn equal_qualified_matches_are_named() {
     ]);
     let out = fox_code(&p, "github.com/acme/yaml.Marshal", "callers", 800);
     assert!(out.contains("2 equally good matches"), "{out}");
+}
+
+/// C and C++ function-pointer members (`void (*irq_mask)(struct irq_data *)`) are members of
+/// their struct, callable, and listed in its outline beside the plain fields.
+#[test]
+fn c_function_pointer_members_are_struct_members() {
+    let src = b"struct irq_chip {\n\tconst char *name;\n\tvoid (*irq_mask)(struct irq_data *data);\n\tstruct page *(*alloc)(int n);\n\tint (*const probe)(void);\n};\n";
+    for l in ["c", "cpp"] {
+        let p = tsindex::extract(lang::by_name(l).unwrap(), src);
+        let q = qnames(&p);
+        for want in ["irq_chip.name", "irq_chip.irq_mask", "irq_chip.alloc", "irq_chip.probe"] {
+            assert!(q.iter().any(|x| x == want), "{l}: missing {want} in {q:?}");
+        }
+        let kind = |n: &str| p.defs.iter().find(|d| d.name == n).map(|d| d.kind.clone()).unwrap();
+        assert_eq!(kind("name"), "field", "{l}");
+        assert_eq!(kind("irq_mask"), "method", "{l}");
+        assert!(p.defs.iter().find(|d| d.name == "irq_mask").unwrap().field_fn, "{l}");
+        // A parameter of the member's own type is no member.
+        assert!(!q.iter().any(|x| x.ends_with(".data") || x.ends_with(".n")), "{l}: {q:?}");
+    }
+}
+
+fn c_ops_project() -> (tempfile::TempDir, tempfile::TempDir, project::Project) {
+    inline_project(&[
+        (
+            "include/linux/irq.h",
+            "struct irq_data;\nstruct irq_chip {\n\tconst char *name;\n\tvoid (*irq_mask)(struct irq_data *data);\n};\nstruct irq_data {\n\tunsigned int irq;\n\tstruct irq_chip *chip;\n};\nstruct irq_desc {\n\tstruct irq_data irq_data;\n};\ntypedef struct irq_chip irq_chip_t;\nstruct irq_chip *irq_desc_get_chip(struct irq_desc *desc);\n",
+        ),
+        ("include/linux/other.h", "struct other_ops {\n\tvoid (*irq_mask)(int x);\n};\n"),
+        (
+            "include/linux/fs.h",
+            "struct address_space_operations {\n\tint (*bmap)(struct address_space *m, long b);\n};\nstruct address_space {\n\tconst struct address_space_operations *a_ops;\n};\nstruct inode {\n\tstruct address_space *i_mapping;\n};\nint bmap(struct inode *inode, long *block);\n",
+        ),
+        ("kernel/irq/mask.c", "void irq_mask(int x) { }\n"),
+        ("kernel/irq/chip.c", "void mask_irq(struct irq_desc *desc)\n{\n\tdesc->irq_data.chip->irq_mask(&desc->irq_data);\n}\n"),
+        (
+            "include/linux/irqchip/chained_irq.h",
+            "static inline void chained_irq_enter(struct irq_chip *chip, struct irq_desc *desc)\n{\n\tif (chip->irq_mask)\n\t\tchip->irq_mask(&desc->irq_data);\n}\n",
+        ),
+        ("kernel/irq/cast.c", "void cast_mask(void *p)\n{\n\t((struct irq_chip *)p)->irq_mask(0);\n}\n"),
+        ("kernel/irq/ret.c", "void ret_mask(struct irq_desc *desc)\n{\n\tirq_desc_get_chip(desc)->irq_mask(0);\n}\n"),
+        ("kernel/irq/alias.c", "void alias_mask(irq_chip_t *c)\n{\n\tc->irq_mask(0);\n}\n"),
+        ("drivers/other/o.c", "void other_mask(struct other_ops *o)\n{\n\to->irq_mask(1);\n}\n"),
+        (
+            "drivers/irqchip/irq-foo.c",
+            "static void foo_mask(struct irq_data *d) { }\nstatic void foo_mask2(struct irq_data *d) { }\nstatic struct irq_chip foo_chip = {\n\t.name = \"foo\",\n\t.irq_mask = foo_mask,\n};\nvoid foo_init(struct irq_chip *c)\n{\n\tc->irq_mask = foo_mask2;\n}\n",
+        ),
+        (
+            "fs/inode.c",
+            "int bmap(struct inode *inode, long *block)\n{\n\t*block = inode->i_mapping->a_ops->bmap(inode->i_mapping, *block);\n\treturn 0;\n}\n",
+        ),
+        ("fs/ioctl.c", "int ioctl_fibmap(struct inode *inode)\n{\n\tlong b;\n\treturn bmap(inode, &b);\n}\n"),
+        (
+            "fs/ext4/inode.c",
+            "static int ext4_bmap(struct address_space *m, long b)\n{\n\treturn 0;\n}\nstatic const struct address_space_operations ext4_aops = {\n\t.bmap = ext4_bmap,\n};\n",
+        ),
+    ])
+}
+
+fn c_sym(p: &project::Project, path: &str, name: &str) -> String {
+    let c = db::open_ro().unwrap();
+    let id: i64 = c
+        .query_row(
+            "SELECT id FROM node WHERE project_id = ?1 AND path = ?2 AND name = ?3 AND kind = 'symbol'",
+            rusqlite::params![p.id, path, name],
+            |r| r.get(0),
+        )
+        .unwrap();
+    format!("c:{id:x}")
+}
+
+/// A C call through a member (`chip->irq_mask(d)`, `inode->i_mapping->a_ops->bmap(...)`)
+/// reaches the struct's function-pointer member, found from the receiver's declared type through
+/// the fields on the way, a cast, a function's return type or a typedef; never a same-name
+/// global function, and never another struct's member of that name.
+#[test]
+fn c_member_calls_resolve_to_the_struct_member() {
+    let _g = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    let (_h, _r, p) = c_ops_project();
+    let out = fox_code(&p, "irq_chip.irq_mask", "callers", 4000);
+    let r = resolved(&out);
+    for f in ["chip.c (1)", "chained_irq.h (1)", "cast.c (1)", "ret.c (1)", "alias.c (1)"] {
+        assert!(r.contains(f), "missing {f}: {out}");
+    }
+    assert!(!r.contains("o.c") && !r.contains("guess"), "{out}");
+    assert!(r.contains("5 call sites in 5 files"), "{out}");
+    let out = fox_code(&p, "other_ops.irq_mask", "callers", 4000);
+    assert!(resolved(&out).contains("1 call sites in 1 files") && out.contains("o.c (1)"), "{out}");
+    // The global function of the same name has no caller.
+    let out = fox_code(&p, &c_sym(&p, "kernel/irq/mask.c", "irq_mask"), "callers", 4000);
+    assert!(resolved(&out).contains("0 call sites"), "{out}");
+    // `bmap()` is called from ioctl.c; the call through `a_ops->bmap` is the member's.
+    let out = fox_code(&p, &c_sym(&p, "fs/inode.c", "bmap"), "callers", 4000);
+    let r = resolved(&out);
+    assert!(r.contains("1 call sites in 1 files") && r.contains("ioctl.c (1)") && !r.contains("guess"), "{out}");
+    let out = fox_code(&p, "address_space_operations.bmap", "callers", 4000);
+    assert!(resolved(&out).contains("1 call sites in 1 files") && out.contains(":3 bmap c:"), "{out}");
+}
+
+/// A function assigned to a member (`.bmap = ext4_bmap`, `c->irq_mask = foo_mask2`) is reached
+/// through calls of that member: impact of the function follows them, and impact of the member
+/// lists the functions assigned to it.
+#[test]
+fn c_functions_assigned_to_members_are_dispatch_targets() {
+    let _g = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    let (_h, _r, p) = c_ops_project();
+    let out = fox_code(&p, "ext4_bmap", "impact", 4000);
+    assert!(out.contains(":1 bmap c:") && out.contains("via address_space_operations.bmap"), "{out}");
+    assert!(out.contains("ioctl_fibmap"), "{out}");
+    let out = fox_code(&p, "irq_chip.irq_mask", "impact", 4000);
+    assert!(out.contains("foo_mask c:") && out.contains("foo_mask2 c:") && out.contains("implements irq_chip.irq_mask"), "{out}");
+    assert!(out.contains("mask_irq") && !out.contains("other_mask"), "{out}");
+    let out = fox_code(&p, "foo_mask", "impact", 4000);
+    assert!(out.contains("mask_irq") && out.contains("chained_irq_enter"), "{out}");
 }

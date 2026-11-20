@@ -39,6 +39,9 @@ pub struct Def {
     /// A class field holding a function (`dispatch = () => {}`): a method reached only through
     /// `this`, its own file or a receiver named like its type; any other call to it is a guess.
     pub field_fn: bool,
+    /// C/C++: the struct or typedef name of a field's, function's (its return value) or
+    /// typedef's type (`struct inode *i_inode` -> `inode`), for typing member calls.
+    pub ty: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -56,6 +59,10 @@ pub struct Ref {
     pub via: Option<String>,
     /// The receiver is a parameter or local (`user := ...; user.Save()`), not a package.
     pub recv_local: bool,
+    /// C: for a call through a member, the receiver's type path ending in the member
+    /// (`T:inode|i_mapping|a_ops|bmap`); for a function stored in a member (`.bmap = ext4_bmap`),
+    /// that member's path (`T:address_space_operations|bmap`). See [`c_chain`].
+    pub rtype: Option<String>,
     pos: usize,
 }
 
@@ -143,6 +150,113 @@ fn receiver_name(n: tree_sitter::Node, p: Option<tree_sitter::Node>, src: &[u8])
         .then(|| (t.to_string(), r.start_byte()))
 }
 
+/// C/C++: is field name `nn` (inside `decl`) declared as a function pointer (`(*name)(...)`)?
+fn c_fn_pointer(nn: tree_sitter::Node, decl: tree_sitter::Node) -> bool {
+    let (mut paren, mut func) = (false, false);
+    let mut cur = nn;
+    for _ in 0..8 {
+        let Some(p) = cur.parent() else { return false };
+        if p.id() == decl.id() {
+            return paren && func;
+        }
+        paren |= p.kind() == "parenthesized_declarator";
+        func |= p.kind() == "function_declarator" && paren;
+        cur = p;
+    }
+    false
+}
+
+/// C: the struct, union or typedef name a declaration (or a cast's type descriptor) names as its
+/// type: `inode` for `const struct inode *`, `irq_chip_t` for `irq_chip_t *`. None for a
+/// primitive or an anonymous struct.
+fn c_type_name(decl: tree_sitter::Node, src: &[u8]) -> Option<String> {
+    let t = decl.child_by_field_name("type")?;
+    let n = match t.kind() {
+        "struct_specifier" | "union_specifier" => t.child_by_field_name("name")?,
+        "type_identifier" => t,
+        _ => return None,
+    };
+    n.utf8_text(src).ok().filter(|s| !s.is_empty() && s.len() <= 120).map(str::to_string)
+}
+
+/// Longest receiver chain kept for a C member call (`a->b.c->d`).
+const C_CHAIN_MAX: usize = 8;
+
+/// C: a receiver expression as a type path for resolution: its base (`T:type` when the base's
+/// type is declared or cast, `F:fn` for a call's return value, `V:name` for a name of unknown
+/// type) and the fields read on the way, joined by `|`: `inode->i_mapping->a_ops` with a
+/// parameter `struct inode *inode` is `T:inode|i_mapping|a_ops`.
+fn c_chain(e: tree_sitter::Node, walk: &Walk, src: &[u8], depth: usize) -> Option<String> {
+    if depth > C_CHAIN_MAX {
+        return None;
+    }
+    let text = |n: tree_sitter::Node| n.utf8_text(src).ok().filter(|t| !t.is_empty() && t.len() <= 120).map(str::to_string);
+    match e.kind() {
+        "identifier" => Some(
+            walk.recv_types.get(&e.start_byte()).map(|t| format!("T:{t}")).unwrap_or_else(|| format!("V:{}", text(e).unwrap_or_default())),
+        ),
+        "field_expression" => {
+            let base = c_chain(e.child_by_field_name("argument")?, walk, src, depth + 1)?;
+            Some(format!("{base}|{}", text(e.child_by_field_name("field")?)?))
+        }
+        "parenthesized_expression" => c_chain(e.named_child(0)?, walk, src, depth + 1),
+        "pointer_expression" | "subscript_expression" => c_chain(e.child_by_field_name("argument")?, walk, src, depth + 1),
+        "cast_expression" => c_type_name(e.child_by_field_name("type")?, src).map(|t| format!("T:{t}")),
+        "call_expression" => {
+            let f = e.child_by_field_name("function")?;
+            (f.kind() == "identifier").then(|| text(f).map(|t| format!("F:{t}"))).flatten()
+        }
+        _ => None,
+    }
+}
+
+/// C: the member a function named as an initializer value or assigned to a field is stored in,
+/// as a type path ending in that member (see [`c_chain`]): `.bmap = ext4_bmap` in
+/// `struct address_space_operations ext4_aops = {...}` is `T:address_space_operations|bmap`,
+/// `chip->irq_mask = foo_mask` with `struct irq_chip *chip` is `T:irq_chip|irq_mask`.
+fn c_slot(value: tree_sitter::Node, parent: tree_sitter::Node, walk: &Walk, src: &[u8]) -> Option<String> {
+    match parent.kind() {
+        "assignment_expression" => {
+            let left = parent.child_by_field_name("left").filter(|l| l.kind() == "field_expression")?;
+            if parent.child_by_field_name("right")?.id() != value.id() {
+                return None;
+            }
+            c_chain(left, walk, src, 0)
+        }
+        "initializer_pair" => {
+            let mut pair = parent;
+            let mut path: Vec<String> = vec![];
+            for _ in 0..C_CHAIN_MAX {
+                // `.a.b = f`: its field designators, in order (an index designator adds none).
+                let mut w = pair.walk();
+                let names: Vec<String> = pair
+                    .children_by_field_name("designator", &mut w)
+                    .filter(|d| d.kind() == "field_designator")
+                    .filter_map(|d| d.named_child(0)?.utf8_text(src).ok().map(str::to_string))
+                    .collect();
+                path.splice(0..0, names);
+                // Up through arrays of structs (`{ { .f = x }, ... }`) to what the list initializes.
+                let mut up = pair.parent()?.parent()?;
+                while up.kind() == "initializer_list" {
+                    up = up.parent()?;
+                }
+                let base = match up.kind() {
+                    "initializer_pair" => {
+                        pair = up;
+                        continue;
+                    }
+                    "init_declarator" => c_type_name(up.parent()?, src)?,
+                    "compound_literal_expression" => c_type_name(up.child_by_field_name("type")?, src)?,
+                    _ => return None,
+                };
+                return (!path.is_empty()).then(|| format!("T:{base}|{}", path.join("|")));
+            }
+            None
+        }
+        _ => None,
+    }
+}
+
 /// Function-like nodes whose parameters and locals can shadow a function name.
 const FN_KINDS: &[&str] = &[
     "function_declaration",
@@ -160,7 +274,8 @@ const FN_KINDS: &[&str] = &[
 
 /// Parents of a value slot whose identifier may name a function (an argument, an initializer
 /// element, a keyed value), or just a parameter or local of the enclosing function.
-const VALUE_SLOTS: &[&str] = &["literal_element", "initializer_pair", "initializer_list", "argument_list", "arguments", "keyword_argument"];
+const VALUE_SLOTS: &[&str] =
+    &["literal_element", "initializer_pair", "initializer_list", "argument_list", "arguments", "keyword_argument", "assignment_expression"];
 
 /// Parameter lists: a name declared in one outside any function body (a C prototype) is no
 /// file-level local.
@@ -192,15 +307,20 @@ struct Walk<'t> {
     /// The parent of every named leaf (by node id): a reference's name node looks up its
     /// receiver here.
     parents: HashMap<usize, tree_sitter::Node<'t>>,
+    /// C: the declared struct or typedef name of each receiver identifier that names a parameter,
+    /// local or file-level variable (`struct inode *inode; inode->i_mapping`), by start byte.
+    recv_types: HashMap<usize, String>,
 }
 
 /// One top-down pass over the tree (see [`Walk`]). Linear in the tree size: ancestors are kept
 /// on a stack, never looked up with `parent()`, which walks down from the root on every call
 /// and made deeply nested functions (a long `else if` chain) quadratic.
-fn walk_tree<'t>(root: tree_sitter::Node<'t>, src: &[u8]) -> Walk<'t> {
+fn walk_tree<'t>(root: tree_sitter::Node<'t>, src: &[u8], c_lang: bool) -> Walk<'t> {
     let mut parents: HashMap<usize, tree_sitter::Node<'t>> = HashMap::new();
     // Scope 0 is the file. (parent scope, declared names)
     let mut scopes: Vec<(usize, HashSet<String>)> = vec![(0, HashSet::new())];
+    // C: per scope, the declared type of each name that has a struct or typedef type.
+    let mut types: Vec<HashMap<String, String>> = vec![HashMap::new()];
     // Open scopes: (depth of the scope node, scope index).
     let mut open: Vec<(usize, usize)> = vec![];
     // (start byte, innermost scope, name) of identifiers in value slots and receiver positions.
@@ -212,6 +332,7 @@ fn walk_tree<'t>(root: tree_sitter::Node<'t>, src: &[u8]) -> Walk<'t> {
         if is_scope(n.kind()) {
             let parent = open.last().map_or(0, |o| o.1);
             scopes.push((parent, HashSet::new()));
+            types.push(HashMap::new());
             open.push((anc.len(), scopes.len() - 1));
         }
         let scope = open.last().map_or(0, |o| o.1);
@@ -225,6 +346,12 @@ fn walk_tree<'t>(root: tree_sitter::Node<'t>, src: &[u8]) -> Walk<'t> {
                     && !anc.last().is_some_and(|p| p.kind() == "assignment" && anc.iter().any(|a| a.kind() == "module"));
             if file_ok && declares(n, &anc, src) {
                 scopes[scope].1.insert(name.to_string());
+                if c_lang
+                    && let Some(d) = anc.iter().rev().find(|a| matches!(a.kind(), "parameter_declaration" | "declaration"))
+                    && let Some(t) = c_type_name(*d, src)
+                {
+                    types[scope].insert(name.to_string(), t);
+                }
             }
             if let Some(p) = anc.last()
                 && (VALUE_SLOTS.contains(&p.kind())
@@ -259,9 +386,13 @@ fn walk_tree<'t>(root: tree_sitter::Node<'t>, src: &[u8]) -> Walk<'t> {
         }
     }
     let (mut locals, mut file_locals) = (HashSet::new(), HashMap::new());
+    let mut recv_types = HashMap::new();
     for (pos, mut sc, name) in uses {
         loop {
             if scopes[sc].1.contains(&name) {
+                if let Some(t) = types[sc].get(&name) {
+                    recv_types.insert(pos, t.clone());
+                }
                 if sc == 0 {
                     file_locals.insert(pos, name);
                 } else {
@@ -275,7 +406,7 @@ fn walk_tree<'t>(root: tree_sitter::Node<'t>, src: &[u8]) -> Walk<'t> {
             sc = scopes[sc].0;
         }
     }
-    Walk { locals, file_locals, parents }
+    Walk { locals, file_locals, parents, recv_types }
 }
 
 /// Is identifier `x` in a declaring position (a parameter or variable name, not a use)?
@@ -378,7 +509,8 @@ pub fn extract(l: &Lang, src: &[u8]) -> Parsed {
     let mut cur = QueryCursor::new();
     let mut it = cur.matches(q, tree.root_node(), src);
     let text = |n: tree_sitter::Node| n.utf8_text(src).unwrap_or("").to_string();
-    let walk = walk_tree(tree.root_node(), src);
+    let c_lang = l.name == "c";
+    let walk = walk_tree(tree.root_node(), src, c_lang);
     let c_family = l.family == "c";
     // Python `@overload` stubs and property setters/deleters, by start byte: (name, scope node).
     let mut stubs: HashMap<usize, (String, usize)> = HashMap::new();
@@ -427,18 +559,22 @@ pub fn extract(l: &Lang, src: &[u8]) -> Parsed {
             {
                 last = b;
             }
-            // A class field holding a function (`handleClick = () => {}`) is a method.
+            // A class field holding a function (`handleClick = () => {}`) is a method, and so is
+            // a C/C++ function-pointer member (`void (*irq_mask)(struct irq_data *)`).
             let field_fn = kind == FIELD
-                && node
-                    .child_by_field_name("value")
-                    .or_else(|| node.child_by_field_name("right"))
-                    .is_some_and(|v| matches!(v.kind(), "arrow_function" | "function_expression" | "function" | "lambda"));
-            if kind == FIELD
-                && node
+                && (node
                     .child_by_field_name("value")
                     .or_else(|| node.child_by_field_name("right"))
                     .is_some_and(|v| matches!(v.kind(), "arrow_function" | "function_expression" | "function" | "lambda"))
-            {
+                    || c_family && c_fn_pointer(nn, node));
+            // A field spans its name: one declaration may name several (`A, B int`).
+            let (node, last) = if kind == FIELD { (nn, nn) } else { (node, last) };
+            let ty = if c_family && matches!(kind.as_str(), "field" | "function" | "type") {
+                c_type_name(outer.map_or(node, |o| o.0), src)
+            } else {
+                None
+            };
+            if field_fn {
                 kind = "method".into();
             }
             if l.family == "python"
@@ -446,8 +582,6 @@ pub fn extract(l: &Lang, src: &[u8]) -> Parsed {
             {
                 stubs.insert(node.start_byte(), (name.clone(), scope));
             }
-            // A field spans its name: one declaration may name several (`A, B int`).
-            let (node, last) = if kind == FIELD { (nn, nn) } else { (node, last) };
             let mut w = node.walk();
             let stat = node.children(&mut w).any(|ch| ch.kind() == "storage_class_specifier" && text(ch) == "static");
             out.defs.push(Def {
@@ -462,6 +596,7 @@ pub fn extract(l: &Lang, src: &[u8]) -> Parsed {
                 decl: node.kind() == "declaration",
                 stat,
                 field_fn,
+                ty,
             });
         } else if let Some(k) = cn.strip_prefix("reference.") {
             // A value in an argument list, keyed literal or initializer (`f(name)`, `Name: name`,
@@ -482,6 +617,11 @@ pub fn extract(l: &Lang, src: &[u8]) -> Parsed {
             let rv = if recv { receiver_name(nn, parent, src) } else { None };
             let recv_local = rv.as_ref().is_some_and(|(_, at)| walk.locals.contains(at));
             let via = if kind == "import" { import_source(nn, &walk.parents, src) } else { rv.map(|x| x.0) };
+            let rtype = match (c_lang, kind, parent) {
+                (true, "call", Some(p)) if recv && p.kind() == "field_expression" => c_chain(p, &walk, src, 0),
+                (true, "ref", Some(p)) => c_slot(nn, p, &walk, src),
+                _ => None,
+            };
             out.refs.push(Ref {
                 kind,
                 name,
@@ -490,6 +630,7 @@ pub fn extract(l: &Lang, src: &[u8]) -> Parsed {
                 recv,
                 via,
                 recv_local,
+                rtype,
                 pos: nn.start_byte(),
             });
         }
@@ -1121,6 +1262,9 @@ fn store_file(
         if d.field_fn {
             meta["f"] = 1.into();
         }
+        if let Some(t) = &d.ty {
+            meta["t"] = t.as_str().into();
+        }
         ins.execute(params![pid, format!("t:{pid}:{path}#{i}"), d.name, path, d.line, d.end_line, lang, meta.to_string(), now])?;
         let id = tx.last_insert_rowid();
         ids.push(id);
@@ -1142,13 +1286,14 @@ fn store_file(
             }
         }
     }
-    let mut r = tx
-        .prepare_cached("INSERT INTO ts_ref(project_id, path, src, name, line, kind, recv, dst, via) VALUES (?1,?2,?3,?4,?5,?6,?7,0,?8)")?;
+    let mut r = tx.prepare_cached(
+        "INSERT INTO ts_ref(project_id, path, src, name, line, kind, recv, dst, via, rtype) VALUES (?1,?2,?3,?4,?5,?6,?7,0,?8,?9)",
+    )?;
     for x in &p.refs {
         let src = x.caller.map(|i| ids[i]).unwrap_or(0);
         // `recv` 2: through a receiver that is a parameter or local.
         let recv = if x.recv_local { 2 } else { x.recv as i64 };
-        r.execute(params![pid, path, src, x.name, x.line, x.kind, recv, x.via])?;
+        r.execute(params![pid, path, src, x.name, x.line, x.kind, recv, x.via, x.rtype])?;
     }
     Ok(())
 }
@@ -1249,6 +1394,167 @@ struct RefRow {
     /// Last name of the receiver (`Evaluator` in `pl.Evaluator.Preempt()`).
     via: Option<String>,
     line: i64,
+    /// See [`Ref::rtype`].
+    rtype: Option<String>,
+    /// The member a function is stored in (C), as last written.
+    slot: i64,
+}
+
+/// A C symbol a type path walks through: a struct member (field or function pointer), a
+/// typedef, or a function with its return type.
+#[derive(Clone)]
+struct CSym {
+    id: i64,
+    kind: String,
+    /// Last segment of the container name: the struct a member belongs to.
+    parent: String,
+    ty: Option<String>,
+    fnptr: bool,
+}
+
+/// What a C type path names: the member's candidates and whether the receiver's type was known
+/// (then the candidates are that type's members and no other).
+struct CRes {
+    ids: Vec<i64>,
+    typed: bool,
+}
+
+/// Most typedef steps followed from a type name (`irq_chip_t` -> `irq_chip`).
+const C_ALIAS_STEPS: usize = 4;
+
+/// C symbols by name, for typing member calls. A full run holds every C symbol up front; a scoped
+/// run reads a name's symbols from the store the first time it is asked for.
+#[derive(Default)]
+struct CTypes {
+    /// Struct members by (struct, member name).
+    member: HashMap<(String, String), Vec<CSym>>,
+    /// Typedefs and functions by name: (kind, type).
+    named: HashMap<String, Vec<(String, Option<String>)>>,
+    /// Per member name: the types fields of that name have (at most two kept: one is an answer).
+    field_tys: HashMap<String, Vec<Option<String>>>,
+    /// Per member name: the function-pointer members of that name.
+    fnptrs: HashMap<String, Vec<i64>>,
+    /// Names read from the store (scoped runs).
+    loaded: HashSet<String>,
+    all: bool,
+}
+
+impl CTypes {
+    fn add(&mut self, name: &str, s: CSym) {
+        if (s.kind == FIELD || s.fnptr) && !s.parent.is_empty() {
+            if s.fnptr {
+                self.fnptrs.entry(name.to_string()).or_default().push(s.id);
+            } else {
+                let v = self.field_tys.entry(name.to_string()).or_default();
+                if v.len() < 2 && !v.contains(&s.ty) {
+                    v.push(s.ty.clone());
+                }
+            }
+            self.member.entry((s.parent.clone(), name.to_string())).or_default().push(s);
+        } else if matches!(s.kind.as_str(), "type" | "function") {
+            self.named.entry(name.to_string()).or_default().push((s.kind, s.ty));
+        }
+    }
+
+    fn load(&mut self, name: &str, fetch: &mut dyn FnMut(&str) -> Vec<CSym>) {
+        if !self.all && self.loaded.insert(name.to_string()) {
+            for s in fetch(name) {
+                self.add(name, s);
+            }
+        }
+    }
+
+    /// `t` and the types it is a typedef of, nearest first.
+    fn aliases(&mut self, t: &str, fetch: &mut dyn FnMut(&str) -> Vec<CSym>) -> Vec<String> {
+        let mut out = vec![t.to_string()];
+        for _ in 0..C_ALIAS_STEPS {
+            let cur = out.last().cloned().unwrap_or_default();
+            self.load(&cur, fetch);
+            let next = self.named.get(&cur).and_then(|v| v.iter().find(|(k, t)| k == "type" && t.is_some())).and_then(|x| x.1.clone());
+            match next {
+                Some(n) if !out.contains(&n) => out.push(n),
+                _ => break,
+            }
+        }
+        out
+    }
+
+    /// Members named `name` of type `t` (through its typedefs).
+    fn members(&mut self, t: &str, name: &str, fetch: &mut dyn FnMut(&str) -> Vec<CSym>) -> Vec<CSym> {
+        self.load(name, fetch);
+        for t in self.aliases(t, fetch) {
+            if let Some(m) = self.member.get(&(t, name.to_string())) {
+                return m.clone();
+            }
+        }
+        vec![]
+    }
+
+    /// The type of field `name` read from a value of type `t`; with `t` unknown (or not found),
+    /// the one type every field of that name has.
+    fn field_type(&mut self, t: Option<&str>, name: &str, fetch: &mut dyn FnMut(&str) -> Vec<CSym>) -> Option<String> {
+        if let Some(t) = t
+            && let Some(f) = self.members(t, name, fetch).first()
+        {
+            return f.ty.clone();
+        }
+        self.load(name, fetch);
+        match self.field_tys.get(name).map(Vec::as_slice) {
+            Some([one]) => one.clone(),
+            _ => None,
+        }
+    }
+
+    /// Resolve a type path (see [`c_chain`]) to the member it ends in.
+    fn resolve(&mut self, path: &str, fetch: &mut dyn FnMut(&str) -> Vec<CSym>) -> CRes {
+        let segs: Vec<&str> = path.split('|').collect();
+        let Some((&last, rest)) = segs.split_last() else { return CRes { ids: vec![], typed: false } };
+        let (base, mids) = rest.split_first().map_or(("", &[][..]), |(b, m)| (*b, m));
+        let mut ty: Option<String> = if let Some(t) = base.strip_prefix("T:") {
+            Some(t.to_string())
+        } else if let Some(f) = base.strip_prefix("F:") {
+            self.load(f, fetch);
+            let rets: HashSet<&String> =
+                self.named.get(f).into_iter().flatten().filter(|(k, _)| k == "function").filter_map(|(_, t)| t.as_ref()).collect();
+            if rets.len() == 1 { rets.into_iter().next().cloned() } else { None }
+        } else {
+            None
+        };
+        for m in mids {
+            ty = self.field_type(ty.as_deref(), m, fetch);
+        }
+        if let Some(t) = &ty {
+            let m = self.members(t, last, fetch);
+            if !m.is_empty() {
+                let mut ids: Vec<i64> = m.iter().filter(|s| s.fnptr).map(|s| s.id).collect();
+                ids.sort_unstable();
+                return CRes { ids, typed: true };
+            }
+        }
+        self.load(last, fetch);
+        let mut ids = self.fnptrs.get(last).cloned().unwrap_or_default();
+        ids.sort_unstable();
+        CRes { ids, typed: false }
+    }
+}
+
+/// A C call through a member: its target among the member's candidates (lowest id first) and
+/// the ambiguity, as [`score`] returns them. A receiver of known type names its struct's member;
+/// an unknown one leaves a guess among a few same-name function-pointer members.
+fn c_member_score(c: &CRes) -> (i64, i64) {
+    match (c.ids.len(), c.typed) {
+        (0, _) => (0, 0),
+        (1, true) => (c.ids[0], 0),
+        (n, true) => (c.ids[0], n as i64),
+        (1, false) => (c.ids[0], 1),
+        (n, false) if n <= GUESS_MAX => (c.ids[0], n as i64),
+        _ => (0, 0),
+    }
+}
+
+/// Is `path` a C file (not C++ or Objective-C, where `x->f()` may call a method)?
+fn is_c_path(path: &str) -> bool {
+    lang::for_path(path).is_some_and(|l| l.name == "c")
 }
 
 /// Go: does import path `imp` name project directory `dir`? The import path ends with the
@@ -1504,6 +1810,7 @@ fn score(r: &RefRow, cands: &[Cand], imp: Option<&FileImports>) -> (i64, i64) {
     let c_fam = fam == "c";
     // Languages where a receiver's type is unknown until run time.
     let dynamic = matches!(fam, "python" | "js");
+    let c_file = c_fam && is_c_path(&r.path);
     let has_def = c_fam && cands.iter().any(|s| s.family == fam && !s.decl && (s.path == r.path || !s.file_local && !s.local));
     // A receiver named exactly like a candidate's type (`pl.Evaluator.Preempt()`) rules out a
     // same-file member of another type (a local interface with the same method).
@@ -1530,6 +1837,10 @@ fn score(r: &RefRow, cands: &[Cand], imp: Option<&FileImports>) -> (i64, i64) {
             continue;
         }
         let member = s.pid != 0 || !s.parent.is_empty();
+        // C: a function-pointer member is reached only through a receiver (see `c_member_score`).
+        if s.field_fn && s.family == "c" && c_file {
+            continue;
+        }
         // JS and Python: a name imported from a module names that module's definition; one from
         // outside the project names none of the project's.
         let source = imp.and_then(|i| i.source(fam, via.unwrap_or(&r.name), &r.path, s));
@@ -1644,7 +1955,7 @@ fn score(r: &RefRow, cands: &[Cand], imp: Option<&FileImports>) -> (i64, i64) {
     (dst, if guess { eligible.max(1) } else { 0 })
 }
 
-fn map_cand(r: &rusqlite::Row) -> rusqlite::Result<(String, Cand)> {
+fn map_cand(r: &rusqlite::Row) -> rusqlite::Result<(String, Cand, Option<String>)> {
     let lang: String = r.get(6)?;
     let path: String = r.get(2)?;
     let file_local = r.get::<_, Option<i64>>(8)?.is_some() && !is_header(&path);
@@ -1662,12 +1973,25 @@ fn map_cand(r: &rusqlite::Row) -> rusqlite::Result<(String, Cand)> {
             file_local,
             field_fn: r.get::<_, Option<i64>>(9)?.is_some(),
         },
+        r.get(10)?,
     ))
 }
 
 const CAND_COLS: &str = "id, name, path, json_extract(meta,'$.k'), COALESCE(json_extract(meta,'$.pid'),0), \
-     COALESCE(json_extract(meta,'$.parent'),''), lang, json_extract(meta,'$.d'), json_extract(meta,'$.s'), json_extract(meta,'$.f')";
-const REF_COLS: &str = "rowid, path, src, name, kind, dst, recv, amb, line, via";
+     COALESCE(json_extract(meta,'$.parent'),''), lang, json_extract(meta,'$.d'), json_extract(meta,'$.s'), json_extract(meta,'$.f'), \
+     json_extract(meta,'$.t')";
+const REF_COLS: &str = "rowid, path, src, name, kind, dst, recv, amb, line, via, rtype, slot";
+
+/// The C symbol a candidate row stands for, when it is one a type path may walk through.
+fn c_sym_of(c: &Cand, ty: Option<String>) -> Option<CSym> {
+    (c.family == "c" && (c.kind == FIELD || c.field_fn || c.kind == "type" || c.kind == "function" && ty.is_some())).then(|| CSym {
+        id: c.id,
+        kind: c.kind.clone(),
+        parent: c.parent.clone(),
+        ty,
+        fnptr: c.field_fn,
+    })
+}
 
 fn map_ref(r: &rusqlite::Row) -> rusqlite::Result<RefRow> {
     Ok(RefRow {
@@ -1685,6 +2009,8 @@ fn map_ref(r: &rusqlite::Row) -> rusqlite::Result<RefRow> {
         enclosing: vec![],
         line: r.get(8)?,
         via: r.get(9)?,
+        rtype: r.get(10)?,
+        slot: r.get(11)?,
     })
 }
 
@@ -1763,15 +2089,28 @@ pub fn resolve_scoped(tx: &Connection, pid: i64, scope: Option<(&HashSet<String>
     let go_srcs: HashSet<i64> =
         refs.iter().filter(|r| r.recv_local && lang::for_path(&r.path).is_some_and(|l| l.family == "go")).map(|r| r.src).collect();
     let mut type_of: HashMap<i64, String> = HashMap::new();
+    // C references whose target follows from a type path (member calls, functions stored in members).
+    let c_refs: Vec<usize> = refs
+        .iter()
+        .enumerate()
+        .filter(|(_, r)| (r.kind == "call" && r.recv || r.kind == "ref" && r.rtype.is_some()) && is_c_path(&r.path))
+        .map(|(i, _)| i)
+        .collect();
+    let mut ctypes = CTypes { all: scope.is_none(), ..Default::default() };
     match scope {
         None => {
             let mut q = tx.prepare(&format!(
                 "SELECT {CAND_COLS} FROM node WHERE project_id = ?1 AND kind = 'symbol' AND source = 'treesitter' ORDER BY id"
             ))?;
-            for (name, c) in q.query_map([pid], map_cand)?.flatten() {
+            for (name, c, ty) in q.query_map([pid], map_cand)?.flatten() {
                 parent_of.insert(c.id, (c.pid, is_callable_kind(&c.kind)));
                 if go_srcs.contains(&c.id) {
                     type_of.insert(c.id, c.parent.clone());
+                }
+                if !c_refs.is_empty()
+                    && let Some(cs) = c_sym_of(&c, ty)
+                {
+                    ctypes.add(&name, cs);
                 }
                 if c.kind != FIELD {
                     cands.entry(name).or_default().push(c);
@@ -1787,7 +2126,7 @@ pub fn resolve_scoped(tx: &Connection, pid: i64, scope: Option<(&HashSet<String>
                 let mut v: Vec<Cand> = q
                     .query_map(params![pid, n], map_cand)?
                     .flatten()
-                    .filter(|(name, c)| name == n && c.kind != FIELD)
+                    .filter(|(name, c, _)| name == n && c.kind != FIELD)
                     .map(|x| x.1)
                     .collect();
                 v.sort_by_key(|c| c.id);
@@ -1844,9 +2183,51 @@ pub fn resolve_scoped(tx: &Connection, pid: i64, scope: Option<(&HashSet<String>
         }
     }
     trace("resolve: candidates loaded", t0);
-    // 3. Score in parallel; write only what changed.
-    let mut scored: Vec<(i64, i64)> =
-        refs.par_iter().map(|r| score(r, cands.get(&r.name).map(Vec::as_slice).unwrap_or(&[]), imports.get(&r.path))).collect();
+    // C type paths, each resolved once: per C reference, its result in `cres_all`.
+    let mut cres_all: Vec<CRes> = vec![];
+    let mut cres: HashMap<usize, usize> = HashMap::new();
+    if !c_refs.is_empty() {
+        let mut q = tx.prepare_cached(&format!(
+            "SELECT {CAND_COLS} FROM node WHERE project_id = ?1 AND kind = 'symbol' AND name = ?2 COLLATE NOCASE AND source = 'treesitter'"
+        ))?;
+        let mut fetch = |n: &str| -> Vec<CSym> {
+            q.query_map(params![pid, n], map_cand)
+                .map(|it| it.flatten().filter(|(name, _, _)| name == n).filter_map(|(_, c, ty)| c_sym_of(&c, ty)).collect())
+                .unwrap_or_default()
+        };
+        let mut memo: HashMap<String, usize> = HashMap::new();
+        for &i in &c_refs {
+            let r = &refs[i];
+            let path = r.rtype.clone().unwrap_or_else(|| format!("V:|{}", r.name));
+            let k = match memo.get(&path) {
+                Some(&k) => k,
+                None => {
+                    cres_all.push(ctypes.resolve(&path, &mut fetch));
+                    memo.insert(path, cres_all.len() - 1);
+                    cres_all.len() - 1
+                }
+            };
+            cres.insert(i, k);
+        }
+        trace("resolve: C type paths", t0);
+    }
+    drop(ctypes);
+    // 3. Score in parallel; write only what changed. A C call through a member reaches that
+    //    member; a function stored in a member records it as its slot.
+    let mut scored: Vec<(i64, i64, i64)> = refs
+        .par_iter()
+        .enumerate()
+        .map(|(i, r)| {
+            let c = cres.get(&i).map(|&k| &cres_all[k]);
+            if let Some(c) = c.filter(|_| r.kind == "call") {
+                let (d, a) = c_member_score(c);
+                return (d, a, 0);
+            }
+            let (d, a) = score(r, cands.get(&r.name).map(Vec::as_slice).unwrap_or(&[]), imports.get(&r.path));
+            let slot = c.filter(|c| c.typed || c.ids.len() == 1).and_then(|c| c.ids.first().copied()).filter(|_| d != 0).unwrap_or(0);
+            (d, a, slot)
+        })
+        .collect();
     trace("resolve: scored", t0);
     let mut out = Resolved { rescored: refs.len(), ..Default::default() };
     // 4. The precise tier: a fresh SCIP import overrides the name resolution where it knows the target.
@@ -1860,19 +2241,19 @@ pub fn resolve_scoped(tx: &Connection, pid: i64, scope: Option<(&HashSet<String>
                 if s.0 != dst || s.1 > 0 {
                     out.upgraded += 1;
                 }
-                *s = (dst, -1);
+                *s = (dst, -1, s.2);
                 out.precise += 1;
             }
         }
         trace("resolve: scip overlay", t0);
     }
-    let mut upd = tx.prepare_cached("UPDATE ts_ref SET dst = ?2, amb = ?3 WHERE rowid = ?1")?;
+    let mut upd = tx.prepare_cached("UPDATE ts_ref SET dst = ?2, amb = ?3, slot = ?4 WHERE rowid = ?1")?;
     let class = |k: &str| if k == "call" { "CALLS" } else { "REFERENCES" };
     let mut touched: HashSet<(i64, i64, &'static str)> = HashSet::new();
     let mut edges: HashSet<(i64, i64, &'static str)> = HashSet::new();
-    for (r, &(dst, amb)) in refs.iter().zip(&scored) {
-        if dst != r.dst || amb != r.amb {
-            upd.execute(params![r.rowid, dst, amb])?;
+    for (r, &(dst, amb, slot)) in refs.iter().zip(&scored) {
+        if dst != r.dst || amb != r.amb || slot != r.slot {
+            upd.execute(params![r.rowid, dst, amb, slot])?;
         }
         if dst != 0 {
             out.resolved += 1;
@@ -1969,6 +2350,8 @@ mod via_tests {
             enclosing: vec![],
             via: Some(via.into()),
             line: 9,
+            rtype: None,
+            slot: 0,
         }
     }
 

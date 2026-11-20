@@ -21,4 +21,8 @@
 (field_declaration declarator: [(field_identifier) @name
   (pointer_declarator declarator: [(field_identifier) @name (pointer_declarator declarator: (field_identifier) @name)])
   (reference_declarator (field_identifier) @name)
-  (array_declarator declarator: (field_identifier) @name)]) @definition.field
+  (array_declarator declarator: (field_identifier) @name)
+  ; A function-pointer member (`void (*irq_mask)(struct irq_data *)`, also returning a pointer):
+  ; indexed as a method of its struct, the target of calls through it.
+  (function_declarator declarator: (parenthesized_declarator (pointer_declarator declarator: (field_identifier) @name)))
+  (pointer_declarator declarator: (function_declarator declarator: (parenthesized_declarator (pointer_declarator declarator: (field_identifier) @name))))]) @definition.field
