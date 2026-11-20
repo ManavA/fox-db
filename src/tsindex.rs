@@ -835,6 +835,8 @@ pub fn index_project_with(c: &mut Connection, p: &Project, delta: Option<&crate:
         tx.execute("DELETE FROM ts_file WHERE project_id = ?1 AND path = ?2", params![p.id, path])?;
         st.removed += 1;
     }
+    // Each file's word row, written after the loop in rowid order (see `store_words`).
+    let mut words_rows: Vec<(String, String)> = Vec::new();
     for w in work {
         match w {
             Work::Touch(path, size, mtime) => {
@@ -850,7 +852,7 @@ pub fn index_project_with(c: &mut Connection, p: &Project, delta: Option<&crate:
                     params![p.id, path, size, mtime],
                 )?;
                 store_bodies(&tx, &sink, p.id, &path, &texts, fill.then_some(&mut emitted))?;
-                store_words(&tx, p.id, &path, &words)?;
+                words_rows.push((path, words));
                 st.unchanged += 1;
             }
             Work::Parse { path, lang, hash, size, mtime, parsed, texts, words } => {
@@ -861,17 +863,22 @@ pub fn index_project_with(c: &mut Connection, p: &Project, delta: Option<&crate:
                 sc_names.extend(parsed.defs.iter().map(|d| d.name.clone()));
                 sc_paths.insert(path.clone());
                 store_file(&tx, &sink, p.id, &path, lang, &parsed, &texts, fill.then_some(&mut emitted))?;
-                store_words(&tx, p.id, &path, &words)?;
                 tx.execute(
                     "INSERT OR REPLACE INTO ts_file(project_id, path, lang, hash, size, mtime) VALUES (?1,?2,?3,?4,?5,?6)",
                     params![p.id, path, lang, hash, size, mtime],
                 )?;
+                words_rows.push((path, words));
                 st.parsed += 1;
                 st.symbols += parsed.defs.len();
                 st.refs += parsed.refs.len();
             }
         }
     }
+    words_rows.sort_by_cached_key(|(path, _)| word_rowid(p.id, path));
+    for (path, words) in &words_rows {
+        store_words(&tx, p.id, path, words)?;
+    }
+    drop(words_rows);
     if bulk {
         tx.execute_batch("CREATE INDEX IF NOT EXISTS ts_ref_name ON ts_ref(project_id, name)")?;
     }
@@ -984,6 +991,10 @@ pub fn file_words(src: &[u8]) -> String {
     out
 }
 
+/// Write a file's `fts_word` row. A run writes its rows in ascending rowid order: FTS5 flushes
+/// its pending terms to a new segment whenever a rowid is below the previous one, and these
+/// rowids are path hashes, so file order flushed about every other row and a cold index of a
+/// large tree went quadratic.
 fn store_words(tx: &Connection, pid: i64, path: &str, words: &str) -> Result<()> {
     let id = word_rowid(pid, path);
     tx.execute("DELETE FROM fts_word WHERE rowid = ?1", [id])?;
