@@ -1,7 +1,7 @@
 {
   "name": "foxdb",
   "displayName": "foxdb",
-  "version": "0.2.3",
+  "version": "0.2.4",
   "description": "Local code graph and index for coding agents: the fox_* MCP tools, the session and subagent brief hooks, the foxdb skill and the fox CLI. Needs fox installed in ~/.foxdb (scripts/install.sh).",
   "author": {
     "name": "ManavA",

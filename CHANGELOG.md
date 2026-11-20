@@ -1,6 +1,10 @@
 # Changelog
 
-## 0.2.3 (2026-11-19)
+## 0.2.4 (2026-11-19)
+
+The v0.2.3 tag was never released: CI caught that ties between same-score candidates broke differently per filesystem. 0.2.4 is 0.2.3 plus that fix.
+
+- Ties break the same way everywhere: files are indexed in path order. A Python call through a whole-module import (`import core; core.plan()`) resolves to that module's function.
 
 First answers that were empty, wrong or padded in agent benchmark transcripts are fixed.
 
