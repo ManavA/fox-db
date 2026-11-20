@@ -91,6 +91,30 @@ fn indexing_leaves_planner_statistics_so_per_file_deletes_use_the_path_index() {
     assert!(!plan.contains("node_sym_probe"), "per-file delete scans every project symbol: {plan}");
 }
 
+/// FTS5 flushes its pending terms to a new segment whenever a row's id is below the previous
+/// one (merges are deferred, see `db::fts_merge`). `fts_word` rowids are path hashes, so writing
+/// them in file order flushed a segment for about every other file, and a cold index of a large
+/// tree went quadratic (the Linux kernel did not finish in five hours). The rows go in rowid
+/// order instead: a small project's words fit one flush, so one segment, like the other tables.
+#[test]
+fn a_cold_index_writes_the_word_index_in_rowid_order() {
+    let _g = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    let _h = home();
+    let repo = tempfile::tempdir().unwrap();
+    let n = 400;
+    for i in 0..n {
+        write(repo.path(), &format!("pkg/m{}/f{i}.go", i % 20), &format!("package m\n\nfunc Unique{i}() int {{ return {i} }}\n"));
+    }
+    let mut c = db::open_rw().unwrap();
+    let (_, st) = index(&mut c, repo.path());
+    assert_eq!(st.parsed, n);
+    assert_eq!(db::fts_segments(&c, "fts_body"), 1);
+    let segments = db::fts_segments(&c, "fts_word");
+    assert_eq!(segments, 1, "fts_word holds {segments} segments for {n} small files: its rows are not written in rowid order");
+    let path: String = c.query_row("SELECT path FROM fts_word WHERE fts_word MATCH '\"~unique399\"'", [], |r| r.get(0)).unwrap();
+    assert_eq!(path, "pkg/m19/f399.go", "every file's words are still found");
+}
+
 #[test]
 fn incremental_resolve_rescores_only_the_change_and_matches_a_full_resolve() {
     let _g = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
