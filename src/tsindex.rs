@@ -568,7 +568,7 @@ fn import_source(n: tree_sitter::Node, parents: &HashMap<usize, tree_sitter::Nod
 
 /// Dedupe definitions, link each to its innermost enclosing definition, and refs to theirs.
 fn nest(p: &mut Parsed) {
-    p.defs.sort_by(|a, b| (a.start, std::cmp::Reverse(a.end)).cmp(&(b.start, std::cmp::Reverse(b.end))));
+    p.defs.sort_by_key(|d| (d.start, std::cmp::Reverse(d.end)));
     // Same name on the same line from two patterns (declaration vs definition): keep the widest,
     // and an explicit container name from either.
     let mut first: HashMap<(String, u32), usize> = HashMap::new();
@@ -632,7 +632,7 @@ fn nest(p: &mut Parsed) {
         "ref" => 2,
         _ => 3,
     };
-    p.refs.sort_by(|a, b| (a.pos, rank(a.kind)).cmp(&(b.pos, rank(b.kind))));
+    p.refs.sort_by_key(|r| (r.pos, rank(r.kind)));
     p.refs.dedup_by(|a, b| a.pos == b.pos && a.name == b.name);
     let mut stack: Vec<usize> = vec![];
     let mut di = 0;

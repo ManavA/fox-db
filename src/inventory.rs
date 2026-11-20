@@ -439,9 +439,9 @@ fn summarize_dir(abs: &Path) -> serde_json::Value {
         }
     }
     let mut ext: Vec<_> = by_ext.into_iter().collect();
-    ext.sort_by(|a, b| b.1.cmp(&a.1));
+    ext.sort_by_key(|e| std::cmp::Reverse(e.1));
     ext.truncate(8);
-    newest.sort_by(|a, b| b.0.cmp(&a.0));
+    newest.sort_by_key(|n| std::cmp::Reverse(n.0));
     newest.truncate(5);
     serde_json::json!({
         "policy": "name_only", "files": files, "dirs": dirs, "bytes": bytes, "truncated": truncated,
