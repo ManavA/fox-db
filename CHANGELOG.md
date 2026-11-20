@@ -8,29 +8,25 @@ First answers that were empty, wrong or padded in agent benchmark transcripts ar
   agents read bodies with the native Read instead. The brief's tool line now names
   `fox_read target=<handle>` as the way to read a body.
 - `callers`, `refs` and `impact` account for every line that names the target as a whole word
-  in the indexed code of its language, so the answer is a labelled superset of `rg -w name`
-  there. The first line counts them by group (`16 lines name `f`: 7 calls, 1 definition,
-  5 imports, 2 declarations/prototypes, 1 in 1 same-name definition elsewhere, 1 comment; all
-  accounted for`); imports, C/C++ prototypes and `extern`s, same-name definitions of other
-  classes or packages (marked as different symbols), comments and docstrings, and strings
-  (which may be dynamic uses) follow as groups of `path:line | code` rows, after the
-  unresolved mentions. A line counts as accounted for only when it is positively classified:
-  renamed imports, lines with no reference inside another same-name definition, and lines
-  whose strings and comments could not be told apart with confidence (strings spanning lines,
-  raw strings, a JS regex, JSX text) are unresolved and make it read `may be incomplete`
-  (`partial at d1`). It says the index is stale when a cited file's content changed or a file
-  added since indexing names the target. Each group lists a few hundred rows at most at any
-  budget and counts the rest; the count is built once per index generation and only for the
-  pages that show it, from a parallel scan capped at 400 MB or 2.5 s (first page about 0.3 s on
-  kubernetes `Get` and a kernel-subset `kfree`). A name with no indexed definition lists its
-  lines instead of answering nothing. On 80 scrapy commits that removed or re-signed a
-  function, the share of the lines those commits changed that callers plus refs list went from
-  34% to 71% (the row caps list at most 200 unresolved and 50 same-name rows per answer, which
-  costs a few of the commonest names).
+  in the code of its language, so the answer is a labelled superset of `rg -w name` there. The
+  first line counts them by group (`16 lines name `f`: 7 calls, 1 definition, 5 imports,
+  2 declarations/prototypes, 1 in 1 same-name definition elsewhere, 1 comment; all accounted
+  for`); comments and strings come from the file's tree-sitter parse, and names in strings are
+  counted as possible dynamic uses. It reads `all accounted for` only when every line is
+  positively classified, the scan was complete and the index is proven fresh (no cited file
+  changed, no code file added or edited since indexing that names it, none too big to index,
+  nothing pending); otherwise it says what is missing. A complete answer adds nothing else; an
+  incomplete one lists at most 20 rows (unresolved lines first, then references that are not
+  calls, declarations and imports) and counts the rest. The count is built once per index
+  generation on a few threads, capped at 5000 files, 200 MB or 2 s. A name with no indexed
+  definition lists its lines instead of answering nothing. On 80 scrapy commits that removed or
+  re-signed a function, the share of the lines those commits changed that callers plus refs
+  list went from 34% to 37% (only 20 rows are listed; the rest are counted in the first line).
 - A call through a module, another type's value or an unrelated receiver no longer resolves
   with certainty to a same-name definition in its own file (`core.plan()` beside a local
-  `plan`, Go `s.inner.Plan()` inside `Server.Plan`, Kotlin `i.plan()`). Every project's
-  references re-score once (store schema 22).
+  `plan`, Go `s.inner.Plan()` inside `Server.Plan` or `x.plan()` on a local of another type,
+  Kotlin `i.plan()`); Swift calls reach Objective-C methods. Every project's references
+  re-score once (store schema 22).
 - Python `@overload` stubs and property setters/deleters beside their definition are no
   symbols of their own, so the name has one match and calls to it are certain (`must_defer`
   with three stubs said "4 matches" and every call was `guess 1 of 4`); the stub lines count as

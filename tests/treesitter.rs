@@ -428,10 +428,15 @@ fn non_call_mentions_do_not_read_as_incomplete() {
     ]);
     let out = fox_code(&p, "plan_query", "callers", 800);
     assert!(!out.contains("may be incomplete"), "{out}");
-    assert!(out.starts_with("6 lines name `plan_query`: 1 call, 1 definition, 1 import, 3 comments; all accounted for\n"), "{out}");
-    // Files of another language (web/names.ts) are not counted.
-    assert!(out.contains("import lines:\n  include/proto.h:3 | #include \"plan_query.h\"\n") && !out.contains("web/names.ts"), "{out}");
-    assert!(out.contains("comment lines:\n  include/proto.h:1 | /* see plan_query */"), "{out}");
+    // The `#include "plan_query.h"` path is a string; files of another language (web/names.ts)
+    // are not counted; a complete answer lists no extra rows.
+    assert!(
+        out.starts_with(
+            "6 lines name `plan_query`: 1 call, 1 definition, 3 comments, 1 in strings (may be dynamic uses); all accounted for\n"
+        ),
+        "{out}"
+    );
+    assert!(!out.contains("web/names.ts") && !out.contains("include/proto.h"), "{out}");
     let out = fox_code(&p, "plan_query", "impact", 800);
     assert!(!out.contains("partial"), "{out}");
     // A line that may call it reads as incomplete; the others are still accounted for.
@@ -442,14 +447,10 @@ fn non_call_mentions_do_not_read_as_incomplete() {
     ]);
     let out = fox_code(&p, "plan_query", "callers", 800);
     assert!(
-        out.starts_with("4 lines name `plan_query`: 1 call, 1 definition, 1 import, 1 unresolved; may be incomplete: 1 unresolved line may use it, listed under unresolved mentions\n"),
+        out.starts_with("4 lines name `plan_query`: 1 call, 1 definition, 1 in strings (may be dynamic uses), 1 unresolved; may be incomplete: 1 unresolved line may use it\n"),
         "{out}"
     );
-    assert!(
-        out.contains("unresolved mentions:\n  mm/b.c:1 | #define USE_B() plan_query(2)")
-            && out.contains("import lines:\n  include/proto.h:1 |"),
-        "{out}"
-    );
+    assert!(out.contains("unresolved mentions:\n  mm/b.c:1 | #define USE_B() plan_query(2)") && !out.contains("include/proto.h"), "{out}");
 }
 
 /// A first-level impact row shows the line that uses the target, not only the dependent's

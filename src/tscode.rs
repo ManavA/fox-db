@@ -795,43 +795,21 @@ pub fn run(c: &Connection, p: &Project, sym: &str, rel: &str, depth: usize, curs
     }
     lines.extend(tail);
     lines.push("~ tree-sitter, name-resolved".into());
-    // What the code rows add when they ride along: a budget that lists the ledger's rows must
-    // hold them too.
-    let before_fit: usize = lines.iter().map(|l| l.len() + 1).sum();
     if matches!(rel, "callers" | "refs" | "impact") {
         fit_code(&mut lines, budget);
     }
-    let code_extra = before_fit.saturating_sub(lines.iter().map(|l| l.len() + 1).sum());
     if let Some((at_lines, linked, mode, guessed)) = ledger {
-        // A later page that ends before the groups needs no ledger: its rows are the answer's
-        // own, at the same places (the accounting line counted as the first).
-        if cursor > 0 {
-            let probe: Vec<String> = std::iter::once(String::new()).chain(lines.iter().cloned()).collect();
-            let text = page(&probe, cursor, budget);
-            let next = text.rsplit_once("cursor=").and_then(|x| x.1.trim().parse::<usize>().ok());
-            if next.is_some_and(|k| k < probe.len() - 1) {
-                return Ok(Some(text));
-            }
-        }
-        let mut l = account::account(c, p, &top.name, Some(top), &at_lines, &linked, mode)?;
-        l.set_guessed(guessed);
-        lines.insert(0, l.head().unwrap_or_else(|| format!("no line names `{}` in the indexed code", top.name)));
-        ledger_rows(&mut lines, &l, budget, code_extra);
+        let l = account::account(c, p, &top.name, Some(top), &at_lines, &linked, mode)?;
+        lines.insert(0, l.head(guessed).unwrap_or_else(|| format!("no line names `{}` in the indexed code", top.name)));
+        ledger_rows(&mut lines, &l);
     }
     Ok(Some(page(&lines, cursor, budget)))
 }
 
-/// The ledger's groups before the last line, trimmed to what the budget leaves on the page
-/// they start (a third of a page at least).
-fn ledger_rows(lines: &mut Vec<String>, l: &account::Ledger, budget: usize, code_extra: usize) {
-    let main: usize = lines.iter().map(|l| l.len() + 1).sum();
-    let page_bytes = budget.clamp(32, 4000) * 4;
-    let room = if main + 64 <= page_bytes {
-        page_bytes - 64 - main
-    } else {
-        page_bytes.saturating_sub(64 + main % page_bytes).max(page_bytes / 3)
-    };
-    let rows = l.tail(room, main + code_extra);
+/// The ledger's few listed rows (imports, declarations, some unresolved lines), before the
+/// answer's last line.
+fn ledger_rows(lines: &mut Vec<String>, l: &account::Ledger) {
+    let rows = l.tail();
     let at = lines.len().saturating_sub(1);
     lines.splice(at..at, rows);
 }
@@ -842,9 +820,9 @@ fn name_only(c: &Connection, p: &Project, name: &str, rel: &str, cursor: usize, 
         return Ok(None);
     }
     let l = account::account(c, p, name, None, &HashSet::new(), &[], account::Mode::Name)?;
-    let Some(head) = l.head() else { return Ok(None) };
+    let Some(head) = l.head(0) else { return Ok(None) };
     let mut lines = vec![head, format!("{rel} of `{name}`: no indexed definition"), "~ tree-sitter, by name".to_string()];
-    ledger_rows(&mut lines, &l, budget, 0);
+    ledger_rows(&mut lines, &l);
     Ok(Some(page(&lines, cursor, budget)))
 }
 

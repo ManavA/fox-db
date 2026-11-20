@@ -97,6 +97,12 @@ pub fn by_name(name: &str) -> Option<&'static Lang> {
     LANGS.iter().find(|l| l.name == name)
 }
 
+/// Whether code of family `a` may call definitions of family `b`: the same family, or Swift and
+/// the C family (Objective-C and C headers bridged into Swift).
+pub fn interop(a: &str, b: &str) -> bool {
+    a == b || matches!((a, b), ("swift", "c") | ("c", "swift"))
+}
+
 pub fn for_path(path: &str) -> Option<&'static Lang> {
     let ext = path.rsplit_once('.')?.1.to_ascii_lowercase();
     LANGS.iter().find(|l| l.exts.contains(&ext.as_str()))

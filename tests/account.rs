@@ -60,12 +60,8 @@ fn python_lines_are_accounted_for_by_group() {
         "{out}"
     );
     assert!(out.contains("callers of ~c:") && out.contains(":8 run c:"), "{out}");
-    assert!(out.contains("import lines:\n  app/run.py:2 | from lib import fetch_page"), "{out}");
-    assert!(out.contains("same-name definitions elsewhere (different symbols; 1 line using them not listed):\n  lib/other.py:2 method Mirror.fetch_page c:"), "{out}");
-    assert!(out.contains("comment lines:\n  app/run.py:6 | # fetch_page is slow"), "{out}");
-    assert!(out.contains("lib/fetch.py:3 |"), "{out}");
-    // The line inside the other definition is counted, not listed.
-    assert!(!out.contains("lib/other.py:3"), "{out}");
+    // A complete answer lists no extra rows: the counts say it all.
+    assert!(!out.contains("import lines:") && !out.contains("lib/other.py") && !out.contains("app/run.py:6"), "{out}");
     assert!(!out.contains("unresolved mentions") && !out.contains("may be incomplete"), "{out}");
     // `refs` and `impact` account for the same lines.
     let out = fox_code(&p, "Fetcher.fetch_page", "refs", 2000);
@@ -99,7 +95,7 @@ fn c_prototypes_are_declarations_and_unknown_uses_are_listed() {
     let out = fox_code(&p, "plan_query", "callers", 2000);
     assert_eq!(
         first(&out),
-        "7 lines name `plan_query`: 2 calls, 1 definition, 2 declarations/prototypes, 1 comment, 1 unresolved; may be incomplete: 1 unresolved line may use it, listed under unresolved mentions",
+        "7 lines name `plan_query`: 2 calls, 1 definition, 2 declarations/prototypes, 1 comment, 1 unresolved; may be incomplete: 1 unresolved line may use it",
         "{out}"
     );
     assert!(out.contains("unresolved mentions:\n  src/other.c:3 | static int (*fp)(int) = plan_query;"), "{out}");
@@ -129,10 +125,9 @@ fn a_stale_index_is_named() {
     assert!(!out.contains("all accounted for"), "{out}");
 }
 
-/// A common name stays within a small budget: counts for every group, a few rows each, and
-/// the budget that lists them all; that budget does.
+/// A common name stays short at every budget: counts for every group and a few rows.
 #[test]
-fn common_names_keep_to_the_budget_and_name_the_budget_that_lists_all() {
+fn common_names_list_a_few_rows_at_any_budget() {
     let _g = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
     let mut files: Vec<(String, String)> = vec![
         ("lib/sock.py".into(), "def close_all(s):\n    return s\n".into()),
@@ -146,19 +141,12 @@ fn common_names_keep_to_the_budget_and_name_the_budget_that_lists_all() {
     }
     let refs: Vec<(&str, &str)> = files.iter().map(|(a, b)| (a.as_str(), b.as_str())).collect();
     let (_h, _r, p) = inline_project(&refs);
-    let out = fox_code(&p, "close_all", "callers", 400);
-    assert!(first(&out).starts_with("63 lines name `close_all`: 1 call, 1 definition, 1 import, 30 comments, 30 unresolved;"), "{out}");
-    assert!(out.len() <= 400 * 4 + 200, "{} bytes\n{out}", out.len());
-    assert!(out.contains("unresolved mentions (first ") && out.contains("comment lines (first 2 of 30):"), "{out}");
-    let need: usize = out
-        .lines()
-        .find_map(|l| l.strip_prefix("rows left out to fit the budget; budget=").and_then(|r| r.split(' ').next()?.parse().ok()))
-        .unwrap_or_else(|| panic!("no budget named\n{out}"));
-    let out = fox_code(&p, "close_all", "callers", need);
-    assert!(out.contains("unresolved mentions:\n") && !out.contains("rows left out"), "{out}");
-    assert_eq!(out.lines().filter(|l| l.starts_with("  mod/") && l.contains("[x.close_all")).count(), 30, "{out}");
-    // Comments are counted and only a few listed, whatever the budget.
-    assert!(out.contains("comment lines (first 5 of 30):"), "{out}");
+    for budget in [400, 4000] {
+        let out = fox_code(&p, "close_all", "callers", budget);
+        assert!(first(&out).starts_with("63 lines name `close_all`: 1 call, 1 definition, 1 import, 30 comments, 30 unresolved;"), "{out}");
+        assert!(out.lines().filter(|l| l.starts_with("  mod/")).count() <= 20, "{out}");
+        assert!(out.contains("more lines are counted, not listed") && !out.contains("comment lines"), "{out}");
+    }
 }
 
 /// A name with no indexed definition that grep would find is never an empty answer.
@@ -363,11 +351,12 @@ fn renamed_imports_are_unresolved() {
     assert!(!ends_complete(&out) && out.contains("use.ts:1 "), "{out}");
 }
 
-/// Staleness: a file whose time moved but whose content did not is current; the upgrade's
-/// re-parse marker is no staleness; a file added since indexing that names the target is, and
-/// no file is named twice.
+/// Freshness: a file whose time moved but whose content did not is current; the upgrade's
+/// re-parse marker reads as pending; a file added since indexing (in a new directory too) or an
+/// uncited file edited in place to name the target makes it stale, named once; a file too big
+/// to index that names it makes it incomplete.
 #[test]
-fn staleness_is_precise() {
+fn freshness_is_proven() {
     let _g = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
     let (_h, r, p) = inline_project(PY);
     let f = r.path().join("app/run.py");
@@ -376,17 +365,39 @@ fn staleness_is_precise() {
     drop(t);
     let out = fox_code(&p, "Fetcher.fetch_page", "callers", 2000);
     assert!(ends_complete(&out), "touched only: {out}");
+    let bump = || {
+        let c = db::open_rw().unwrap();
+        db::bump_generation(&c).unwrap();
+    };
     {
         let c = db::open_rw().unwrap();
         c.execute("UPDATE ts_file SET size = -1 WHERE path = 'lib/other.py'", []).unwrap();
+        db::bump_generation(&c).unwrap();
     }
     let out = fox_code(&p, "Fetcher.fetch_page", "callers", 2000);
-    assert!(ends_complete(&out), "migration marker: {out}");
-    std::fs::write(r.path().join("app/new.py"), "from lib.fetch import Fetcher\n\n\ndef more(f: Fetcher):\n    return f.fetch_page(1)\n")
-        .unwrap();
+    assert!(first(&out).contains("may be incomplete: the index is being updated"), "migration marker: {out}");
+    let (_h, r, p) = inline_project(PY);
+    std::fs::create_dir_all(r.path().join("new/deep")).unwrap();
+    std::fs::write(r.path().join("new/deep/more.py"), "def more(f):\n    return f.fetch_page(1)\n").unwrap();
+    bump();
     let out = fox_code(&p, "Fetcher.fetch_page", "callers", 2000);
-    assert!(first(&out).contains("the index is stale for 1 file (app/new.py)"), "added: {out}");
-    assert_eq!(first(&out).matches("app/new.py").count(), 1, "{out}");
+    assert!(first(&out).contains("the index is stale for 1 file (new/deep/more.py)"), "added: {out}");
+    assert_eq!(first(&out).matches("new/deep/more.py").count(), 1, "{out}");
+    let (_h, r, p) = inline_project(&[PY[0], PY[1], PY[2], ("app/quiet.py", "def quiet():\n    return 1\n")]);
+    std::fs::write(r.path().join("app/quiet.py"), "def quiet(f):\n    return f.fetch_page(2)\n").unwrap();
+    bump();
+    let out = fox_code(&p, "Fetcher.fetch_page", "callers", 2000);
+    assert!(first(&out).contains("the index is stale for 1 file (app/quiet.py)"), "edited: {out}");
+    let (_h, r, p) = inline_project(PY);
+    let big = format!("def big(f):\n    return f.fetch_page(3)\n{}", "x = 1\n".repeat(400_000));
+    std::fs::write(r.path().join("app/big.py"), big).unwrap();
+    {
+        let mut c = db::open_rw().unwrap();
+        inventory::index_project(&mut c, &p).unwrap();
+        tsindex::index_project(&mut c, &p).unwrap();
+    }
+    let out = fox_code(&p, "Fetcher.fetch_page", "callers", 2000);
+    assert!(first(&out).contains("may be incomplete: 1 file too big to index name it (app/big.py)"), "big: {out}");
 }
 
 /// Only files of the target's language count, a Python stub line of another symbol is no
@@ -426,9 +437,114 @@ fn big_ledgers_cap_rows_and_lead_with_plausible_receivers() {
     for budget in [400, 3999, 4000] {
         let out = fox_code(&p, "Store.fetch", "callers", budget);
         let listed = out.lines().filter(|l| l.starts_with("  mod/")).count();
-        assert!(listed <= 200, "{budget}: {listed}");
+        assert!(listed <= 20, "{budget}: {listed}");
         assert!(!out.contains("(first 0 of") && !out.contains("lists them all"), "{budget}: {out}");
         let first_row = out.lines().skip_while(|l| !l.starts_with("unresolved mentions")).nth(1).unwrap_or("");
         assert!(first_row.contains("zz/use.py:2"), "{budget}: {out}");
+    }
+}
+
+/// Go: a call through a local or parameter of another type never resolves with certainty to a
+/// same-file method; the method's own receiver does.
+#[test]
+fn go_locals_of_another_type_are_not_certain() {
+    let _g = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    let (_h, _r, p) = inline_project(&[
+        ("go.mod", "module ex\ngo 1.21\n"),
+        (
+            "a.go",
+            "package ex\n\ntype Server struct{}\n\nfunc (s *Server) plan() int { return 1 }\n\nfunc (s *Server) run() int {\n\treturn s.plan()\n}\n\nfunc h2() int {\n\tx := &Other{}\n\treturn x.plan()\n}\n\nfunc h3(y *Other) int {\n\treturn y.plan()\n}\n",
+        ),
+        ("b.go", "package ex\n\ntype Other struct{}\n\nfunc (o *Other) plan() int { return 2 }\n"),
+    ]);
+    let out = fox_code(&p, "Server.plan", "callers", 2000);
+    let row = |n: &str| out.lines().find(|l| l.contains(n)).unwrap_or("").to_string();
+    assert!(row("Server.run c:").starts_with("  :8 ") && !row("Server.run c:").contains("guess"), "{out}");
+    for other in ["h2 c:", "h3 c:"] {
+        assert!(row(other).is_empty() || row(other).contains("guess"), "{other}: {out}");
+    }
+    assert!(!ends_complete(&out), "{out}");
+}
+
+/// Swift calls reach Objective-C methods: one family for accounting and resolution.
+#[test]
+fn swift_reaches_objective_c() {
+    let _g = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    let (_h, _r, p) = inline_project(&[
+        ("Core.m", "#import <Foundation/Foundation.h>\n@implementation Core\n- (int)plan { return 1; }\n@end\n"),
+        ("Use.swift", "func go(o: Core) -> Int {\n    return o.plan()\n}\n"),
+    ]);
+    let out = fox_code(&p, "plan", "callers", 2000);
+    assert!(out.contains("Use.swift"), "{out}");
+}
+
+/// A bare call of a builtin with a method's name (`len(x)` for `T.len`) is no candidate.
+#[test]
+fn bare_builtin_calls_are_not_candidates_for_methods() {
+    let _g = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    let (_h, _r, p) = inline_project(&[
+        ("go.mod", "module ex\ngo 1.21\n"),
+        (
+            "q.go",
+            "package ex\n\ntype Q struct{ xs []int }\n\nfunc (q *Q) len() int { return len(q.xs) }\n\nfunc use(q *Q) int { return q.len() + len(q.xs) }\n",
+        ),
+    ]);
+    let out = fox_code(&p, "Q.len", "callers", 2000);
+    assert!(ends_complete(&out), "{out}");
+}
+
+/// Strings and comments come from the parse: nested JS templates, JSX text, Dart and Ruby
+/// interpolation, PHP heredocs and Python raw f-strings never hide a use.
+#[test]
+fn parsed_strings_never_hide_a_use() {
+    let _g = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    let cases: &[(&str, &[(&str, &str)])] = &[
+        (
+            "js",
+            &[
+                ("plan.js", "export class A { plan(x) { return x; } }\n"),
+                (
+                    "use.js",
+                    "export function go(ok, b, o) {\n  const a = `x ${ok ? `y ${b}` : ''} z`;\n  const f1 = o.plan;\n  return `w`;\n}\n",
+                ),
+            ],
+        ),
+        (
+            "jsx",
+            &[
+                ("a.js", "export class A { plan(x) { return x; } }\n"),
+                ("App.jsx", "export function C({ done, o }) {\n  return <span>{done} / <Btn onClick={o.plan} /></span>;\n}\n"),
+            ],
+        ),
+        ("dart", &[("a.dart", "class A { int plan(int x) => x; }\n"), ("use.dart", "void go(dynamic o) {\n  print('v ${o.plan}');\n}\n")]),
+        (
+            "rb",
+            &[
+                ("a.rb", "class A\n  def plan(x)\n    x\n  end\nend\n"),
+                ("use.rb", "def go(o)\n  s = \"line one\n#{o.method(:plan)} two\"\n  s\nend\n"),
+            ],
+        ),
+        (
+            "php",
+            &[
+                ("a.php", "<?php\nclass A { public function plan($x) { return $x; } }\n"),
+                (
+                    "use.php",
+                    "<?php\nfunction go($o) {\n    $doc = <<<EOT\nFiles under src/*.php\nEOT;\n    $f = $o->plan;\n    return $doc;\n}\n",
+                ),
+            ],
+        ),
+        (
+            "py",
+            &[
+                ("a.py", "class A:\n    def plan(self, x):\n        return x\n"),
+                ("use.py", "def go(o):\n    a = fr\"{o.plan}\"\n    b = Fr\"\"\"{o.plan}\"\"\"\n    return a, b\n"),
+            ],
+        ),
+    ];
+    for (what, files) in cases {
+        let (_h, _r, p) = inline_project(files);
+        let out = fox_code(&p, "A.plan", "refs", 2000);
+        assert!(!ends_complete(&out) && !first(&out).contains("comment") && !first(&out).contains("strings"), "{what}: {out}");
     }
 }

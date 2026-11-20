@@ -1227,6 +1227,8 @@ struct RefRow {
     amb: i64,
     /// Container of the calling definition (-1 when unknown).
     caller_parent: i64,
+    /// Last segment of the calling definition's container name (Go: its receiver's type).
+    caller_type: String,
     /// The calling definition and the definitions enclosing it, innermost first.
     enclosing: Vec<i64>,
     /// Last name of the receiver (`Evaluator` in `pl.Evaluator.Preempt()`).
@@ -1492,7 +1494,7 @@ fn score(r: &RefRow, cands: &[Cand], imp: Option<&FileImports>) -> (i64, i64) {
     // The best candidate is a function-holding field reached without receiver evidence.
     let mut field_fn_guess = false;
     for s in cands {
-        if s.family != fam || s.id == r.src && call && is_type_kind(&s.kind) {
+        if !lang::interop(fam, s.family) || s.id == r.src && call && is_type_kind(&s.kind) {
             continue;
         }
         if via_hit && s.path == r.path && via.is_some_and(|v| via_match(v, &s.parent) < 20) {
@@ -1519,9 +1521,9 @@ fn score(r: &RefRow, cands: &[Cand], imp: Option<&FileImports>) -> (i64, i64) {
         // (`connect(o.spider_opened)` in a method of that type) counts as its own too.
         let own_receiver = via.is_some_and(|v| SELF_NAMES.contains(&v) || via_match(v, &s.parent) == 20)
             || !call && s.pid != 0 && s.pid == r.caller_parent
-            // Go: a method's receiver parameter (`func (s *Server) a() { s.b() }`), or a local
-            // value, reaching a method of its own file.
-            || fam == "go" && r.recv_local;
+            // Go: a method's receiver parameter or a local inside a method of the candidate's
+            // type (`func (s *Server) a() { s.b() }`); a local of another type is no evidence.
+            || fam == "go" && r.recv_local && !s.parent.is_empty() && s.parent == r.caller_type;
         // Through a receiver or qualifier, a same-file definition is certain only through its
         // own: a member through `self`/`this`/its type or its method's receiver, a free function
         // through nothing that names another module (`core.plan()`, `inner::plan()` are not this
@@ -1650,6 +1652,7 @@ fn map_ref(r: &rusqlite::Row) -> rusqlite::Result<RefRow> {
         recv_local: r.get::<_, i64>(6)? == 2,
         amb: r.get(7)?,
         caller_parent: -1,
+        caller_type: String::new(),
         enclosing: vec![],
         line: r.get(8)?,
         via: r.get(9)?,
@@ -1727,6 +1730,10 @@ pub fn resolve_scoped(tx: &Connection, pid: i64, scope: Option<(&HashSet<String>
     //    the container of every definition involved.
     let mut cands: HashMap<String, Vec<Cand>> = HashMap::new();
     let mut parent_of: HashMap<i64, (i64, bool)> = HashMap::new(); // id -> (container id, callable)
+    // Go calling definitions: id -> its receiver's type (methods are not nested in their type).
+    let go_srcs: HashSet<i64> =
+        refs.iter().filter(|r| r.recv_local && lang::for_path(&r.path).is_some_and(|l| l.family == "go")).map(|r| r.src).collect();
+    let mut type_of: HashMap<i64, String> = HashMap::new();
     match scope {
         None => {
             let mut q = tx.prepare(&format!(
@@ -1734,6 +1741,9 @@ pub fn resolve_scoped(tx: &Connection, pid: i64, scope: Option<(&HashSet<String>
             ))?;
             for (name, c) in q.query_map([pid], map_cand)?.flatten() {
                 parent_of.insert(c.id, (c.pid, is_callable_kind(&c.kind)));
+                if go_srcs.contains(&c.id) {
+                    type_of.insert(c.id, c.parent.clone());
+                }
                 if c.kind != FIELD {
                     cands.entry(name).or_default().push(c);
                 }
@@ -1757,6 +1767,12 @@ pub fn resolve_scoped(tx: &Connection, pid: i64, scope: Option<(&HashSet<String>
             let mut one = tx.prepare_cached(
                 "SELECT COALESCE(json_extract(meta,'$.pid'),0), json_extract(meta,'$.k') FROM node WHERE id = ?1 AND kind = 'symbol'",
             )?;
+            let mut ty = tx.prepare_cached("SELECT COALESCE(json_extract(meta,'$.parent'),'') FROM node WHERE id = ?1")?;
+            for id in &go_srcs {
+                if let Ok(t) = ty.query_row([id], |r| r.get::<_, String>(0)) {
+                    type_of.insert(*id, t.rsplit('.').next().unwrap_or("").to_string());
+                }
+            }
             let mut want: Vec<i64> =
                 refs.iter().map(|r| r.src).chain(cands.values().flatten().map(|c| c.pid)).filter(|&i| i != 0).collect();
             want.sort_unstable();
@@ -1789,6 +1805,9 @@ pub fn resolve_scoped(tx: &Connection, pid: i64, scope: Option<(&HashSet<String>
     }
     for r in refs.iter_mut() {
         r.caller_parent = parent_of.get(&r.src).map(|p| p.0).unwrap_or(-1);
+        if let Some(t) = type_of.get(&r.src) {
+            r.caller_type = t.clone();
+        }
         let mut cur = r.src;
         while cur != 0 && r.enclosing.len() < 16 {
             r.enclosing.push(cur);
@@ -1917,6 +1936,7 @@ mod via_tests {
             recv_local: false,
             amb: 0,
             caller_parent: -1,
+            caller_type: String::new(),
             enclosing: vec![],
             via: Some(via.into()),
             line: 9,
