@@ -151,6 +151,17 @@ The queries were written by the agents that ran the research, after reading the 
 describe, and they cover two repositories. They are a regression gate and a rough guide, not a
 measure of agent success; the agent A/B runner (`bench/ab.py`) is that.
 
+### Graph expansion
+
+File localization on 20 SWE-bench Verified issues (Python: django, sympy, sphinx, astropy,
+xarray, pylint, matplotlib), the whole issue text as the query, test files removed from the
+ranking: recall@5 went from 0.46 to 0.54 and recall@10 from 0.52 to 0.62 with the expansion
+described in [architecture.md](architecture.md#search). Identifier queries taken from the same
+issues are not expanded, and their recall is unchanged (0.49 / 0.60), as is recall on 10 Go and
+TypeScript issues (caddy, prometheus, hugo, vue, docusaurus, babel). The expansion's weight was
+picked on these same tasks, so the gain is an optimistic estimate. Median query time was
+unchanged (about 0.07 s), and every query of the checked-in fixture eval still finds its target first.
+
 ## Later
 
 - **Tantivy (done in milestone 7, opt-in):** with `backend = "auto"` a project of about 1M rows

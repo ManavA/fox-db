@@ -347,7 +347,9 @@ fn subagent_stop(input: &Value, h: Harness) -> Result<String> {
         },
     )?;
     // Its gist on the board too, for siblings reading what is new: a short summary entry that
-    // links the report, with the paths and handles it cites as handles.
+    // links the report, with the paths and handles it cites as handles. Best effort: the report
+    // is saved and the agent finished whatever happens here.
+    let cites = crate::handoff::attachments(&w, p.id, &cited(msg), false).unwrap_or_default();
     let _ = crate::handoff::post(
         &w,
         &crate::handoff::Post {
@@ -357,7 +359,7 @@ fn subagent_stop(input: &Value, h: Harness) -> Result<String> {
             harness: Some(h.name()),
             session: input["session_id"].as_str(),
             agent,
-            evidence: Some(&crate::handoff::attachments(&w, p.id, &cited(msg), false)?).filter(|e| !e.is_empty()).map(String::as_str),
+            evidence: Some(cites.as_str()).filter(|e| !e.is_empty()),
             parent: Some(report),
             ..Default::default()
         },

@@ -181,3 +181,87 @@ fn result_cache_is_keyed_by_generation() {
     assert_eq!(warm.cache_hits(), 1);
     assert!(c2.contains("SubtitleSelectionPolicyV2"), "{c2}");
 }
+
+// ---- graph-expanded find ----
+
+/// A question in words whose answer is split over files: the function the words describe calls a
+/// helper in another file that shares none of the words. The top symbol hits anchor a one-hop
+/// walk of the call graph, so the helper's file is in the answer; without the walk it is not.
+fn expand_fixture() -> Env {
+    let home = tempfile::tempdir().unwrap();
+    let repo = tempfile::tempdir().unwrap();
+    unsafe {
+        std::env::set_var("FOXDB_HOME", home.path());
+        std::env::set_var("FOXDB_CLAUDE_PROJECTS", home.path().join("no-claude"));
+    }
+    let r = repo.path();
+    write(
+        r,
+        "app/headers.py",
+        "from app.wire.pairs import split_pair\n\n\ndef parse_header(raw):\n    \"\"\"Parse one request header line into its name and value.\"\"\"\n    name, value = split_pair(raw)\n    return name, value\n",
+    );
+    write(r, "app/wire/pairs.py", "def split_pair(raw):\n    i = raw.index(\":\")\n    return raw[:i].strip(), raw[i + 1 :].strip()\n");
+    // Lexical noise: many functions that share the question's words.
+    for i in 0..6 {
+        write(
+            r,
+            &format!("app/noise/n{i}.py"),
+            &format!("def request_line_{i}(name, value):\n    \"\"\"A request header value and name, line {i}.\"\"\"\n    return name\n"),
+        );
+    }
+    let mut c = db::open_rw().unwrap();
+    let p = project::ensure(&c, &project::locate(r)).unwrap();
+    inventory::index_project(&mut c, &p).unwrap();
+    tsindex::index_project(&mut c, &p).unwrap();
+    let p = project::find(&c, &project::locate(r)).unwrap().unwrap();
+    Env { _home: home, repo, c, p }
+}
+
+fn files_in(out: &str) -> Vec<String> {
+    let mut v: Vec<String> = vec![];
+    for l in out.lines() {
+        if let Some(p) = l
+            .split_whitespace()
+            .find_map(|w| w.rsplit_once(':').filter(|(p, n)| p.contains('.') && n.parse::<u32>().is_ok()).map(|(p, _)| p))
+            && !v.iter().any(|x| x == p)
+        {
+            v.push(p.to_string());
+        }
+    }
+    v
+}
+
+#[test]
+fn a_question_in_words_finds_the_files_its_top_hits_call_into() {
+    let _g = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    let e = expand_fixture();
+    let q = "parse a request header line into name and value";
+    let with = find(&e, q, "any");
+    let files = files_in(&with);
+    let at = files.iter().position(|f| f == "app/wire/pairs.py");
+    assert!(at.is_some_and(|i| i < 10), "the callee's file is in the top files: {files:?}\n{with}");
+    // The same search with the walk switched off misses it: the walk is what found it.
+    let without = search::with_expansion(false, || find(&e, q, "any"));
+    assert!(!files_in(&without).iter().any(|f| f == "app/wire/pairs.py"), "{without}");
+    // Deterministic, and bounded: the walk adds at most EXPAND_ANCHORS x EXPAND_PER_ANCHOR rows.
+    assert_eq!(with, find(&e, q, "any"));
+    let all = |on: bool| {
+        let o = query::FindOpts { kind: "any", all: false, budget: 4000, limit: 200, offset: 0 };
+        search::with_expansion(on, || query::find(&e.c, Some(&e.p), q, &o).unwrap()).lines().count()
+    };
+    let added = all(true) - all(false);
+    assert!((1..=search::EXPAND_ANCHORS * search::EXPAND_PER_ANCHOR).contains(&added), "{added} rows added");
+}
+
+/// An identifier is not expanded: one with a definition is already precise, and expanding one
+/// without cost recall on the localization tasks. The answer is the same bytes as without the walk.
+#[test]
+fn identifier_queries_are_not_expanded() {
+    let _g = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    let e = expand_fixture();
+    for q in ["parse_header", "split_pair", "HeaderParser", "app/wire"] {
+        let with = find(&e, q, "any");
+        let without = search::with_expansion(false, || find(&e, q, "any"));
+        assert_eq!(with, without, "{q}");
+    }
+}

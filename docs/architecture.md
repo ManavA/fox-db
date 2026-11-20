@@ -86,7 +86,22 @@ a question in words reads body text instead; mixing the two hurt both in the ret
 The fused list is then re-ranked: the definition of the queried name (or a heading whose title
 is the query) x3, a file whose stem is the query x1.5, test paths x0.3, vendored and generated
 code x0.3, and each further hit from a file already shown counts half as much again (a twentieth
-less for questions, whose answer often sits beside a sibling). Keyword, substring and prefix
+less for questions, whose answer often sits beside a sibling).
+
+A question in words is then expanded over the call graph (lexically anchored, after LARGER):
+its five best symbol hits that are not tests or vendored code, each scoring at least 0.3 of the
+best, anchor a one-hop walk over certain references (tree-sitter references that are not
+guesses, and compiler-resolved edges), callers and callees alike, eight neighbours per anchor,
+most connected first. Each neighbour earns its anchor's score, less a quarter for each place
+further down the anchor's list, summed over anchors, but never more than 0.97 of the best
+anchor that links it (so the definition a question describes stays above the helpers it
+calls), then re-ranked like any hit. So "where is
+the code that does X" also returns the files the matching code calls into or is called from,
+in the same call, even when they share no words with the question. Identifiers are not
+expanded: an exact name is already answered precisely, and expanding names with no definition
+cost recall in the localization runs. `FOXDB_EXPAND=0` turns it off (for comparisons).
+
+Keyword, substring and prefix
 retrieval sit behind the `SearchBackend` trait (with `IndexSink`, `VectorBackend` and `Embedder`
 beside it): SQLite FTS5 implements it, and so does a big project's tantivy index (see
 [below](#derived-tantivy-index-for-big-projects)); see

@@ -765,6 +765,97 @@ pub fn graph_arm(c: &Connection, g: Option<&Graph>, ident: &str, pid: i64, k: us
     Ok(v.into_iter().take(k).map(|x| x.0).collect())
 }
 
+/// Graph expansion (lexically anchored, after LARGER): for a question in words, the best symbol
+/// hits anchor a one-hop walk over certain references (callers and callees), and each neighbour
+/// earns its anchors' scores, less for each place further down an anchor's list. A file the
+/// answer calls into, or is called from, then ranks next to it even when it shares none of the
+/// query's words. Identifiers are not expanded: one with a definition is answered precisely
+/// already, and expanding one without cost recall on the file-localization tasks.
+/// Bounded: this many anchors, [`EXPAND_PER_ANCHOR`] neighbours each.
+pub const EXPAND_ANCHORS: usize = 5;
+/// Neighbours taken per anchor, most connected first.
+pub const EXPAND_PER_ANCHOR: usize = 8;
+/// A neighbour's share of its anchor's score (0.25 and 0.5 found fewer gold files).
+const W_EXPAND: f64 = 1.0;
+/// A neighbour never outscores the best anchor that links it: at most this share of its score,
+/// so the definition a question describes stays above the helpers it calls.
+const EXPAND_CEILING: f64 = 0.97;
+/// Anchors score at least this share of the best symbol hit: a weak hit's neighbours are noise.
+const ANCHOR_MIN: f64 = 0.3;
+
+static EXPAND_OFF: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Run `f` with graph expansion on or off, for tests and benches that compare the two
+/// (`FOXDB_EXPAND=0` turns it off for a whole process).
+pub fn with_expansion<T>(on: bool, f: impl FnOnce() -> T) -> T {
+    let before = EXPAND_OFF.swap(!on, std::sync::atomic::Ordering::SeqCst);
+    let r = f();
+    EXPAND_OFF.store(before, std::sync::atomic::Ordering::SeqCst);
+    r
+}
+
+fn expansion_on() -> bool {
+    !EXPAND_OFF.load(std::sync::atomic::Ordering::SeqCst) && std::env::var("FOXDB_EXPAND").map_or(true, |v| v != "0")
+}
+
+/// One hop from `anchor` over certain references (tree-sitter references that are not guesses,
+/// and compiler-resolved edges), most connected first, then by id. The `!= 0` terms let SQLite use
+/// the partial indexes on `ts_ref(src)` and `ts_ref(dst)`; without them each hop scans the table.
+fn neighbours(c: &Connection, anchor: i64, k: usize) -> Result<Vec<i64>> {
+    let mut s = c.prepare_cached(
+        "SELECT nb FROM (
+           SELECT dst AS nb FROM ts_ref WHERE src = ?1 AND src != 0 AND dst != 0 AND amb = 0
+           UNION ALL SELECT src FROM ts_ref WHERE dst = ?1 AND dst != 0 AND src != 0 AND amb = 0
+           UNION ALL SELECT dst FROM edge WHERE src = ?1 AND kind IN ('CALLS','REFERENCES')
+           UNION ALL SELECT src FROM edge WHERE dst = ?1 AND kind IN ('CALLS','REFERENCES'))
+         WHERE nb != ?1 GROUP BY nb ORDER BY COUNT(*) DESC, nb LIMIT ?2",
+    )?;
+    Ok(s.query_map(rusqlite::params![anchor, k as i64], |r| r.get(0))?.flatten().collect())
+}
+
+/// Add the neighbours of the best symbol hits to `scored` (see [`EXPAND_ANCHORS`]): a neighbour
+/// already there gains score, a new one joins with its anchors' share, either way no higher than
+/// [`EXPAND_CEILING`] of its best anchor (unless it already scored more). Both carry their own
+/// feature boost (tests and vendored code stay down). Deterministic: anchors are taken by score,
+/// then id; neighbours by connection count, then id.
+fn expand(c: &Connection, scored: &mut Vec<(Hit, f64)>, f: &Filter, q: &str, ident: Option<&str>) -> Result<()> {
+    let usable = |h: &Hit| h.kind == "symbol" && !h.path.as_deref().is_some_and(|p| is_test_path(p) || is_vendor_or_generated(p));
+    let mut order: Vec<(f64, i64)> = scored.iter().filter(|(h, _)| usable(h)).map(|(h, s)| (*s, h.id)).collect();
+    order.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap().then(a.1.cmp(&b.1)));
+    let Some(&(best, _)) = order.first() else { return Ok(()) };
+    // Per neighbour: the summed gain, and the best anchor that links it (its ceiling).
+    let mut gain: HashMap<i64, (f64, f64)> = HashMap::new();
+    for &(s, a) in order.iter().filter(|(s, _)| *s >= best * ANCHOR_MIN).take(EXPAND_ANCHORS) {
+        for (r, nb) in neighbours(c, a, EXPAND_PER_ANCHOR)?.into_iter().enumerate() {
+            let e = gain.entry(nb).or_default();
+            e.0 += s * W_EXPAND / (1.0 + r as f64 * 0.25);
+            e.1 = e.1.max(s);
+        }
+    }
+    let mut fresh: Vec<i64> = vec![];
+    let at: HashMap<i64, usize> = scored.iter().enumerate().map(|(i, (h, _))| (h.id, i)).collect();
+    for (id, &(g, top)) in &gain {
+        match at.get(id) {
+            Some(&i) => {
+                let own = scored[i].1;
+                let b = feature_boost(&scored[i].0, q, ident);
+                scored[i].1 = own.max((own + g * b).min(top * EXPAND_CEILING));
+            }
+            None => fresh.push(*id),
+        }
+    }
+    fresh.sort_unstable();
+    let mut loaded = load_hits(c, &fresh, f)?;
+    for id in fresh {
+        if let Some(h) = loaded.remove(&id) {
+            let (g, top) = gain[&id];
+            let s = g.min(top * EXPAND_CEILING) * feature_boost(&h, q, ident);
+            scored.push((h, s));
+        }
+    }
+    Ok(())
+}
+
 pub fn is_test_path(p: &str) -> bool {
     let l = p.to_ascii_lowercase();
     l.contains("/test/")
@@ -1257,7 +1348,7 @@ fn ranked(
     let top: Vec<(i64, f64)> = fused.into_iter().take(want.max(90)).collect();
     let ids: Vec<i64> = top.iter().map(|x| x.0).collect();
     let mut hits = load_hits(c, &ids, &f)?;
-    let scored: Vec<(Hit, f64)> = top
+    let mut scored: Vec<(Hit, f64)> = top
         .into_iter()
         .filter_map(|(id, s)| hits.remove(&id).map(|h| (h, s)))
         .map(|(h, s)| {
@@ -1265,6 +1356,11 @@ fn ranked(
             (h, s * b)
         })
         .collect();
+    // A question in words folds in the neighbours of its best symbol hits (see `EXPAND_ANCHORS`).
+    if cur.is_some() && route == Route::Text && matches!(o.kind, "any" | "symbol") && expansion_on() {
+        expand(c, &mut scored, &f, q, ident.as_deref())?;
+        trace("search expand", t0);
+    }
     let mut hits = damp_same_file(scored, if route == Route::Text { DAMP_TEXT } else { DAMP_NAMES }, ident.as_deref());
     if let Some(id) = ident.as_deref()
         && route != Route::Text
