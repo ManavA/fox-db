@@ -166,42 +166,41 @@ fn c_fn_pointer(nn: tree_sitter::Node, decl: tree_sitter::Node) -> bool {
     false
 }
 
-/// C: the struct, union or typedef name a declaration (or a cast's type descriptor) names as its
-/// type: `inode` for `const struct inode *`, `irq_chip_t` for `irq_chip_t *`. None for a
-/// primitive or an anonymous struct.
+/// C: the type a declaration (or a cast's type descriptor) names, in its namespace: a struct or
+/// union tag as `S:inode` (`const struct inode *`), a typedef name as `T:irq_chip_t`
+/// (`irq_chip_t *`). Tags and typedef names are separate namespaces in C. None for a primitive
+/// or an anonymous struct.
 fn c_type_name(decl: tree_sitter::Node, src: &[u8]) -> Option<String> {
     let t = decl.child_by_field_name("type")?;
-    let n = match t.kind() {
-        "struct_specifier" | "union_specifier" => t.child_by_field_name("name")?,
-        "type_identifier" => t,
+    let (ns, n) = match t.kind() {
+        "struct_specifier" | "union_specifier" => ("S", t.child_by_field_name("name")?),
+        "type_identifier" => ("T", t),
         _ => return None,
     };
-    n.utf8_text(src).ok().filter(|s| !s.is_empty() && s.len() <= 120).map(str::to_string)
+    n.utf8_text(src).ok().filter(|s| !s.is_empty() && s.len() <= 120).map(|s| format!("{ns}:{s}"))
 }
 
 /// Longest receiver chain kept for a C member call (`a->b.c->d`).
 const C_CHAIN_MAX: usize = 8;
 
-/// C: a receiver expression as a type path for resolution: its base (`T:type` when the base's
-/// type is declared or cast, `F:fn` for a call's return value, `V:name` for a name of unknown
-/// type) and the fields read on the way, joined by `|`: `inode->i_mapping->a_ops` with a
-/// parameter `struct inode *inode` is `T:inode|i_mapping|a_ops`.
+/// C: a receiver expression as a type path for resolution: its base (the type, `S:tag` or
+/// `T:typedef`, when the base's type is declared or cast, `F:fn` for a call's return value,
+/// `V:name` for a name of unknown type) and the fields read on the way, joined by `|`:
+/// `inode->i_mapping->a_ops` with a parameter `struct inode *inode` is `S:inode|i_mapping|a_ops`.
 fn c_chain(e: tree_sitter::Node, walk: &Walk, src: &[u8], depth: usize) -> Option<String> {
     if depth > C_CHAIN_MAX {
         return None;
     }
     let text = |n: tree_sitter::Node| n.utf8_text(src).ok().filter(|t| !t.is_empty() && t.len() <= 120).map(str::to_string);
     match e.kind() {
-        "identifier" => Some(
-            walk.recv_types.get(&e.start_byte()).map(|t| format!("T:{t}")).unwrap_or_else(|| format!("V:{}", text(e).unwrap_or_default())),
-        ),
+        "identifier" => Some(walk.recv_types.get(&e.start_byte()).cloned().unwrap_or_else(|| format!("V:{}", text(e).unwrap_or_default()))),
         "field_expression" => {
             let base = c_chain(e.child_by_field_name("argument")?, walk, src, depth + 1)?;
             Some(format!("{base}|{}", text(e.child_by_field_name("field")?)?))
         }
         "parenthesized_expression" => c_chain(e.named_child(0)?, walk, src, depth + 1),
         "pointer_expression" | "subscript_expression" => c_chain(e.child_by_field_name("argument")?, walk, src, depth + 1),
-        "cast_expression" => c_type_name(e.child_by_field_name("type")?, src).map(|t| format!("T:{t}")),
+        "cast_expression" => c_type_name(e.child_by_field_name("type")?, src),
         "call_expression" => {
             let f = e.child_by_field_name("function")?;
             (f.kind() == "identifier").then(|| text(f).map(|t| format!("F:{t}"))).flatten()
@@ -212,8 +211,8 @@ fn c_chain(e: tree_sitter::Node, walk: &Walk, src: &[u8], depth: usize) -> Optio
 
 /// C: the member a function named as an initializer value or assigned to a field is stored in,
 /// as a type path ending in that member (see [`c_chain`]): `.bmap = ext4_bmap` in
-/// `struct address_space_operations ext4_aops = {...}` is `T:address_space_operations|bmap`,
-/// `chip->irq_mask = foo_mask` with `struct irq_chip *chip` is `T:irq_chip|irq_mask`.
+/// `struct address_space_operations ext4_aops = {...}` is `S:address_space_operations|bmap`,
+/// `chip->irq_mask = foo_mask` with `struct irq_chip *chip` is `S:irq_chip|irq_mask`.
 fn c_slot(value: tree_sitter::Node, parent: tree_sitter::Node, walk: &Walk, src: &[u8]) -> Option<String> {
     match parent.kind() {
         "assignment_expression" => {
@@ -249,7 +248,7 @@ fn c_slot(value: tree_sitter::Node, parent: tree_sitter::Node, walk: &Walk, src:
                     "compound_literal_expression" => c_type_name(up.child_by_field_name("type")?, src)?,
                     _ => return None,
                 };
-                return (!path.is_empty()).then(|| format!("T:{base}|{}", path.join("|")));
+                return (!path.is_empty()).then(|| format!("{base}|{}", path.join("|")));
             }
             None
         }
@@ -287,10 +286,16 @@ fn is_ident(k: &str) -> bool {
 }
 
 /// Nodes that open a scope for parameters and locals: functions (any depth, so a lambda's
-/// parameter hides a name only inside that lambda) and Python comprehensions.
-fn is_scope(k: &str) -> bool {
-    FN_KINDS.contains(&k) || matches!(k, "list_comprehension" | "set_comprehension" | "dictionary_comprehension" | "generator_expression")
+/// parameter hides a name only inside that lambda), Python comprehensions, and C blocks, `case`
+/// arms and `for` statements (a local declared there is visible only there).
+fn is_scope(k: &str, c_lang: bool) -> bool {
+    FN_KINDS.contains(&k)
+        || matches!(k, "list_comprehension" | "set_comprehension" | "dictionary_comprehension" | "generator_expression")
+        || c_lang && matches!(k, "compound_statement" | "case_statement" | "for_statement")
 }
+
+/// A name declared twice in one C scope with different types (`#ifdef` arms): no type.
+const C_TYPE_CONFLICT: &str = "?";
 
 /// Parents of an identifier used as a receiver (`user.Save()`, `obj.f`).
 const RECEIVER_PARENTS: &[&str] = &["selector_expression", "member_expression", "attribute", "field_expression"];
@@ -329,7 +334,7 @@ fn walk_tree<'t>(root: tree_sitter::Node<'t>, src: &[u8], c_lang: bool) -> Walk<
     let mut cur = root.walk();
     'walk: loop {
         let n = cur.node();
-        if is_scope(n.kind()) {
+        if is_scope(n.kind(), c_lang) {
             let parent = open.last().map_or(0, |o| o.1);
             scopes.push((parent, HashSet::new()));
             types.push(HashMap::new());
@@ -350,12 +355,19 @@ fn walk_tree<'t>(root: tree_sitter::Node<'t>, src: &[u8], c_lang: bool) -> Walk<
                     && let Some(d) = anc.iter().rev().find(|a| matches!(a.kind(), "parameter_declaration" | "declaration"))
                     && let Some(t) = c_type_name(*d, src)
                 {
-                    types[scope].insert(name.to_string(), t);
+                    let e = types[scope].entry(name.to_string()).or_insert_with(|| t.clone());
+                    if *e != t {
+                        *e = C_TYPE_CONFLICT.to_string();
+                    }
                 }
             }
             if let Some(p) = anc.last()
                 && (VALUE_SLOTS.contains(&p.kind())
                     || RECEIVER_PARENTS.contains(&p.kind()) && p.named_child(0).is_some_and(|f| f.id() == n.id())
+                    // C: the base of `(*pp)->f()` and `arr[i]->f()`, for its declared type.
+                    || c_lang
+                        && matches!(p.kind(), "pointer_expression" | "subscript_expression")
+                        && p.child_by_field_name("argument").is_some_and(|f| f.id() == n.id())
                     || matches!(p.kind(), "call" | "call_expression")
                         && p.child_by_field_name("function").is_some_and(|f| f.id() == n.id()))
             {
@@ -390,7 +402,7 @@ fn walk_tree<'t>(root: tree_sitter::Node<'t>, src: &[u8], c_lang: bool) -> Walk<
     for (pos, mut sc, name) in uses {
         loop {
             if scopes[sc].1.contains(&name) {
-                if let Some(t) = types[sc].get(&name) {
+                if let Some(t) = types[sc].get(&name).filter(|t| *t != C_TYPE_CONFLICT) {
                     recv_types.insert(pos, t.clone());
                 }
                 if sc == 0 {
@@ -561,14 +573,15 @@ pub fn extract(l: &Lang, src: &[u8]) -> Parsed {
             }
             // A class field holding a function (`handleClick = () => {}`) is a method, and so is
             // a C/C++ function-pointer member (`void (*irq_mask)(struct irq_data *)`).
-            let field_fn = kind == FIELD
-                && (node
+            let value_fn = kind == FIELD
+                && node
                     .child_by_field_name("value")
                     .or_else(|| node.child_by_field_name("right"))
-                    .is_some_and(|v| matches!(v.kind(), "arrow_function" | "function_expression" | "function" | "lambda"))
-                    || c_family && c_fn_pointer(nn, node));
-            // A field spans its name: one declaration may name several (`A, B int`).
-            let (node, last) = if kind == FIELD { (nn, nn) } else { (node, last) };
+                    .is_some_and(|v| matches!(v.kind(), "arrow_function" | "function_expression" | "function" | "lambda"));
+            let field_fn = value_fn || kind == FIELD && c_family && c_fn_pointer(nn, node);
+            // A field spans its name: one declaration may name several (`A, B int`). One holding
+            // a function spans its body, so the calls inside belong to it.
+            let (node, last) = if kind == FIELD && !value_fn { (nn, nn) } else { (node, last) };
             let ty = if c_family && matches!(kind.as_str(), "field" | "function" | "type") {
                 c_type_name(outer.map_or(node, |o| o.0), src)
             } else {
@@ -1007,9 +1020,19 @@ pub fn index_project_with(c: &mut Connection, p: &Project, delta: Option<&crate:
     let sink = Sink::open(&tx);
     let mut emitted: HashSet<i64> = HashSet::new();
     // A big cold run builds the name index once at the end: a sort, not millions of random inserts.
-    let bulk = old.is_empty() && work.len() > 5000;
+    // So does a run that re-parses most of a big project (an upgrade that re-parses a language).
+    let reparsed = work.iter().filter(|w| matches!(w, Work::Parse { path, .. } if old.contains_key(path))).count();
+    let bulk = work.len() > 5000 && (old.is_empty() || reparsed * 2 > old.len());
     if bulk {
-        tx.execute_batch("DROP INDEX IF EXISTS ts_ref_name")?;
+        tx.execute_batch("DROP INDEX IF EXISTS ts_ref_name; DROP INDEX IF EXISTS ts_ref_rtype;")?;
+    }
+    // Re-parsing most of a big project: drop the old rows of every re-parsed file in one pass
+    // per table, not file by file (the resolution after it is a full one).
+    let pre_dropped = bulk && !old.is_empty();
+    if pre_dropped {
+        let paths: Vec<&str> =
+            work.iter().filter_map(|w| if let Work::Parse { path, .. } = w { Some(path.as_str()) } else { None }).collect();
+        drop_files_bulk(&tx, &sink, p.id, &paths)?;
     }
     // Scope for incremental resolution: changed paths, and names defined there before or after.
     let mut sc_paths: HashSet<String> = HashSet::new();
@@ -1021,10 +1044,15 @@ pub fn index_project_with(c: &mut Connection, p: &Project, delta: Option<&crate:
         out.extend(q.query_map(params![p.id, path], |r| r.get::<_, String>(0))?.flatten());
         Ok(())
     };
+    let mut cchange = CChange::default();
+    let is_c = |path: &str| is_c_path(path) || is_header(path);
     for path in &removed {
         old_names(path, &mut sc_names)?;
         sc_paths.insert(path.clone());
-        drop_file(&tx, &sink, p.id, path)?;
+        if !full && !bulk && is_c(path) {
+            cchange.add(&c_type_rows_stored(&tx, p.id, path)?, &HashSet::new());
+        }
+        sc_names.extend(drop_file(&tx, &sink, p.id, path)?);
         tx.execute("DELETE FROM ts_file WHERE project_id = ?1 AND path = ?2", params![p.id, path])?;
         st.removed += 1;
     }
@@ -1049,9 +1077,14 @@ pub fn index_project_with(c: &mut Connection, p: &Project, delta: Option<&crate:
                 st.unchanged += 1;
             }
             Work::Parse { path, lang, hash, size, mtime, parsed, texts, words } => {
-                if old.contains_key(&path) {
+                if old.contains_key(&path) && !pre_dropped {
                     old_names(&path, &mut sc_names)?;
-                    drop_file(&tx, &sink, p.id, &path)?;
+                    if !full && !bulk && is_c(&path) {
+                        cchange.add(&c_type_rows_stored(&tx, p.id, &path)?, &c_type_rows(&parsed));
+                    }
+                    sc_names.extend(drop_file(&tx, &sink, p.id, &path)?);
+                } else if !full && !bulk && is_c(&path) {
+                    cchange.add(&HashSet::new(), &c_type_rows(&parsed));
                 }
                 sc_names.extend(parsed.defs.iter().map(|d| d.name.clone()));
                 sc_paths.insert(path.clone());
@@ -1073,13 +1106,16 @@ pub fn index_project_with(c: &mut Connection, p: &Project, delta: Option<&crate:
     }
     drop(words_rows);
     if bulk {
-        tx.execute_batch("CREATE INDEX IF NOT EXISTS ts_ref_name ON ts_ref(project_id, name)")?;
+        tx.execute_batch(
+            "CREATE INDEX IF NOT EXISTS ts_ref_name ON ts_ref(project_id, name);
+             CREATE INDEX IF NOT EXISTS ts_ref_rtype ON ts_ref(project_id, rtype) WHERE rtype IS NOT NULL;",
+        )?;
     }
     trace("ts parse+store", t0);
     // A store upgraded past the ambiguity column re-scores every reference once.
     let rescore = db::rescore_pending(&tx, p.id);
     if st.parsed > 0 || st.removed > 0 || rescore {
-        let r = resolve_scoped(&tx, p.id, (!full && !rescore).then_some((&sc_paths, &sc_names)))?;
+        let r = resolve_scoped_c(&tx, p.id, (!full && !rescore && !bulk).then_some((&sc_paths, &sc_names)), &cchange)?;
         (st.rescored, st.resolved) = (r.rescored, r.resolved);
     }
     if rescore {
@@ -1123,20 +1159,74 @@ pub(crate) fn trace(what: &str, t0: std::time::Instant) {
     }
 }
 
-fn drop_file(tx: &Connection, sink: &Sink, pid: i64, path: &str) -> Result<()> {
+/// Drop a file's symbols and references. Returns the names of references elsewhere that store a
+/// function in one of its members (`ts_ref.slot`): they must be scored again.
+fn drop_file(tx: &Connection, sink: &Sink, pid: i64, path: &str) -> Result<Vec<String>> {
     let sel = "SELECT id FROM node WHERE project_id = ?1 AND path = ?2 AND kind = 'symbol' AND source = 'treesitter'";
+    let mut q = tx.prepare_cached(&format!(
+        "SELECT name FROM ts_ref INDEXED BY ts_ref_slot WHERE slot != 0 AND slot IN ({sel}) AND path != ?2
+         UNION SELECT name FROM ts_ref INDEXED BY ts_ref_slot WHERE slot != 0 AND slot IN ({}) AND path != ?2",
+        sel.replacen("SELECT id", "SELECT -id", 1)
+    ))?;
+    let slotted: Vec<String> = q.query_map(params![pid, path], |r| r.get(0))?.flatten().collect();
     for t in [TBL_NODE, TBL_TRI, TBL_BODY] {
         sink.del_where(tx, pid, t, sel, &[&pid, &path])?;
     }
-    tx.execute(&format!("DELETE FROM edge WHERE src IN ({sel})"), params![pid, path])?;
-    tx.execute(&format!("DELETE FROM edge WHERE dst IN ({sel})"), params![pid, path])?;
-    tx.execute(&format!("DELETE FROM fts_node WHERE rowid IN ({sel})"), params![pid, path])?;
-    tx.execute(&format!("DELETE FROM fts_trigram WHERE rowid IN ({sel})"), params![pid, path])?;
-    tx.execute(&format!("DELETE FROM fts_body WHERE rowid IN ({sel})"), params![pid, path])?;
-    tx.execute(&format!("UPDATE ts_ref SET dst = 0 WHERE dst != 0 AND dst IN ({sel})"), params![pid, path])?;
-    tx.execute("DELETE FROM node WHERE project_id = ?1 AND path = ?2 AND kind = 'symbol' AND source = 'treesitter'", params![pid, path])?;
-    tx.execute("DELETE FROM ts_ref WHERE project_id = ?1 AND path = ?2", params![pid, path])?;
-    tx.execute("DELETE FROM fts_word WHERE rowid = ?1", [word_rowid(pid, path)])?;
+    // Prepared once per run: a re-parse of most of a big tree calls this for every file.
+    for sql in [
+        format!("DELETE FROM edge WHERE src IN ({sel})"),
+        format!("DELETE FROM edge WHERE dst IN ({sel})"),
+        format!("DELETE FROM fts_node WHERE rowid IN ({sel})"),
+        format!("DELETE FROM fts_trigram WHERE rowid IN ({sel})"),
+        format!("DELETE FROM fts_body WHERE rowid IN ({sel})"),
+        format!("UPDATE ts_ref SET dst = 0 WHERE dst != 0 AND dst IN ({sel})"),
+        "DELETE FROM node WHERE project_id = ?1 AND path = ?2 AND kind = 'symbol' AND source = 'treesitter'".to_string(),
+        "DELETE FROM ts_ref WHERE project_id = ?1 AND path = ?2".to_string(),
+    ] {
+        tx.prepare_cached(&sql)?.execute(params![pid, path])?;
+    }
+    tx.prepare_cached("DELETE FROM fts_word WHERE rowid = ?1")?.execute([word_rowid(pid, path)])?;
+    Ok(slotted)
+}
+
+/// [`drop_file`] for many files at once, one statement per table over a temporary list of their
+/// symbols. References into them are not looked up: the caller resolves everything again.
+fn drop_files_bulk(tx: &Connection, sink: &Sink, pid: i64, paths: &[&str]) -> Result<()> {
+    tx.execute_batch(
+        "DROP TABLE IF EXISTS temp.gone_path; DROP TABLE IF EXISTS temp.gone;
+         CREATE TEMP TABLE gone_path(path TEXT PRIMARY KEY) WITHOUT ROWID;
+         CREATE TEMP TABLE gone(id INTEGER PRIMARY KEY);",
+    )?;
+    {
+        let mut ins = tx.prepare("INSERT OR IGNORE INTO temp.gone_path(path) VALUES (?1)")?;
+        for path in paths {
+            ins.execute([path])?;
+        }
+    }
+    tx.execute(
+        "INSERT INTO temp.gone(id) SELECT id FROM node WHERE project_id = ?1 AND kind = 'symbol' AND source = 'treesitter'
+           AND path IN temp.gone_path",
+        [pid],
+    )?;
+    let sel = "SELECT id FROM temp.gone WHERE ?1 = ?1";
+    for t in [TBL_NODE, TBL_TRI, TBL_BODY] {
+        sink.del_where(tx, pid, t, sel, &[&pid])?;
+    }
+    tx.execute_batch(
+        "DELETE FROM edge WHERE src IN temp.gone;
+         DELETE FROM edge WHERE dst IN temp.gone;
+         DELETE FROM fts_node WHERE rowid IN temp.gone;
+         DELETE FROM fts_trigram WHERE rowid IN temp.gone;
+         DELETE FROM fts_body WHERE rowid IN temp.gone;
+         UPDATE ts_ref SET dst = 0 WHERE dst != 0 AND dst IN temp.gone;
+         DELETE FROM node WHERE id IN temp.gone;",
+    )?;
+    tx.execute("DELETE FROM ts_ref WHERE project_id = ?1 AND path IN temp.gone_path", [pid])?;
+    let mut w = tx.prepare_cached("DELETE FROM fts_word WHERE rowid = ?1")?;
+    for path in paths {
+        w.execute([word_rowid(pid, path)])?;
+    }
+    tx.execute_batch("DROP TABLE temp.gone_path; DROP TABLE temp.gone;")?;
     Ok(())
 }
 
@@ -1264,6 +1354,13 @@ fn store_file(
         }
         if let Some(t) = &d.ty {
             meta["t"] = t.as_str().into();
+        }
+        // C: a member of a struct or union tag (not of an anonymous struct named by a typedef).
+        if (d.kind == FIELD || d.field_fn)
+            && let Some(c) = d.container
+            && matches!(p.defs[c].kind.as_str(), "struct" | "class")
+        {
+            meta["ps"] = 1.into();
         }
         ins.execute(params![pid, format!("t:{pid}:{path}#{i}"), d.name, path, d.line, d.end_line, lang, meta.to_string(), now])?;
         let id = tx.last_insert_rowid();
@@ -1406,7 +1503,8 @@ struct RefRow {
 struct CSym {
     id: i64,
     kind: String,
-    /// Last segment of the container name: the struct a member belongs to.
+    /// The struct a member belongs to, in its namespace (`S:irq_chip`, or `T:name` for an
+    /// anonymous struct named by a typedef).
     parent: String,
     ty: Option<String>,
     fnptr: bool,
@@ -1464,13 +1562,15 @@ impl CTypes {
         }
     }
 
-    /// `t` and the types it is a typedef of, nearest first.
+    /// `t` and the types it is a typedef of, nearest first: `T:irq_chip_t` -> `S:irq_chip`. A
+    /// struct tag (`S:`) is no alias of anything.
     fn aliases(&mut self, t: &str, fetch: &mut dyn FnMut(&str) -> Vec<CSym>) -> Vec<String> {
         let mut out = vec![t.to_string()];
         for _ in 0..C_ALIAS_STEPS {
             let cur = out.last().cloned().unwrap_or_default();
-            self.load(&cur, fetch);
-            let next = self.named.get(&cur).and_then(|v| v.iter().find(|(k, t)| k == "type" && t.is_some())).and_then(|x| x.1.clone());
+            let Some(name) = cur.strip_prefix("T:") else { break };
+            self.load(name, fetch);
+            let next = self.named.get(name).and_then(|v| v.iter().find(|(k, t)| k == "type" && t.is_some())).and_then(|x| x.1.clone());
             match next {
                 Some(n) if !out.contains(&n) => out.push(n),
                 _ => break,
@@ -1510,8 +1610,8 @@ impl CTypes {
         let segs: Vec<&str> = path.split('|').collect();
         let Some((&last, rest)) = segs.split_last() else { return CRes { ids: vec![], typed: false } };
         let (base, mids) = rest.split_first().map_or(("", &[][..]), |(b, m)| (*b, m));
-        let mut ty: Option<String> = if let Some(t) = base.strip_prefix("T:") {
-            Some(t.to_string())
+        let mut ty: Option<String> = if base.starts_with("T:") || base.starts_with("S:") {
+            Some(base.to_string())
         } else if let Some(f) = base.strip_prefix("F:") {
             self.load(f, fetch);
             let rets: HashSet<&String> =
@@ -1549,6 +1649,17 @@ fn c_member_score(c: &CRes) -> (i64, i64) {
         (1, false) => (c.ids[0], 1),
         (n, false) if n <= GUESS_MAX => (c.ids[0], n as i64),
         _ => (0, 0),
+    }
+}
+
+/// The member a function stored in it is linked to (`ts_ref.slot`): its id when the target's type
+/// names one member, minus its id when that is a guess (two structs share the tag, or the
+/// receiver's type is unknown and a few same-name members exist), 0 when nothing fits.
+fn c_slot_id(c: &CRes) -> i64 {
+    match c_member_score(c) {
+        (0, _) => 0,
+        (id, 0) => id,
+        (id, _) => -id,
     }
 }
 
@@ -1811,7 +1922,9 @@ fn score(r: &RefRow, cands: &[Cand], imp: Option<&FileImports>) -> (i64, i64) {
     // Languages where a receiver's type is unknown until run time.
     let dynamic = matches!(fam, "python" | "js");
     let c_file = c_fam && is_c_path(&r.path);
-    let has_def = c_fam && cands.iter().any(|s| s.family == fam && !s.decl && (s.path == r.path || !s.file_local && !s.local));
+    // A function-pointer member is no definition of a free function of its name.
+    let has_def =
+        c_fam && cands.iter().any(|s| s.family == fam && !s.decl && !s.field_fn && (s.path == r.path || !s.file_local && !s.local));
     // A receiver named exactly like a candidate's type (`pl.Evaluator.Preempt()`) rules out a
     // same-file member of another type (a local interface with the same method).
     let via = if r.recv { r.via.as_deref() } else { None };
@@ -1955,7 +2068,11 @@ fn score(r: &RefRow, cands: &[Cand], imp: Option<&FileImports>) -> (i64, i64) {
     (dst, if guess { eligible.max(1) } else { 0 })
 }
 
-fn map_cand(r: &rusqlite::Row) -> rusqlite::Result<(String, Cand, Option<String>)> {
+/// A candidate row: name, candidate, its C type (`meta.t`) and whether its container is a struct
+/// tag (`meta.ps`).
+type CandRow = (String, Cand, Option<String>, bool);
+
+fn map_cand(r: &rusqlite::Row) -> rusqlite::Result<CandRow> {
     let lang: String = r.get(6)?;
     let path: String = r.get(2)?;
     let file_local = r.get::<_, Option<i64>>(8)?.is_some() && !is_header(&path);
@@ -1974,20 +2091,21 @@ fn map_cand(r: &rusqlite::Row) -> rusqlite::Result<(String, Cand, Option<String>
             field_fn: r.get::<_, Option<i64>>(9)?.is_some(),
         },
         r.get(10)?,
+        r.get::<_, Option<i64>>(11)?.is_some(),
     ))
 }
 
 const CAND_COLS: &str = "id, name, path, json_extract(meta,'$.k'), COALESCE(json_extract(meta,'$.pid'),0), \
      COALESCE(json_extract(meta,'$.parent'),''), lang, json_extract(meta,'$.d'), json_extract(meta,'$.s'), json_extract(meta,'$.f'), \
-     json_extract(meta,'$.t')";
+     json_extract(meta,'$.t'), json_extract(meta,'$.ps')";
 const REF_COLS: &str = "rowid, path, src, name, kind, dst, recv, amb, line, via, rtype, slot";
 
 /// The C symbol a candidate row stands for, when it is one a type path may walk through.
-fn c_sym_of(c: &Cand, ty: Option<String>) -> Option<CSym> {
+fn c_sym_of(c: &Cand, ty: Option<String>, tag: bool) -> Option<CSym> {
     (c.family == "c" && (c.kind == FIELD || c.field_fn || c.kind == "type" || c.kind == "function" && ty.is_some())).then(|| CSym {
         id: c.id,
         kind: c.kind.clone(),
-        parent: c.parent.clone(),
+        parent: if c.parent.is_empty() { String::new() } else { format!("{}:{}", if tag { "S" } else { "T" }, c.parent) },
         ty,
         fnptr: c.field_fn,
     })
@@ -2037,6 +2155,98 @@ pub fn resolve(tx: &Connection, pid: i64) -> Result<Resolved> {
 /// those references, their files' imports and their names' candidates are read, so the cost
 /// follows the change, not the project. Scoring runs in parallel.
 pub fn resolve_scoped(tx: &Connection, pid: i64, scope: Option<(&HashSet<String>, &HashSet<String>)>) -> Result<Resolved> {
+    resolve_scoped_c(tx, pid, scope, &CChange::default())
+}
+
+/// What changed in the C types of the files a run re-parsed or removed, so a scoped resolution
+/// also re-scores the member calls and stored functions whose type path passes through it.
+#[derive(Default)]
+pub(crate) struct CChange {
+    /// Functions whose return type changed (a path's `F:` base).
+    funcs: HashSet<String>,
+    /// Fields whose type changed, and their structs (a path's middle segments).
+    fields: HashSet<String>,
+    /// A typedef changed: every type path may read differently.
+    all: bool,
+}
+
+/// One C file's type facts, as the store keeps them: (kind, name, container, type).
+type CTypeRow = (&'static str, String, String, String);
+
+/// The type facts of a parsed C file (see [`CTypeRow`]).
+fn c_type_rows(p: &Parsed) -> HashSet<CTypeRow> {
+    (0..p.defs.len())
+        .filter_map(|i| {
+            let d = &p.defs[i];
+            let kind = if d.field_fn {
+                "fnptr"
+            } else {
+                match d.kind.as_str() {
+                    FIELD => "field",
+                    "type" => "type",
+                    "function" if d.ty.is_some() => "function",
+                    _ => return None,
+                }
+            };
+            Some((kind, d.name.clone(), p.container_of(i).unwrap_or_default(), d.ty.clone().unwrap_or_default()))
+        })
+        .collect()
+}
+
+/// The type facts the store holds for C file `path` (see [`CTypeRow`]).
+fn c_type_rows_stored(tx: &Connection, pid: i64, path: &str) -> Result<HashSet<CTypeRow>> {
+    let mut q = tx.prepare_cached(
+        "SELECT name, json_extract(meta,'$.k'), COALESCE(json_extract(meta,'$.parent'),''), COALESCE(json_extract(meta,'$.t'),''),
+                json_extract(meta,'$.f')
+         FROM node WHERE project_id = ?1 AND path = ?2 AND kind = 'symbol' AND source = 'treesitter'",
+    )?;
+    let rows = q.query_map(params![pid, path], |r| {
+        Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?, r.get::<_, String>(2)?, r.get::<_, String>(3)?, r.get::<_, Option<i64>>(4)?))
+    })?;
+    Ok(rows
+        .flatten()
+        .filter_map(|(name, k, parent, t, f)| {
+            let kind = if f.is_some() {
+                "fnptr"
+            } else {
+                match k.as_str() {
+                    FIELD => "field",
+                    "type" => "type",
+                    "function" if !t.is_empty() => "function",
+                    _ => return None,
+                }
+            };
+            Some((kind, name, parent, t))
+        })
+        .collect())
+}
+
+impl CChange {
+    /// Note the facts that differ between a C file's stored and parsed versions.
+    fn add(&mut self, before: &HashSet<CTypeRow>, after: &HashSet<CTypeRow>) {
+        for (kind, name, parent, _) in before.symmetric_difference(after) {
+            match *kind {
+                "type" => self.all = true,
+                "function" => {
+                    self.funcs.insert(name.clone());
+                }
+                // A function-pointer member ends a path: its calls are re-scored by name.
+                _ => {
+                    self.fields.insert(name.clone());
+                    self.fields.extend(parent.rsplit('.').next().filter(|s| !s.is_empty()).map(str::to_string));
+                }
+            }
+        }
+    }
+}
+
+/// [`resolve_scoped`], also re-scoring the C references whose type path `c` touches.
+pub(crate) fn resolve_scoped_c(
+    tx: &Connection,
+    pid: i64,
+    scope: Option<(&HashSet<String>, &HashSet<String>)>,
+    c: &CChange,
+) -> Result<Resolved> {
     let t0 = std::time::Instant::now();
     // 1. The references to score, and the imports of their files.
     let mut refs: Vec<RefRow> = vec![];
@@ -2067,6 +2277,36 @@ pub fn resolve_scoped(tx: &Connection, pid: i64, scope: Option<(&HashSet<String>
             sorted_names.sort();
             for name in sorted_names {
                 refs.extend(by_name.query_map(params![pid, name], map_ref)?.flatten().filter(|r| seen.insert(r.rowid)));
+            }
+            // C type paths through a changed type: by their base (a function's return value)
+            // through the index, by a field on the way through a scan of the paths alone.
+            let mut rowids: Vec<i64> = vec![];
+            let mut by_base = tx.prepare_cached(
+                "SELECT rowid FROM ts_ref INDEXED BY ts_ref_rtype WHERE project_id = ?1 AND rtype IS NOT NULL AND rtype >= ?2 AND rtype < ?3",
+            )?;
+            let mut funcs: Vec<&String> = c.funcs.iter().collect();
+            funcs.sort();
+            for f in funcs {
+                rowids.extend(by_base.query_map(params![pid, format!("F:{f}|"), format!("F:{f}}}")], |r| r.get::<_, i64>(0))?.flatten());
+            }
+            if c.all || !c.fields.is_empty() {
+                let mut q = tx.prepare_cached(
+                    "SELECT rowid, rtype FROM ts_ref INDEXED BY ts_ref_rtype WHERE project_id = ?1 AND rtype IS NOT NULL",
+                )?;
+                let touches = |t: &str| c.all || t.split('|').any(|seg| c.fields.contains(seg.split_once(':').map_or(seg, |x| x.1)));
+                rowids.extend(
+                    q.query_map([pid], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?)))?
+                        .flatten()
+                        .filter(|(_, t)| touches(t))
+                        .map(|x| x.0),
+                );
+            }
+            rowids.sort_unstable();
+            let mut one = tx.prepare_cached(&format!("SELECT {REF_COLS} FROM ts_ref WHERE rowid = ?1"))?;
+            for id in rowids {
+                if seen.insert(id) {
+                    refs.extend(one.query_map([id], map_ref)?.flatten());
+                }
             }
             refs.retain(|r| r.kind != "import");
             let files: HashSet<&str> = refs.iter().map(|r| r.path.as_str()).collect();
@@ -2102,13 +2342,13 @@ pub fn resolve_scoped(tx: &Connection, pid: i64, scope: Option<(&HashSet<String>
             let mut q = tx.prepare(&format!(
                 "SELECT {CAND_COLS} FROM node WHERE project_id = ?1 AND kind = 'symbol' AND source = 'treesitter' ORDER BY id"
             ))?;
-            for (name, c, ty) in q.query_map([pid], map_cand)?.flatten() {
+            for (name, c, ty, tag) in q.query_map([pid], map_cand)?.flatten() {
                 parent_of.insert(c.id, (c.pid, is_callable_kind(&c.kind)));
                 if go_srcs.contains(&c.id) {
                     type_of.insert(c.id, c.parent.clone());
                 }
                 if !c_refs.is_empty()
-                    && let Some(cs) = c_sym_of(&c, ty)
+                    && let Some(cs) = c_sym_of(&c, ty, tag)
                 {
                     ctypes.add(&name, cs);
                 }
@@ -2126,7 +2366,7 @@ pub fn resolve_scoped(tx: &Connection, pid: i64, scope: Option<(&HashSet<String>
                 let mut v: Vec<Cand> = q
                     .query_map(params![pid, n], map_cand)?
                     .flatten()
-                    .filter(|(name, c, _)| name == n && c.kind != FIELD)
+                    .filter(|(name, c, ..)| name == n && c.kind != FIELD)
                     .map(|x| x.1)
                     .collect();
                 v.sort_by_key(|c| c.id);
@@ -2192,7 +2432,7 @@ pub fn resolve_scoped(tx: &Connection, pid: i64, scope: Option<(&HashSet<String>
         ))?;
         let mut fetch = |n: &str| -> Vec<CSym> {
             q.query_map(params![pid, n], map_cand)
-                .map(|it| it.flatten().filter(|(name, _, _)| name == n).filter_map(|(_, c, ty)| c_sym_of(&c, ty)).collect())
+                .map(|it| it.flatten().filter(|(name, ..)| name == n).filter_map(|(_, c, ty, tag)| c_sym_of(&c, ty, tag)).collect())
                 .unwrap_or_default()
         };
         let mut memo: HashMap<String, usize> = HashMap::new();
@@ -2224,7 +2464,7 @@ pub fn resolve_scoped(tx: &Connection, pid: i64, scope: Option<(&HashSet<String>
                 return (d, a, 0);
             }
             let (d, a) = score(r, cands.get(&r.name).map(Vec::as_slice).unwrap_or(&[]), imports.get(&r.path));
-            let slot = c.filter(|c| c.typed || c.ids.len() == 1).and_then(|c| c.ids.first().copied()).filter(|_| d != 0).unwrap_or(0);
+            let slot = c.filter(|_| d != 0).map_or(0, c_slot_id);
             (d, a, slot)
         })
         .collect();

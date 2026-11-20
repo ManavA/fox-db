@@ -1858,3 +1858,136 @@ fn c_functions_assigned_to_members_are_dispatch_targets() {
     let out = fox_code(&p, "foo_mask", "impact", 4000);
     assert!(out.contains("mask_irq") && out.contains("chained_irq_enter"), "{out}");
 }
+
+/// A line storing a function in the member (`.bmap = ext4_bmap,`) is accounted for: a reference
+/// that is not a call for `callers`, resolved for `impact`; never unresolved.
+#[test]
+fn c_member_store_lines_are_accounted_for() {
+    let _g = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    let (_h, _r, p) = c_ops_project();
+    let out = fox_code(&p, "address_space_operations.bmap", "callers", 4000);
+    let head = out.lines().next().unwrap_or("");
+    assert!(head.contains("1 reference, not a call") && !head.contains("unresolved"), "{out}");
+    assert!(out.contains("references, not calls (what is called through them is not followed):\n  fs/ext4/inode.c:6"), "{out}");
+    let out = fox_code(&p, "address_space_operations.bmap", "impact", 4000);
+    assert!(!out.contains("unresolved mentions:\n  fs/ext4/inode.c:6"), "{out}");
+}
+
+/// A plain call of a function whose only visible declaration is a header prototype reaches the
+/// prototype even when a struct has a function-pointer member of the same name.
+#[test]
+fn c_prototype_calls_survive_a_same_name_member() {
+    let _g = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    let (_h, _r, p) = inline_project(&[
+        ("blk.h", "struct bio;\nstruct bdev_ops {\n\tvoid (*submit_bio)(struct bio *bio);\n};\nvoid submit_bio(struct bio *bio);\n"),
+        ("use.c", "#include \"blk.h\"\nvoid go(struct bio *b)\n{\n\tsubmit_bio(b);\n}\n"),
+    ]);
+    let out = fox_code(&p, "go", "callees", 2000);
+    assert!(out.contains("1 callees") && out.contains("blk.h") && out.contains("function submit_bio"), "{out}");
+}
+
+/// A receiver declared in a block is typed by that block's declaration only: the same name
+/// outside the block (or in another `case`) keeps its own type.
+#[test]
+fn c_block_scoped_receivers_keep_their_own_types() {
+    let _g = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    let (_h, _r, p) = inline_project(&[
+        ("ops.h", "struct a_ops {\n\tint (*op)(int);\n};\nstruct b_ops {\n\tint (*op)(int);\n};\n"),
+        (
+            "blk.c",
+            "int f(struct a_ops *x, int k)\n{\n\tif (k) {\n\t\tstruct b_ops *x = 0;\n\t\treturn x->op(1);\n\t}\n\treturn x->op(2);\n}\n",
+        ),
+        (
+            "sw.c",
+            "int g(int k)\n{\n\tswitch (k) {\n\tcase 1: {\n\t\tstruct a_ops *y = 0;\n\t\treturn y->op(3);\n\t}\n\tcase 2: {\n\t\tstruct b_ops *y = 0;\n\t\treturn y->op(4);\n\t}\n\t}\n\treturn 0;\n}\n",
+        ),
+    ]);
+    let a = fox_code(&p, "a_ops.op", "callers", 4000);
+    let b = fox_code(&p, "b_ops.op", "callers", 4000);
+    assert!(resolved(&a).contains("2 call sites in 2 files") && !resolved(&a).contains("guess"), "{a}");
+    assert!(a.contains(":7 f c:") && a.contains(":6 g c:"), "{a}");
+    assert!(resolved(&b).contains("2 call sites in 2 files") && b.contains(":5 f c:") && b.contains(":10 g c:"), "{b}");
+}
+
+/// A class field holding a function spans its body: calls inside it belong to it, not the class.
+#[test]
+fn arrow_function_fields_span_their_bodies() {
+    let src = b"class Widget {\n  handleClick = (e) => {\n    const a = 1;\n    return helper(e);\n  };\n}\n";
+    let p = tsindex::extract(lang::by_name("javascript").unwrap(), src);
+    let cs = calls(&p);
+    assert!(cs.iter().any(|(a, b)| a == "Widget.handleClick" && b == "helper"), "{cs:?}");
+}
+
+/// Re-parsing a header that declares a member keeps the functions stored in that member linked
+/// to it, and a changed field type moves member calls through it to the new type's member.
+#[test]
+fn c_member_links_follow_header_edits() {
+    let _g = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    let (_h, repo, p) = inline_project(&[
+        (
+            "ops.h",
+            "struct my_ops {\n\tint (*go)(int);\n};\nstruct alt_ops {\n\tint (*run)(int);\n};\nstruct cfg_ops {\n\tint (*run)(int);\n};\nstruct holder {\n\tstruct alt_ops *ops;\n};\n",
+        ),
+        ("impl.c", "#include \"ops.h\"\nstatic int my_go(int x) { return x; }\nstatic struct my_ops o = {\n\t.go = my_go,\n};\n"),
+        ("call.c", "#include \"ops.h\"\nint use(struct my_ops *m) { return m->go(1); }\n"),
+        ("hold.c", "#include \"ops.h\"\nint hold(struct holder *h) { return h->ops->run(1); }\n"),
+    ]);
+    let out = fox_code(&p, "my_go", "impact", 4000);
+    assert!(out.contains("via my_ops.go"), "{out}");
+    assert!(fox_code(&p, "alt_ops.run", "callers", 4000).contains("hold.c (1)"));
+    let mut c = db::open_rw().unwrap();
+    let h = repo.path().join("ops.h");
+    let text = std::fs::read_to_string(&h).unwrap();
+    std::fs::write(&h, format!("/* ops */\n{}", text.replace("struct alt_ops *ops;", "struct cfg_ops *ops;"))).unwrap();
+    inventory::index_project(&mut c, &p).unwrap();
+    assert_eq!(tsindex::index_project(&mut c, &p).unwrap().parsed, 1);
+    let out = fox_code(&p, "my_go", "impact", 4000);
+    assert!(out.contains("via my_ops.go") && out.contains("use c:"), "{out}");
+    let alt = fox_code(&p, "alt_ops.run", "callers", 4000);
+    let cfg = fox_code(&p, "cfg_ops.run", "callers", 4000);
+    assert!(!alt.contains("hold.c (1)") && cfg.contains("hold.c (1)"), "{alt}\n{cfg}");
+    // The scoped update matches a full re-resolution.
+    let snap = |c: &rusqlite::Connection| -> Vec<(i64, i64, i64)> {
+        let mut q = c.prepare("SELECT rowid, dst, slot FROM ts_ref ORDER BY rowid").unwrap();
+        q.query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?))).unwrap().flatten().collect()
+    };
+    let inc = snap(&c);
+    tsindex::resolve(&c, p.id).unwrap();
+    assert_eq!(snap(&c), inc);
+}
+
+/// Typedef names and struct tags are separate namespaces: `tagged *` is the typedef's struct,
+/// `struct tagged *` the tag's.
+#[test]
+fn c_typedef_names_and_struct_tags_do_not_collide() {
+    let _g = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    let (_h, _r, p) = inline_project(&[
+        ("t.h", "struct a_ops {\n\tint (*op)(int);\n};\nstruct tagged {\n\tint (*op)(int);\n};\ntypedef struct a_ops tagged;\n"),
+        ("u.c", "#include \"t.h\"\nint t1(tagged *x) { return x->op(1); }\nint t2(struct tagged *y) { return y->op(2); }\n"),
+    ]);
+    let a = fox_code(&p, "a_ops.op", "callers", 4000);
+    let t = fox_code(&p, "tagged.op", "callers", 4000);
+    assert!(a.contains(":2 t1 c:") && !a.contains(":3 t2"), "{a}");
+    assert!(t.contains(":3 t2 c:") && !t.contains(":2 t1"), "{t}");
+}
+
+/// A function stored in a member whose struct is ambiguous (two structs share the tag) or whose
+/// receiver has no known type is linked to it only as a guess.
+#[test]
+fn c_uncertain_member_stores_are_guesses() {
+    let _g = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    let (_h, _r, p) = inline_project(&[
+        ("d1/dup.h", "struct dup_ops {\n\tint (*cb)(int);\n};\n"),
+        ("d2/dup.h", "struct dup_ops {\n\tint (*cb)(int);\n};\n"),
+        ("d1/set.c", "static int f1(int x) { return x; }\nstatic struct dup_ops o = {\n\t.cb = f1,\n};\n"),
+        ("d1/use.c", "int use1(struct dup_ops *p) { return p->cb(1); }\n"),
+        ("o/only.h", "struct only_ops {\n\tint (*hook)(int);\n};\n"),
+        ("o/set.c", "static int f2(int x) { return x; }\nvoid set2(void) { g->hook = f2; }\n"),
+        ("o/use.c", "int use2(struct only_ops *p) { return p->hook(1); }\n"),
+    ]);
+    for (f, user) in [("f1", "use1"), ("f2", "use2")] {
+        let out = fox_code(&p, f, "impact", 4000);
+        let row = out.lines().find(|l| l.contains(&format!(" {user} c:"))).unwrap_or_else(|| panic!("{f}: {out}"));
+        assert!(row.contains("guess") && row.contains(" via "), "{f}: {out}");
+    }
+}

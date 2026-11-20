@@ -447,6 +447,7 @@ pub(crate) fn migrate(c: &Connection) -> Result<()> {
         add_column(c, "ts_ref", "slot", "INTEGER NOT NULL DEFAULT 0")?;
         c.execute_batch(
             "CREATE INDEX IF NOT EXISTS ts_ref_slot ON ts_ref(slot) WHERE slot != 0;
+             CREATE INDEX IF NOT EXISTS ts_ref_rtype ON ts_ref(project_id, rtype) WHERE rtype IS NOT NULL;
              UPDATE ts_file SET hash = '', size = -1 WHERE lang IN ('c', 'cpp');
              INSERT OR REPLACE INTO meta(k, v)
                SELECT 'rescore:' || p.id, 1 FROM project p WHERE EXISTS (SELECT 1 FROM ts_file f WHERE f.project_id = p.id AND f.lang IN ('c', 'cpp'));

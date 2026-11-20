@@ -947,13 +947,15 @@ fn impact(c: &Connection, p: &Project, top: &TSym, depth: usize, lines: &mut Vec
     let mut disp_top: HashMap<String, Disp> = HashMap::new();
     // A first-level dependent's first line using `top`, shown as its row's code.
     let mut use_at: HashMap<i64, i64> = HashMap::new();
+    // A link known only by a guess makes what it reaches a guess too.
+    let link = |id: i64| if dsp.guessed.contains(&id) { Some(1) } else { None };
     for m in &dsp.up {
-        guess.insert(m.id, None);
+        guess.insert(m.id, link(m.id));
         frontier.push(m.id);
     }
     let mut first = Level::default();
     for m in &dsp.down {
-        if guess.insert(m.id, None).is_none() {
+        if guess.insert(m.id, link(m.id)).is_none() {
             first.syms.push(m.id);
             disp.insert(m.id, Some(format!(" implements {}", top.qname())));
         }
@@ -1162,6 +1164,9 @@ fn impact(c: &Connection, p: &Project, top: &TSym, depth: usize, lines: &mut Vec
 struct Dispatch {
     up: Vec<TSym>,
     down: Vec<TSym>,
+    /// Of `up` and `down`, those linked only by a guess (C: a function stored in a member whose
+    /// struct is not certain).
+    guessed: HashSet<i64>,
     /// `partial at d1:` when a candidate list was capped.
     capped: Option<String>,
 }
@@ -1177,7 +1182,7 @@ fn dispatch(c: &Connection, pid: i64, top: &TSym) -> Result<Dispatch> {
     if crate::lang::for_path(&top.path).is_some_and(|l| l.name == "c") {
         return c_dispatch(c, top);
     }
-    let mut d = Dispatch { up: vec![], down: vec![], capped: None };
+    let mut d = Dispatch { up: vec![], down: vec![], guessed: HashSet::new(), capped: None };
     if !is_callable_kind(&top.kind) || top.parent.as_deref().is_none_or(str::is_empty) {
         return Ok(d);
     }
@@ -1241,20 +1246,23 @@ fn dispatch(c: &Connection, pid: i64, top: &TSym) -> Result<Dispatch> {
 /// (`.bmap = ext4_bmap`, `chip->irq_mask = foo_mask`), `up`; a member dispatches to the
 /// functions stored in it, `down`.
 fn c_dispatch(c: &Connection, top: &TSym) -> Result<Dispatch> {
-    let mut d = Dispatch { up: vec![], down: vec![], capped: None };
+    let mut d = Dispatch { up: vec![], down: vec![], guessed: HashSet::new(), capped: None };
+    // (linked id, certain): a negative slot is a guess.
     let sql = if top.kind == "function" {
-        "SELECT DISTINCT slot FROM ts_ref WHERE dst = ?1 AND dst != 0 AND slot != 0"
+        "SELECT abs(slot), MAX(slot > 0) FROM ts_ref WHERE dst = ?1 AND dst != 0 AND slot != 0 GROUP BY abs(slot)"
     } else if top.kind == "method" {
-        "SELECT DISTINCT dst FROM ts_ref INDEXED BY ts_ref_slot WHERE slot = ?1 AND slot != 0 AND dst != 0"
+        "SELECT dst, MAX(slot > 0) FROM ts_ref INDEXED BY ts_ref_slot WHERE slot != 0 AND slot IN (?1, -?1) AND dst != 0 GROUP BY dst"
     } else {
         return Ok(d);
     };
     let mut q = c.prepare_cached(&format!("{sql} LIMIT {}", DISPATCH_SAME_MAX + 1))?;
-    let ids: Vec<i64> = q.query_map([top.id], |r| r.get(0))?.flatten().collect();
+    let ids: Vec<(i64, bool)> = q.query_map([top.id], |r| Ok((r.get(0)?, r.get(1)?)))?.flatten().collect();
     if ids.len() > DISPATCH_SAME_MAX {
         d.capped = Some(format!("partial at d1: dispatch read the first {DISPATCH_SAME_MAX} functions stored in it; there are more"));
     }
-    let mut v: Vec<TSym> = ids.into_iter().take(DISPATCH_SAME_MAX).filter(|&i| i != top.id).filter_map(|i| by_id(c, i)).collect();
+    d.guessed = ids.iter().filter(|x| !x.1).map(|x| x.0).collect();
+    let mut v: Vec<TSym> =
+        ids.into_iter().take(DISPATCH_SAME_MAX).map(|x| x.0).filter(|&i| i != top.id).filter_map(|i| by_id(c, i)).collect();
     v.sort_by(|a, b| (&a.path, a.line, a.id).cmp(&(&b.path, b.line, b.id)));
     if top.kind == "function" {
         d.up = v

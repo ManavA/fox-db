@@ -7,17 +7,23 @@ foxdb is one Rust crate with two binaries: `fox` (CLI, MCP server over stdio, ho
 `fox index` walks a project (honouring `.gitignore` and the per-project tiers), stores files, directories, Markdown sections and milestone entries as rows of `node`, parses changed code files with tree-sitter in parallel (or reads Xcode index stores for Swift) and resolves call references by name with scope awareness. Unchanged files are skipped by size, mtime and content hash. Secrets are never read. A project is registered the first time `fox` or the MCP server runs inside it, keyed by its git common dir, so worktrees share one project.
 
 **C member calls.** A C function-pointer member (`void (*irq_mask)(struct irq_data *)`) is a
-method of its struct. Fields, functions and typedefs keep the struct or typedef name of their
-type (`meta.t`). A call through a member (`inode->i_mapping->a_ops->bmap(...)`) stores the
-receiver as a type path (`ts_ref.rtype`, `T:inode|i_mapping|a_ops|bmap`): its base is the
-declared type of a parameter, local or file-level variable, a cast, or a function's return
-type, and each field on the way gives the next type, through typedefs. Resolution follows the
-path to the member, which then is the call's target with certainty. When the receiver's type is
-unknown, the call is a guess among at most three same-name function-pointer members, else
-unresolved. It never reaches a free function or another struct's member. A function stored in a
-member (`.bmap = ext4_bmap`, `chip->irq_mask = foo_mask;`) records that member as its
-`ts_ref.slot`, so `impact` treats it like interface dispatch: calls through the member reach the
-function, and the member's implementations are its first-level dependents.
+method of its struct. Fields, functions and typedefs keep their type in `meta.t`, with struct
+tags and typedef names in separate namespaces (`S:inode`, `T:irq_chip_t`). A call through a
+member (`inode->i_mapping->a_ops->bmap(...)`) stores the receiver as a type path
+(`ts_ref.rtype`, `S:inode|i_mapping|a_ops|bmap`). Its base is the declared type of a parameter,
+local or file-level variable (locals are scoped to their block or `case`), a cast, or a
+function's return type. Each field on the way gives the next type, through typedefs. Resolution
+follows the path to the member, which then is the call's target with certainty. When the
+receiver's type is unknown, the call is a guess among at most three same-name function-pointer
+members, else unresolved. It never reaches a free function or another struct's member, and a
+member is no definition that hides a free function's prototype. A function stored in a member
+(`.bmap = ext4_bmap`, `chip->irq_mask = foo_mask;`) records that member as its `ts_ref.slot`
+(negative when the member is a guess). `impact` treats it like interface dispatch: calls through
+the member reach the function, and the functions stored in a member are its first-level
+dependents. A re-parse of a C file re-scores the references that store a function in its
+members, and those whose type path passes through a field or function whose type changed (every
+type path when a typedef changed). A run that re-parses most of a big project drops the old rows
+in one pass per table and resolves everything again.
 
 **Change detection on big trees** (`walkcache`). A tree of at least 50,000 files keeps its last
 walk in `$FOXDB_HOME/walk/<project id>`: the directories it entered with their modification

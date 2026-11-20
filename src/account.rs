@@ -206,6 +206,8 @@ struct Ctx<'a> {
     mode: Mode,
     resolved: &'a HashSet<Line>,
     linked: &'a [i64],
+    /// C: lines storing a function in the target member (`.read_folio = foo,`), certainly.
+    stores: &'a HashSet<Line>,
     defs: &'a HashMap<String, Vec<Def>>,
     refs: &'a HashMap<Line, Vec<RefAt>>,
     /// Indexed (size, mtime, hash) of each file.
@@ -280,6 +282,16 @@ fn build(
     {
         refs.entry((path, line)).or_default().push((kind, dst, amb));
     }
+    // C: a function stored in the target member names it on that line (`.read_folio = foo,`):
+    // a reference to the member, not a call; `refs` and `impact` count it as resolved.
+    let mut stores: HashSet<Line> = HashSet::new();
+    if let Some(t) = top.filter(|t| t.kind == "method" && crate::lang::for_path(&t.path).is_some_and(|l| l.family == "c")) {
+        let mut q = c.prepare_cached("SELECT path, line FROM ts_ref INDEXED BY ts_ref_slot WHERE slot != 0 AND slot = ?1")?;
+        for k in q.query_map([t.id], |r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?)))?.flatten() {
+            refs.entry(k.clone()).or_default().push(("ref".to_string(), t.id, 0));
+            stores.insert(k);
+        }
+    }
     let pending = crate::db::reindex_pending(c, pid) || crate::db::rescore_pending(c, pid);
     let mut files: HashSet<String> = if crate::db::reindex_pending(c, pid) {
         crate::tscode::body_paths(c, pid, name)?.into_iter().collect()
@@ -314,6 +326,7 @@ fn build(
         mode,
         resolved,
         linked,
+        stores: &stores,
         defs: &defs,
         refs: &refs,
         indexed: &indexed,
@@ -665,7 +678,8 @@ fn scan_file(cx: &Ctx, p: &Project, path: &str, raw: &[u8]) -> FileOut {
     for (&ln, occ) in &hits {
         let n = ln as i64 + 1;
         let key = (path.to_string(), n);
-        let resolved_line = cx.resolved.contains(&key);
+        let store = cx.mode != Mode::Calls && cx.stores.contains(&key);
+        let resolved_line = cx.resolved.contains(&key) || store;
         let rs: &[RefAt] = cx.refs.get(&key).map(Vec::as_slice).unwrap_or(&[]);
         let def = def_at.get(&n).copied();
         let raw_line = line_text(ln);
@@ -770,6 +784,8 @@ fn scan_file(cx: &Ctx, p: &Project, path: &str, raw: &[u8]) -> FileOut {
             continue;
         }
         if resolved_line {
+            // A store is resolved without being one of the answer's rows: counted here.
+            out.linked += (store && !cx.resolved.contains(&key)) as usize;
             continue;
         }
         let (cat, r, same_def) = if not_call {
