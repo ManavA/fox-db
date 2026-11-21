@@ -562,4 +562,15 @@ fn parent_reads_are_newest_first_once_and_under_the_root_only() {
     let t = tx.path().join("t.jsonl");
     fs::write(&t, lines.join("\n") + "\n").unwrap();
     assert_eq!(hook::parent_reads(&t, repo.path()), ["a.rs", "b.rs"]);
+    // The transcript names the repo through a symlink (macOS: /var -> /private/var) while the
+    // project root is canonical, or the other way round: the same files either way.
+    let link = tx.path().join("repo-link");
+    std::os::unix::fs::symlink(repo.path(), &link).unwrap();
+    fs::write(repo.path().join("a.rs"), "").unwrap();
+    let l = link.to_string_lossy();
+    let t2 = tx.path().join("t2.jsonl");
+    fs::write(&t2, [read(format!("{l}/a.rs")), read(format!("{l}/sub/new.rs"))].join("\n") + "\n").unwrap();
+    let canon = fs::canonicalize(repo.path()).unwrap();
+    assert_eq!(hook::parent_reads(&t2, &canon), ["sub/new.rs", "a.rs"]);
+    assert_eq!(hook::parent_reads(&t, &link), ["a.rs", "b.rs"]);
 }

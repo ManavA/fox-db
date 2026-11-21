@@ -30,23 +30,16 @@ pub fn hms(ts: i64) -> String {
     format!("{} {:02}:{:02}", crate::mcp::ymd(ts), s / 3600, s % 3600 / 60)
 }
 
-/// A process's start time in clock ticks since boot (field 22 of `/proc/<pid>/stat`).
+/// A process's start-time token (see [`crate::procinfo::Info::start`]).
 pub fn proc_start(pid: i64) -> Option<i64> {
-    let s = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
-    // The command name may hold spaces and parens; fields resume after the last ')'.
-    let rest = &s[s.rfind(')')? + 1..];
-    rest.split_whitespace().nth(19)?.parse().ok()
+    crate::procinfo::start(pid)
 }
 
 /// The process exists, is not a zombie, and (when known) started when we recorded it.
 pub fn alive(pid: i64, start: Option<i64>) -> bool {
-    let Ok(s) = std::fs::read_to_string(format!("/proc/{pid}/stat")) else { return false };
-    let Some(rest) = s.rfind(')').map(|i| &s[i + 1..]) else { return false };
-    let mut f = rest.split_whitespace();
-    if matches!(f.next(), Some("Z" | "X")) {
-        return false;
-    }
-    start.is_none_or(|st| proc_start(pid) == Some(st))
+    let Some(i) = crate::procinfo::info(pid) else { return false };
+    // A platform without start tokens cannot tell a reused pid apart: existence must do.
+    !i.zombie && start.is_none_or(|st| i.start.is_none_or(|now| now == st))
 }
 
 #[derive(Debug, Clone, Default)]
@@ -379,12 +372,9 @@ fn holder_live(w: &Connection, agent: &str, pid: Option<i64>, start: Option<i64>
 /// Shells sit between a harness and the commands it runs; they never stand for an agent.
 const SHELLS: &[&str] = &["sh", "bash", "dash", "zsh", "fish", "ksh", "mksh", "busybox"];
 
-/// `(command name, parent pid)` from `/proc/<pid>/stat`.
+/// `(command name, parent pid)`; None where the platform does not tell (see `procinfo`).
 fn comm_ppid(pid: i64) -> Option<(String, i64)> {
-    let s = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
-    let (open, close) = (s.find('(')?, s.rfind(')')?);
-    let ppid = s[close + 1..].split_whitespace().nth(1)?.parse().ok()?;
-    Some((s[open + 1..close].to_string(), ppid))
+    crate::procinfo::info(pid).filter(|i| i.ppid > 0 || !i.comm.is_empty()).map(|i| (i.comm, i.ppid))
 }
 
 /// This process's ancestors, nearest first (at most 8, stopping at init).
