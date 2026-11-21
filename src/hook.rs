@@ -275,6 +275,13 @@ pub fn parent_reads(transcript: &Path, root: &Path) -> Vec<String> {
         return vec![];
     }
     let text = String::from_utf8_lossy(&buf);
+    // The root as given and as canonical: either may be the form the transcript uses.
+    let mut roots = vec![root.to_path_buf()];
+    if let Ok(c) = std::fs::canonicalize(root)
+        && c != root
+    {
+        roots.push(c);
+    }
     let mut seen: Vec<String> = vec![];
     // A tail that starts mid-line skips that line.
     for l in text.lines().skip(usize::from(start > 0)).filter(|l| l.contains("\"tool_use\"")) {
@@ -287,11 +294,15 @@ pub fn parent_reads(transcript: &Path, root: &Path) -> Vec<String> {
                 _ => None,
             };
             let Some(path) = path else { continue };
-            // Component-wise: `/repo-old/a.rs` is not under `/repo`.
-            let rel = match Path::new(path).strip_prefix(root) {
-                Ok(r) => r.to_string_lossy().into_owned(),
-                Err(_) if !path.starts_with('/') => path.to_string(),
-                Err(_) => continue,
+            // Component-wise (`/repo-old/a.rs` is not under `/repo`), and through symlinks: a
+            // transcript may name the repo as `/var/…` while the root is `/private/var/…` (macOS).
+            let rel = if path.starts_with('/') {
+                match relative_to(Path::new(path), &roots) {
+                    Some(r) => r,
+                    None => continue,
+                }
+            } else {
+                path.to_string()
             };
             if !rel.is_empty() {
                 seen.push(rel);
@@ -301,6 +312,27 @@ pub fn parent_reads(transcript: &Path, root: &Path) -> Vec<String> {
     // Newest first, each path once.
     let mut once = std::collections::HashSet::new();
     seen.into_iter().rev().filter(|p| once.insert(p.clone())).collect()
+}
+
+/// `path` relative to the first of `roots` it lies under, component-wise. Failing that, its
+/// nearest existing ancestor is canonicalized (the file itself may be gone) and tried again, so a
+/// path through a symlink still matches.
+fn relative_to(path: &Path, roots: &[PathBuf]) -> Option<String> {
+    let under = |p: &Path| roots.iter().find_map(|r| p.strip_prefix(r).ok().map(Path::to_path_buf));
+    if let Some(r) = under(path) {
+        return Some(r.to_string_lossy().into_owned());
+    }
+    let mut tail: Vec<&std::ffi::OsStr> = vec![];
+    let mut cur = path;
+    let base = loop {
+        if let Ok(c) = std::fs::canonicalize(cur) {
+            break c;
+        }
+        tail.push(cur.file_name()?);
+        cur = cur.parent()?;
+    };
+    let full = tail.iter().rev().fold(base, |p, n| p.join(n));
+    under(&full).map(|r| r.to_string_lossy().into_owned())
 }
 
 /// `parent read (...): f:1a src/a.rs, f:2b src/b.rs` for the indexed files among the parent's
