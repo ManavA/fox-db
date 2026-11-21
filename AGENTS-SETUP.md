@@ -44,7 +44,7 @@ with that directory in every command and snippet below, and make sure each harne
 
 If the user named a local checkout (for example "set up foxdb from ~/foxdb"), `cd` into it and
 run `scripts/install.sh --source` instead of the block below, so that checkout is what gets built
-(without `--source` the installer prefers the v0.2.4 release asset where there is one).
+(without `--source` the installer prefers the v0.2.5 release asset where there is one).
 Otherwise clone the repository and run the installer from inside the clone:
 
 ```sh
@@ -60,16 +60,16 @@ fox --version
 `scripts/install.sh` picks the release asset for this machine (`uname`: Linux or macOS, x86_64 or
 arm64; releases from v0.2.4 have all four, v0.2.2 only Linux x86_64), downloads it and its `.sha256`
 from the GitHub release with curl or wget (no login) and checks the checksum; without an asset it
-builds `fox` and `foxd` from source with cargo (cloning tag v0.2.4 when run outside a checkout).
+builds `fox` and `foxd` from source with cargo (cloning tag v0.2.5 when run outside a checkout).
 `FOXDB_RELEASE_URL` overrides where the asset is downloaded from.
 It copies them to `~/.foxdb/bin` (or `$FOXDB_HOME/bin`) and the skill to `~/.foxdb/skill/`, and
 touches nothing else. `--source` forces a source build; `--tarball FILE` installs a tarball you
 already downloaded. The prebuilt Linux binary needs glibc 2.35 or newer (2.39 for v0.2.2); on an
-older system the installer falls back to a source build. Expected last line: `fox 0.2.4`.
+older system the installer falls back to a source build. Expected last line: `fox 0.2.5`.
 
 A source build takes several minutes (over 5 on a busy machine). If your tool calls have a time
 limit, run `scripts/install.sh` in the background with its output going to a log file, and poll
-the log until it prints `installed fox 0.2.4`.
+the log until it prints `installed fox 0.2.5`.
 
 Ask the user whether to add `export PATH="$HOME/.foxdb/bin:$PATH"` to their shell profile.
 The harness entries below use absolute paths, so they work without it.
@@ -307,7 +307,7 @@ printf '%s\n' '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocol
 echo '{"hook_event_name":"SessionStart","source":"startup","session_id":"setup-check"}' | fox hook session-start --harness claude | cut -c1-60
 ```
 
-Expected: `fox 0.2.4`; the project with `*` and `indexed ... ago`; rows that start with a
+Expected: `fox 0.2.5`; the project with `*` and `indexed ... ago`; rows that start with a
 handle (`c:`, `f:`, `d:` …) and end in `path:line`; exactly four tool names (`fox_find`,
 `fox_graph`, `fox_memory`, `fox_read`); and a JSON line starting
 `{"hookSpecificOutput":{"additionalContext":"foxdb · `.

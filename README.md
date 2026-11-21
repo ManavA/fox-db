@@ -256,7 +256,7 @@ Measured trade-offs and open targets: [docs/benchmarks.md](docs/benchmarks.md),
 
 ## Status
 
-0.2.4, used daily by one developer on large Kotlin, Swift and Rust codebases. It is
+0.2.5, used daily by one developer on large Kotlin, Swift and Rust codebases. It is
 single-machine and single-user, the call graph outside Swift is name-resolved unless you import
 a SCIP index (treat `callers` as a lower bound), and some performance targets are still open;
 see [docs/benchmarks.md](docs/benchmarks.md) and the limitations in

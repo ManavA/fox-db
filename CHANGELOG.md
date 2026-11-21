@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.2.5 (2026-11-21)
+
+- C and C++ function-pointer struct members are indexed; a call through a member (`a_ops->bmap(...)`) resolves through the receiver's declared type to that member, never to a same-name global, and functions stored in members (`.bmap = ext4_bmap`) are dispatch targets for impact and overrides. On a Linux kernel benchmark, ops-table dispatch recall went from 0 to 1.0. Schema 24; C and C++ files re-parse once.
+- The SessionStart brief is fast on very large stores (about 30 ms on the Linux kernel, was about 2 s, which missed its deadline).
+- `fox_find` expands a question in words one hop over the call graph, so the files the matching code calls into or is called from rank in the same answer (`FOXDB_EXPAND=0` turns it off).
+- The handoff board doubles as a swarm log: fact, failed, summary and question entries with handle attachments, a per-agent `since=me` cursor, and the parent's read files listed as handles in the subagent brief.
+- Multi-agent orchestration (`fox dispatch`, `fox wait`) works on macOS.
+- Ties between same-score candidates and sorting follow newer clippy; reviewers' fixes for C block scoping, typedef namespaces and incremental re-scoring.
+
 ## 0.2.4 (2026-11-19)
 
 The v0.2.3 tag was never released: CI caught that ties between same-score candidates broke differently per filesystem. 0.2.4 is 0.2.3 plus that fix.
