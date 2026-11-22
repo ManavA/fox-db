@@ -2833,3 +2833,126 @@ fn python_base_edit_rescopes_subclass_calls() {
     tsindex::resolve(&c, p.id).unwrap();
     assert_eq!(snap(&c), inc);
 }
+
+/// Every reference's (target, ambiguity), in rowid order.
+fn ref_snapshot(c: &rusqlite::Connection) -> Vec<(i64, i64, i64)> {
+    let mut q = c.prepare("SELECT rowid, dst, amb FROM ts_ref ORDER BY rowid").unwrap();
+    q.query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?))).unwrap().flatten().collect()
+}
+
+/// Re-index after writing `files`, then check the incremental result equals a full resolve.
+fn reindex_matches_full(repo: &Path, p: &project::Project, files: &[(&str, &str)]) {
+    for (f, text) in files {
+        std::fs::write(repo.join(f), text).unwrap();
+    }
+    let mut c = db::open_rw().unwrap();
+    inventory::index_project(&mut c, p).unwrap();
+    tsindex::index_project(&mut c, p).unwrap();
+    let inc = ref_snapshot(&c);
+    tsindex::resolve(&c, p.id).unwrap();
+    assert_eq!(ref_snapshot(&c), inc);
+}
+
+/// Python: a subclass's base list changing, or a new subclass file, re-scores the `self.` calls
+/// of its base classes in other files (a subclass's order decides whether they are certain).
+#[test]
+fn python_subclass_edits_rescore_base_class_calls() {
+    let _g = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    let base = "class Base:\n    def run(self):\n        return self.hook()\n\n    def hook(self):\n        return 0\n";
+    let mixin = "class Mixin:\n    def hook(self):\n        return 1\n";
+    let (_h, repo, p) = inline_project(&[
+        ("base.py", base),
+        ("mixin.py", mixin),
+        ("sub.py", "from base import Base\nfrom mixin import Mixin\n\n\nclass Sub(Base, Mixin):\n    pass\n"),
+    ]);
+    let out = fox_code(&p, "Base.hook", "callers", 6000);
+    assert!(row_of(&out, "Base.run").is_some_and(|r| !r.contains("guess")), "{out}");
+    reindex_matches_full(
+        repo.path(),
+        &p,
+        &[("sub.py", "from base import Base\nfrom mixin import Mixin\n\n\nclass Sub(Mixin, Base):\n    pass\n")],
+    );
+    let out = fox_code(&p, "Base.hook", "callers", 6000);
+    not_certain(&out, "Base.run");
+    // A new subclass file.
+    let (_h, repo, p) = inline_project(&[("base.py", base), ("mixin.py", mixin)]);
+    let out = fox_code(&p, "Base.hook", "callers", 6000);
+    assert!(row_of(&out, "Base.run").is_some_and(|r| !r.contains("guess")), "{out}");
+    reindex_matches_full(
+        repo.path(),
+        &p,
+        &[("sub.py", "from base import Base\nfrom mixin import Mixin\n\n\nclass Sub(Mixin, Base):\n    pass\n")],
+    );
+    let out = fox_code(&p, "Base.hook", "callers", 6000);
+    not_certain(&out, "Base.run");
+}
+
+/// Python: a base edit far up a wide hierarchy still re-scores a deep subclass's calls.
+#[test]
+fn python_base_edit_under_a_wide_hierarchy_matches_full() {
+    let _g = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    let leaves: String = (0..2100).map(|i| format!("class L{i}(B1):\n    pass\n\n")).collect();
+    let leaves = format!("from b1 import B1\n\n{leaves}");
+    let (_h, repo, p) = inline_project(&[
+        ("mixins.py", "class Mixin:\n    def m(self):\n        return 1\n"),
+        ("other.py", "class Other:\n    def m(self):\n        return 2\n"),
+        ("b.py", "from mixins import Mixin\nfrom other import Other\n\n\nclass B(Other):\n    pass\n"),
+        ("b1.py", "from b import B\n\n\nclass B1(B):\n    pass\n"),
+        ("leaves.py", &leaves),
+        ("c.py", "from leaves import L2099\n\n\nclass C(L2099):\n    def go(self):\n        return self.m()\n"),
+    ]);
+    reindex_matches_full(
+        repo.path(),
+        &p,
+        &[("b.py", "from mixins import Mixin\nfrom other import Other\n\n\nclass B(Mixin):\n    pass\n")],
+    );
+    let out = fox_code(&p, "Other.m", "callers", 6000);
+    assert!(row_of(&out, "C.go").is_none_or(|r| r.contains("guess")), "{out}");
+}
+
+/// C++: a qualified receiver the index cannot place (a `using` alias, a namespace alias) keeps the name-based pick, as before; only a library namespace
+/// (`std::`) is outside the project.
+#[test]
+fn cpp_unplaced_qualified_receivers_keep_the_name_pick() {
+    let _g = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    let (_h, _r, p) = inline_project(&[
+        (
+            "a.hpp",
+            "namespace b { struct Real { void start() {} }; }\nnamespace a { using Engine = b::Real; }\nnamespace c = b;\n#define NS_BEGIN namespace m {\n#define NS_END }\nNS_BEGIN\nstruct Motor { void spin() {} };\nNS_END\n",
+        ),
+        (
+            "u.cpp",
+            "#include \"a.hpp\"\nvoid f1(a::Engine& e) { e.start(); }\nvoid f2(c::Real& r) { r.start(); }\nvoid f3(m::Motor& x) { x.spin(); }\n",
+        ),
+    ]);
+    let out = fox_code(&p, "Real.start", "callers", 6000);
+    assert!(row_of(&out, "f1").is_some() && row_of(&out, "f2").is_some(), "{out}");
+    // `std::` stays outside the project.
+    let (_h, _r, p) = inline_project(&[
+        ("a.hpp", "namespace mylib { class string { public: int size() { return 0; } }; }\n"),
+        ("u.cpp", "#include <string>\nint ext(std::string& s) { return s.size(); }\n"),
+    ]);
+    let out = fox_code(&p, "string.size", "callers", 6000);
+    assert!(row_of(&out, "ext").is_none(), "{out}");
+}
+
+/// C++: adding a class re-scores only the type paths that name it, not every member call.
+#[test]
+fn cpp_new_class_rescores_only_paths_naming_it() {
+    let _g = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    let mut files: Vec<(String, String)> = vec![("a.hpp".into(), "namespace n { class Engine { public: void start() {} }; }\n".into())];
+    for i in 0..30 {
+        files.push((format!("u{i}.cpp"), format!("#include \"a.hpp\"\nvoid f{i}(n::Engine& e) {{ e.start(); }}\n")));
+    }
+    let refs: Vec<(&str, &str)> = files.iter().map(|(a, b)| (a.as_str(), b.as_str())).collect();
+    let (_h, repo, p) = inline_project(&refs);
+    std::fs::write(repo.path().join("u0.cpp"), "#include \"a.hpp\"\nvoid f0(n::Engine& e) { e.start(); }\nclass Zed { int q; };\n")
+        .unwrap();
+    let mut c = db::open_rw().unwrap();
+    inventory::index_project(&mut c, &p).unwrap();
+    let st = tsindex::index_project(&mut c, &p).unwrap();
+    assert!(st.rescored < 10, "{}", st.rescored);
+    let inc = ref_snapshot(&c);
+    tsindex::resolve(&c, p.id).unwrap();
+    assert_eq!(ref_snapshot(&c), inc);
+}

@@ -35,14 +35,15 @@ pointer's pointee), the class `auto` gets from `Engine()`, `new`, `make_unique<T
 and for a name that is no local, or `this`, a field of the class whose method the call is in.
 Each step keeps its operator: a smart pointer or `optional` (`W:Pump`) reaches its pointee only
 through `->` or `*`, and its own members (`p.reset()`) are no project method, nor are those of a
-qualified type no project class matches (`std::string`). Template parameters are no classes.
+qualified type in a library namespace (`std::`, `boost::`, ...) no project class matches
+(`std::string`); another unmatched qualifier (a namespace or `using` alias) leaves the name pick. Template parameters are no classes.
 Resolution follows the fields to the receiver's class, which must be the only class (or typedef)
 of its name, or for a qualified name the only class whose whole name ends in it; a method that
 class itself defines once is the target with certainty (its out-of-line definition over the
 in-class declaration). Any unknown step, a class that does not define the method (it may inherit
 it), overloads, a `virtual`/`override` method of that name anywhere, or a call `f()` where `f`
-is also a method leave the name-based guess. A change to the classes of a name re-scores every
-type path.
+is also a method leave the name-based guess. Adding or removing a class re-scores the type paths
+naming it.
 
 **Python method resolution.** After name scoring, a Python call through `self`, `cls` or
 `super()` is re-targeted by the calling class's C3 linearization, built from the stored and
@@ -53,8 +54,9 @@ with one anywhere in the order only a definition in the calling class itself is 
 base's ancestors may come earlier). A guessed base link, a hierarchy C3 rejects, a class
 attribute of the name that is no method (`step = _other`), or a project subclass whose own order
 would reach another definition leave the call a guess. `super(X, self)` counts only when `X` is
-the enclosing class. Re-parsing a Python file whose classes or bases changed adds the files of
-their subclasses (followed through `impl` rows by target) to the incremental scope.
+the enclosing class. Walks are memoized per class, name and start. When a re-parsed or removed
+Python file's classes change (their bases, an expression base, the names they define), every
+Python call through `self`, `cls` or `super()` in the project is re-scored.
 
 **Change detection on big trees** (`walkcache`). A tree of at least 50,000 files keeps its last
 walk in `$FOXDB_HOME/walk/<project id>`: the directories it entered with their modification
