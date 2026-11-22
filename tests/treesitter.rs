@@ -2623,3 +2623,213 @@ fn cpp_typedef_function_pointer_members_are_function_members() {
     let out = fox_code(&p, "ops.run", "callers", 6000);
     assert!(rows(&out).contains("drive"), "{out}");
 }
+
+/// A call row of `func` in a `callers` answer, if any.
+fn row_of<'a>(out: &'a str, func: &str) -> Option<&'a str> {
+    out.lines().find(|l| l.trim_start().starts_with(':') && l.contains(&format!(" {func} c:")))
+}
+
+/// `func`'s call is not credited to the target with certainty (absent or a guess), and the
+/// answer does not read as complete because of it.
+fn not_certain(out: &str, func: &str) {
+    if let Some(r) = row_of(out, func) {
+        assert!(r.contains("guess"), "{func} must not be certain: {out}");
+    }
+}
+
+/// C++: a smart pointer's or optional's own members (`p.reset()`) are no pointee's method; `->`
+/// reaches the pointee.
+#[test]
+fn cpp_smart_pointer_own_members_are_not_the_pointees() {
+    let _g = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    let (_h, _r, p) = inline_project(&[(
+        "a.cpp",
+        "#include <memory>\n#include <optional>\nclass Engine {\npublic:\n    void reset() {}\n    void start() {}\n};\nvoid by_up(std::unique_ptr<Engine> p) { p.reset(); }\nvoid by_make() { auto p = std::make_unique<Engine>(); p.reset(); }\nvoid by_opt() { auto o = std::make_optional<Engine>(); o.reset(); }\nvoid by_opt2(std::optional<Engine> o) { o.reset(); }\nvoid arrow(std::unique_ptr<Engine> p) { p->start(); }\nvoid deref(std::shared_ptr<Engine> p) { (*p).start(); }\n",
+    )]);
+    let out = fox_code(&p, "Engine.reset", "callers", 6000);
+    for f in ["by_up", "by_make", "by_opt", "by_opt2"] {
+        not_certain(&out, f);
+    }
+    assert!(!out.contains("all accounted for") || !rows(&out).contains("by_"), "{out}");
+    let out = fox_code(&p, "Engine.start", "callers", 6000);
+    for f in ["arrow", "deref"] {
+        assert!(row_of(&out, f).is_some_and(|r| !r.contains("guess")), "{f}: {out}");
+    }
+}
+
+/// C++: a qualified receiver type must name the candidate's own class, an unqualified one the
+/// only class of that name; template parameters are no classes; overloads, virtual methods and
+/// a call through a name that is also a member function stay guesses.
+#[test]
+fn cpp_receivers_in_doubt_stay_guesses() {
+    let _g = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    let (_h, _r, p) = inline_project(&[
+        (
+            "a.cpp",
+            "#include <memory>\n#include <string>\nclass Pump { public: void reset() {} };\nclass Engine {\npublic:\n    void reset() {}\n    void put(int x) {}\n    void put(const char* s) {}\n};\nvoid by_up(std::unique_ptr<Engine> p) { p.reset(); }\nvoid over(Engine& e) { e.put(\"x\"); }\n",
+        ),
+        (
+            "b.cpp",
+            "namespace mylib { class string { public: int size() { return 0; } }; }\nstruct Base { void run() {} };\nnamespace other { struct Holder : Base {}; }\n",
+        ),
+        (
+            "c.cpp",
+            "#include <string>\nnamespace x { struct Holder { void run() {} }; }\nint ext(std::string& s) { return s.size(); }\nvoid ns(other::Holder& h) { h.run(); }\ntemplate <class Engine> void tpl(Engine e) { e.reset(); }\nstruct Base2 { virtual void go() {} };\nstruct Derived2 : Base2 { void go() override {} };\nvoid virt(Base2* b) { b->go(); }\nvoid qual(x::Holder& h) { h.run(); }\n",
+        ),
+        (
+            "d.cpp",
+            "class Motor { public: void spin() {} };\nclass Rotor { public: void spin() {} };\nMotor make() { return Motor(); }\nclass Car {\npublic:\n    Rotor make() { return Rotor(); }\n    void go() { auto p = make(); p.spin(); }\n};\n",
+        ),
+    ]);
+    let out = fox_code(&p, "string.size", "callers", 6000);
+    not_certain(&out, "ext");
+    let out = fox_code(&p, "x.Holder.run", "callers", 6000);
+    not_certain(&out, "ns");
+    assert!(row_of(&out, "qual").is_some_and(|r| !r.contains("guess")), "{out}");
+    let out = fox_code(&p, "Base.run", "callers", 6000);
+    not_certain(&out, "ns");
+    let out = fox_code(&p, "Engine.reset", "callers", 6000);
+    not_certain(&out, "tpl");
+    not_certain(&out, "by_up");
+    let c = db::open_ro().unwrap();
+    let mut q = c.prepare("SELECT id FROM node WHERE project_id = ?1 AND name = 'put' AND kind = 'symbol'").unwrap();
+    let puts: Vec<i64> = q.query_map([p.id], |r| r.get(0)).unwrap().flatten().collect();
+    assert_eq!(puts.len(), 2);
+    for id in puts {
+        let out = fox_code(&p, &format!("c:{id:x}"), "callers", 6000);
+        not_certain(&out, "over");
+    }
+    let out = fox_code(&p, "Base2.go", "callers", 6000);
+    not_certain(&out, "virt");
+    let out = fox_code(&p, "Derived2.go", "callers", 6000);
+    assert!(!out.lines().next().unwrap_or("").contains("all accounted for"), "{out}");
+    let out = fox_code(&p, "Motor.spin", "callers", 6000);
+    not_certain(&out, "Car.go");
+}
+
+/// C++: a class-typed member stays a field when a same-name typedef of a function pointer lives
+/// in another namespace, and its qualified type still reaches its class.
+#[test]
+fn cpp_class_member_is_no_function_member_beside_a_same_name_typedef() {
+    let _g = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    let (_h, _r, p) = inline_project(&[(
+        "a.hpp",
+        "namespace cb { typedef void (*Engine)(int); }\nnamespace car { class Engine { public: void start() {} }; }\nstruct Car { car::Engine engine; void go() { engine.start(); } };\n",
+    )]);
+    let c = db::open_ro().unwrap();
+    let k: String = c
+        .query_row(
+            "SELECT json_extract(meta,'$.k') FROM node WHERE project_id = ?1 AND name = 'engine' AND kind = 'symbol'",
+            rusqlite::params![p.id],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(k, "field");
+    let out = fox_code(&p, "Engine.start", "callers", 6000);
+    assert!(row_of(&out, "Car.go").is_some_and(|r| !r.contains("guess")), "{out}");
+}
+
+/// C++ files reclassify typedef'd function-pointer members on an incremental run as a full one
+/// does.
+#[test]
+fn cpp_typedef_members_incremental_matches_full() {
+    let _g = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    let (_h, repo, p) = inline_project(&[
+        ("t.hpp", "typedef int (*op_fn)(int);\n"),
+        ("a.cpp", "#include \"t.hpp\"\nstruct Ops { int run; };\nint use(Ops *p) { return p->run; }\n"),
+    ]);
+    let mut c = db::open_rw().unwrap();
+    std::fs::write(repo.path().join("a.cpp"), "#include \"t.hpp\"\nstruct Ops { op_fn run; };\nint use(Ops *p) { return p->run(1); }\n")
+        .unwrap();
+    inventory::index_project(&mut c, &p).unwrap();
+    tsindex::index_project(&mut c, &p).unwrap();
+    let kind = |c: &rusqlite::Connection| -> String {
+        c.query_row("SELECT json_extract(meta,'$.k') FROM node WHERE project_id = ?1 AND name = 'run' AND kind = 'symbol'", [p.id], |r| {
+            r.get(0)
+        })
+        .unwrap()
+    };
+    assert_eq!(kind(&c), "method");
+    let snap = |c: &rusqlite::Connection| -> Vec<(i64, i64, i64)> {
+        let mut q = c.prepare("SELECT rowid, dst, amb FROM ts_ref ORDER BY rowid").unwrap();
+        q.query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?))).unwrap().flatten().collect()
+    };
+    let inc = snap(&c);
+    tsindex::resolve(&c, p.id).unwrap();
+    assert_eq!(snap(&c), inc);
+}
+
+/// Python: doubt leaves a `self.` or `super()` call a guess: a dynamic base, a class attribute
+/// shadowing the method, a guessed base link, a subclass that overrides the method, an explicit
+/// `super(Other, self)`.
+#[test]
+fn python_mro_in_doubt_stays_a_guess() {
+    let _g = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    let (_h, _r, p) = inline_project(&[
+        (
+            "a.py",
+            "from typing import Generic, TypeVar\nT = TypeVar(\"T\")\n\n\nclass Mixin(Generic[T]):\n    def step(self):\n        return 2\n\n\nclass Base:\n    def step(self):\n        return 1\n\n\nclass Child(Mixin[int], Base):\n    def go(self):\n        return self.step()\n\n\ndef make():\n    return object\n\n\nclass Dyn(make(), Base):\n    def go2(self):\n        return self.step()\n\n\nclass Tmpl:\n    def run(self):\n        return self.hook()\n\n    def hook(self):\n        return 0\n\n\nclass Sub(Tmpl):\n    def hook(self):\n        return 1\n",
+        ),
+        (
+            "b.py",
+            "class Base3:\n    def step3(self):\n        return 1\n\n\ndef _other(self):\n    return 0\n\n\nclass Child3(Base3):\n    step3 = _other\n\n    def go3(self):\n        return self.step3()\n",
+        ),
+        ("k.py", "class K2:\n    def m(self):\n        return 2\n\n\nclass K1(K2):\n    def other(self):\n        return 1\n"),
+        ("p1/g.py", "from k import K2\n\n\nclass G(K2):\n    def m(self):\n        return 3\n"),
+        ("p2/g.py", "class G:\n    def m(self):\n        return 4\n"),
+        ("c.py", "from k import K1\nfrom p1.g import *\n\n\nclass A(K1, G):\n    def go(self):\n        return self.m()\n"),
+        (
+            "d.py",
+            "class A4:\n    def m4(self):\n        return 0\n\n\nclass B4(A4):\n    def m4(self):\n        return 1\n\n\nclass C4(B4):\n    def m4(self):\n        return super(B4, self).m4()\n",
+        ),
+    ]);
+    let out = fox_code(&p, "Mixin.step", "callers", 6000);
+    assert!(row_of(&out, "Child.go").is_some_and(|r| !r.contains("guess")), "{out}");
+    let out = fox_code(&p, "Base.step", "callers", 6000);
+    not_certain(&out, "Child.go");
+    not_certain(&out, "Dyn.go2");
+    let out = fox_code(&p, "Tmpl.hook", "callers", 6000);
+    not_certain(&out, "Tmpl.run");
+    let out = fox_code(&p, "Base3.step3", "callers", 6000);
+    not_certain(&out, "Child3.go3");
+    let out = fox_code(&p, "K2.m", "callers", 6000);
+    not_certain(&out, "A.go");
+    let out = fox_code(&p, "B4.m4", "callers", 6000);
+    not_certain(&out, "C4.m4");
+}
+
+/// Python: changing a class's bases re-scores the `self.` calls of its subclasses in other files.
+#[test]
+fn python_base_edit_rescopes_subclass_calls() {
+    let _g = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    let (_h, repo, p) = inline_project(&[
+        ("mixins.py", "class Mixin:\n    def m(self):\n        return 1\n"),
+        ("other.py", "class Other:\n    def m(self):\n        return 2\n"),
+        ("b.py", "from mixins import Mixin\nfrom other import Other\n\n\nclass B(Other):\n    def x(self):\n        return 0\n"),
+        ("c.py", "from b import B\n\n\nclass C(B):\n    def go(self):\n        return self.m()\n"),
+        ("d.py", "from c import C\n\n\nclass D(C):\n    def go4(self):\n        return self.m()\n"),
+    ]);
+    let out = fox_code(&p, "Other.m", "callers", 6000);
+    assert!(row_of(&out, "C.go").is_some() && row_of(&out, "D.go4").is_some(), "{out}");
+    let mut c = db::open_rw().unwrap();
+    std::fs::write(
+        repo.path().join("b.py"),
+        "from mixins import Mixin\nfrom other import Other\n\n\nclass B(Mixin):\n    def x(self):\n        return 0\n",
+    )
+    .unwrap();
+    inventory::index_project(&mut c, &p).unwrap();
+    tsindex::index_project(&mut c, &p).unwrap();
+    drop(c);
+    let out = fox_code(&p, "Mixin.m", "callers", 6000);
+    assert!(row_of(&out, "C.go").is_some() && row_of(&out, "D.go4").is_some(), "{out}");
+    let out = fox_code(&p, "Other.m", "callers", 6000);
+    assert!(row_of(&out, "C.go").is_none() && row_of(&out, "D.go4").is_none(), "{out}");
+    let c = db::open_rw().unwrap();
+    let snap = |c: &rusqlite::Connection| -> Vec<(i64, i64, i64)> {
+        let mut q = c.prepare("SELECT rowid, dst, amb FROM ts_ref ORDER BY rowid").unwrap();
+        q.query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?))).unwrap().flatten().collect()
+    };
+    let inc = snap(&c);
+    tsindex::resolve(&c, p.id).unwrap();
+    assert_eq!(snap(&c), inc);
+}

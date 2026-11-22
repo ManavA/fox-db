@@ -1,6 +1,6 @@
 ; foxdb tags for C++ (adapted from tree-sitter-cpp tags.scm; definitions span the body).
 (struct_specifier name: (type_identifier) @name body: (_)) @definition.struct
-(class_specifier name: (type_identifier) @name) @definition.class
+(class_specifier name: (type_identifier) @name body: (_)) @definition.class
 (namespace_definition name: (namespace_identifier) @name) @definition.module
 (function_definition declarator: (function_declarator declarator: (identifier) @name)) @definition.function
 (function_definition declarator: (function_declarator declarator: (field_identifier) @name)) @definition.method

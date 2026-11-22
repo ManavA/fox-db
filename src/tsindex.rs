@@ -50,6 +50,11 @@ pub struct Def {
     /// C++: a method declared in its class body without a body (`void start();`); its
     /// out-of-line definition is the one a call reaches.
     pub proto: bool,
+    /// C++: a method declared `virtual`, `override` or `final`: a call through a receiver may run
+    /// another class's.
+    pub virt: bool,
+    /// Python: a class whose bases include an expression the index cannot follow (`make()`).
+    pub dyn_bases: bool,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -143,9 +148,22 @@ fn receiver_name(n: tree_sitter::Node, p: Option<tree_sitter::Node>, src: &[u8])
         r = p.named_child(0).filter(|c| c.id() != n.id());
     }
     let mut r = r?;
-    // Python `super().f()` and `super(Child, self).f()`: the receiver is the class's parent.
+    // Python `super().f()` and `super(Child, self).f()` in `Child`: the next class of its method
+    // resolution order. `super(Other, self)` starts elsewhere: a call as receiver, as any other.
     if r.kind() == "call" && r.child_by_field_name("function").and_then(|f| f.utf8_text(src).ok()) == Some("super") {
-        return Some(("super".to_string(), r.start_byte()));
+        let first = r.child_by_field_name("arguments").and_then(|a| a.named_child(0));
+        let own = match first {
+            None => true,
+            Some(a) => {
+                let mut up = r.parent();
+                while let Some(u) = up.filter(|u| u.kind() != "class_definition") {
+                    up = u.parent();
+                }
+                let cls = up.and_then(|c| c.child_by_field_name("name")).and_then(|n| n.utf8_text(src).ok());
+                a.kind() == "identifier" && cls.is_some() && a.utf8_text(src).ok() == cls
+            }
+        };
+        return own.then(|| ("super".to_string(), r.start_byte()));
     }
     // A chain: its last name (`a.b` -> `b`).
     while r.named_child_count() > 0 && ["navigation", "member", "field", "selector", "attribute"].iter().any(|w| r.kind().contains(w)) {
@@ -254,10 +272,10 @@ fn c_chain(e: tree_sitter::Node, walk: &Walk, src: &[u8], depth: usize) -> Optio
 }
 
 /// C++: a receiver expression as a type path, like [`c_chain`] but with the class of the base
-/// as `S:Name` (a declared type, a smart pointer's pointee, an `auto` initializer's form), `F:fn`
-/// for a call's value, and for a name that is no local the field of the class whose method it is
-/// in: `engine.start()` in `Car::go` is `S:Car|engine|start`, `car.engine.start()` with a
-/// parameter `Car& car` is `S:Car|engine|start`. None when the base's type cannot be told.
+/// as `S:Name` (`S:ns::Name` when qualified), `W:Name` for a smart pointer or `optional` holding
+/// one, `F:fn` for a call's value, and each step after it led by its operator (`.` or `>` for
+/// `->`): `engine.start()` in `Car::go` is `S:Car|.engine|.start`, `p->start()` with
+/// `std::unique_ptr<Pump> p` is `W:Pump|>start`. None when the base's type cannot be told.
 fn cpp_chain(e: tree_sitter::Node, walk: &Walk, src: &[u8], depth: usize) -> Option<String> {
     if depth > C_CHAIN_MAX {
         return None;
@@ -273,18 +291,126 @@ fn cpp_chain(e: tree_sitter::Node, walk: &Walk, src: &[u8], depth: usize) -> Opt
             if walk.locals.contains(&pos) || walk.file_locals.contains_key(&pos) {
                 return None;
             }
-            Some(format!("S:{}|{}", walk.recv_class.get(&pos)?, text(e)?))
+            Some(format!("S:{}|.{}", walk.recv_class.get(&pos)?, text(e)?))
         }
         "this" => walk.recv_class.get(&pos).map(|c| format!("S:{c}")),
         "field_expression" => {
             let base = cpp_chain(e.child_by_field_name("argument")?, walk, src, depth + 1)?;
-            Some(format!("{base}|{}", text(e.child_by_field_name("field")?)?))
+            let mut w = e.walk();
+            let op = if e.children(&mut w).any(|c| c.kind() == "->") { '>' } else { '.' };
+            Some(format!("{base}|{op}{}", text(e.child_by_field_name("field")?)?))
         }
         "parenthesized_expression" => cpp_chain(e.named_child(0)?, walk, src, depth + 1),
-        "pointer_expression" => cpp_chain(e.child_by_field_name("argument")?, walk, src, depth + 1),
-        "call_expression" | "cast_expression" | "new_expression" => cpp_value(e, src),
+        "pointer_expression" => {
+            let inner = cpp_chain(e.child_by_field_name("argument")?, walk, src, depth + 1)?;
+            let deref = e.child_by_field_name("operator").is_some_and(|o| o.kind() == "*");
+            // `*p` of a smart pointer is its pointee; a dereference after a step (`*a.b`) or the
+            // address of a smart pointer cannot be told here.
+            match inner.strip_prefix("W:") {
+                _ if inner.contains('|') => None,
+                Some(c) if deref => Some(format!("S:{c}")),
+                Some(_) => None,
+                None => Some(inner),
+            }
+        }
+        "call_expression" | "cast_expression" | "new_expression" => cpp_value(e, src).filter(|t| !cpp_tparam(t, &walk.tparams)),
         _ => None,
     }
+}
+
+/// Python: when Python file `path`'s classes or their bases change (`parsed`: its new parse, None
+/// when it is removed), add the files of every project subclass of its classes, and of the
+/// classes naming one of its class names as a base, to `out`. Read before the file's rows go.
+fn py_subclass_files(tx: &Connection, pid: i64, path: &str, parsed: Option<&Parsed>, out: &mut HashSet<String>) -> Result<()> {
+    // (class, its bases in order, whether a base is an expression), old and new.
+    type Sig = Vec<(String, Vec<String>, bool)>;
+    let mut old: Sig = vec![];
+    let mut ids: Vec<i64> = vec![];
+    {
+        let mut q = tx.prepare_cached(
+            "SELECT id, name, json_extract(meta,'$.db') IS NOT NULL FROM node
+             WHERE project_id = ?1 AND path = ?2 AND kind = 'symbol' AND json_extract(meta,'$.k') = 'class' ORDER BY id",
+        )?;
+        let mut b = tx.prepare_cached("SELECT name FROM ts_ref WHERE src = ?1 AND src != 0 AND kind = 'impl' ORDER BY rowid")?;
+        for (id, name, db) in
+            q.query_map(params![pid, path], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?, r.get::<_, bool>(2)?)))?.flatten()
+        {
+            let bases: Vec<String> = b.query_map([id], |r| r.get(0))?.flatten().collect();
+            ids.push(id);
+            old.push((name, bases, db));
+        }
+    }
+    let new: Sig = match parsed {
+        None => vec![],
+        Some(p) => p
+            .defs
+            .iter()
+            .enumerate()
+            .filter(|(_, d)| d.kind == "class")
+            .map(|(i, d)| {
+                let bases = p.refs.iter().filter(|r| r.kind == "impl" && r.caller == Some(i)).map(|r| r.name.clone()).collect();
+                (d.name.clone(), bases, d.dyn_bases)
+            })
+            .collect(),
+    };
+    if old == new {
+        return Ok(());
+    }
+    // Seeds: the old classes (by id), and every class naming one of the class names as a base.
+    let mut todo: Vec<i64> = vec![];
+    let mut seen: HashSet<i64> = ids.iter().copied().collect();
+    let mut by_dst = tx.prepare_cached("SELECT src, path FROM ts_ref WHERE dst = ?1 AND dst != 0 AND kind = 'impl'")?;
+    let mut by_name = tx.prepare_cached("SELECT src, path FROM ts_ref WHERE project_id = ?1 AND name = ?2 AND kind = 'impl'")?;
+    let mut found: Vec<(i64, String)> = vec![];
+    for id in &ids {
+        found.extend(by_dst.query_map([id], |r| Ok((r.get(0)?, r.get(1)?)))?.flatten());
+    }
+    let names: HashSet<&String> = old.iter().chain(&new).map(|c| &c.0).collect();
+    for n in names {
+        found.extend(by_name.query_map(params![pid, n], |r| Ok((r.get(0)?, r.get(1)?)))?.flatten());
+    }
+    loop {
+        for (src, p) in found.drain(..) {
+            if src != 0 && seen.insert(src) {
+                out.insert(p);
+                todo.push(src);
+            }
+        }
+        // Bounded like the walk that reads them (see [`PY_SUBS_MAX`]).
+        let Some(c) = todo.pop().filter(|_| seen.len() <= PY_SUBS_MAX * 10) else { break };
+        found.extend(by_dst.query_map([c], |r| Ok((r.get(0)?, r.get(1)?)))?.flatten());
+    }
+    Ok(())
+}
+
+/// Python: does class definition `n` name a base the index records no reference for (a call, a
+/// `*bases` splat, any other expression)?
+fn py_dyn_bases(n: tree_sitter::Node) -> bool {
+    let Some(args) = n.child_by_field_name("superclasses") else { return false };
+    let mut w = args.walk();
+    let named = |x: tree_sitter::Node| matches!(x.kind(), "identifier" | "attribute");
+    args.named_children(&mut w).any(|a| match a.kind() {
+        "keyword_argument" | "comment" => false,
+        "subscript" => !a.child_by_field_name("value").is_some_and(named),
+        _ => !named(a),
+    })
+}
+
+/// C++: is method definition or declaration `n` marked `virtual`, `override` or `final`?
+fn cpp_virtual(n: tree_sitter::Node) -> bool {
+    let mut w = n.walk();
+    let kids: Vec<tree_sitter::Node> = n.children(&mut w).collect();
+    kids.iter().any(|c| c.kind() == "virtual" || c.kind() == "virtual_function_specifier")
+        || kids.iter().filter(|c| c.kind() == "function_declarator").any(|d| {
+            let mut w = d.walk();
+            d.children(&mut w).any(|c| c.kind() == "virtual_specifier")
+        })
+}
+
+/// C++: does type path base `t` (`S:T`, `W:T`, `S:T::inner`) name a template parameter?
+fn cpp_tparam(t: &str, tparams: &HashSet<String>) -> bool {
+    let b = t.get(2..).unwrap_or("").trim_start_matches("::");
+    tparams.contains(b.split("::").next().unwrap_or(""))
 }
 
 /// C: the member a function named as an initializer value or assigned to a field is stored in,
@@ -334,30 +460,33 @@ fn c_slot(value: tree_sitter::Node, parent: tree_sitter::Node, walk: &Walk, src:
     }
 }
 
-/// Smart pointers whose pointee is the receiver of `p->f()`.
-const CPP_SMART: &[&str] = &["unique_ptr", "shared_ptr", "weak_ptr", "auto_ptr", "scoped_ptr", "intrusive_ptr"];
+/// Wrappers whose pointee is the receiver of `p->f()` and `(*p).f()`; `p.f()` is the wrapper's
+/// own member.
+const CPP_SMART: &[&str] = &["unique_ptr", "shared_ptr", "weak_ptr", "auto_ptr", "scoped_ptr", "intrusive_ptr", "optional"];
 
-/// Functions whose first template argument is the type of what they return.
-const CPP_MAKERS: &[&str] = &[
-    "make_unique",
-    "make_shared",
-    "make_optional",
-    "static_cast",
-    "dynamic_cast",
-    "reinterpret_cast",
-    "const_cast",
-    "static_pointer_cast",
-    "dynamic_pointer_cast",
-    "const_pointer_cast",
-];
+/// Functions whose first template argument is the type they return a wrapper of.
+const CPP_WRAP_MAKERS: &[&str] =
+    &["make_unique", "make_shared", "make_optional", "static_pointer_cast", "dynamic_pointer_cast", "const_pointer_cast"];
 
-/// C++: the class a type node names, as `S:Name` (the last name of a qualified one, the pointee
-/// of a smart pointer). None for a primitive, `auto` or any other template.
+/// Casts whose first template argument is the type of what they return.
+const CPP_CASTS: &[&str] = &["static_cast", "dynamic_cast", "reinterpret_cast", "const_cast"];
+
+/// C++: the class a type node names, as `S:Name` (`S:ns::Name` when qualified), or `W:Name` for
+/// a smart pointer or `optional` of one. None for a primitive, `auto` or any other template.
 fn cpp_type(t: tree_sitter::Node, src: &[u8]) -> Option<String> {
     let text = |n: tree_sitter::Node| n.utf8_text(src).ok().filter(|s| !s.is_empty() && s.len() <= 120);
     match t.kind() {
         "type_identifier" | "namespace_identifier" => text(t).map(|s| format!("S:{s}")),
-        "qualified_identifier" => cpp_type(t.child_by_field_name("name")?, src),
+        "qualified_identifier" => {
+            let name = t.child_by_field_name("name")?;
+            if name.kind() == "template_type" {
+                // `std::unique_ptr<T>`: the wrapper, whatever its namespace.
+                return cpp_type(name, src);
+            }
+            let full: String = text(t)?.chars().filter(|c| !c.is_whitespace()).collect();
+            let full = full.trim_start_matches("::");
+            (!full.contains('<') && !full.is_empty()).then(|| format!("S:{full}"))
+        }
         "struct_specifier" | "class_specifier" | "union_specifier" => cpp_type(t.child_by_field_name("name")?, src),
         "type_descriptor" => cpp_type(t.child_by_field_name("type")?, src),
         "template_type" => {
@@ -366,8 +495,9 @@ fn cpp_type(t: tree_sitter::Node, src: &[u8]) -> Option<String> {
             }
             let args = t.child_by_field_name("arguments")?;
             let arg = args.named_child(0).filter(|a| args.named_child_count() == 1 && a.kind() == "type_descriptor")?;
-            // `unique_ptr<T[]>`, `shared_ptr<T*>`: not a pointer to a `T`.
-            arg.child_by_field_name("declarator").is_none().then(|| cpp_type(arg, src)).flatten()
+            // `unique_ptr<T[]>`, `shared_ptr<T*>`: not a wrapper of a `T`.
+            let inner = arg.child_by_field_name("declarator").is_none().then(|| cpp_type(arg, src)).flatten()?;
+            inner.strip_prefix("S:").map(|c| format!("W:{c}"))
         }
         _ => None,
     }
@@ -375,7 +505,7 @@ fn cpp_type(t: tree_sitter::Node, src: &[u8]) -> Option<String> {
 
 /// C++: the type a value expression has when its form says so: `Engine()` and `f()` (the path
 /// `F:name`: a function's return type, else the class of that name), `new Engine`,
-/// `make_unique<Engine>()`, `static_cast<Engine*>(x)`.
+/// `make_unique<Engine>()` (a wrapper), `static_cast<Engine*>(x)`.
 fn cpp_value(v: tree_sitter::Node, src: &[u8]) -> Option<String> {
     let text = |n: tree_sitter::Node| n.utf8_text(src).ok().filter(|s| !s.is_empty() && s.len() <= 120);
     match v.kind() {
@@ -391,7 +521,12 @@ fn cpp_value(v: tree_sitter::Node, src: &[u8]) -> Option<String> {
                 "template_function" => {
                     let maker = text(f.child_by_field_name("name")?)?;
                     let arg = f.child_by_field_name("arguments")?.named_child(0)?;
-                    CPP_MAKERS.contains(&maker).then(|| cpp_type(arg, src)).flatten()
+                    let t = cpp_type(arg, src)?;
+                    if CPP_WRAP_MAKERS.contains(&maker) {
+                        t.strip_prefix("S:").map(|c| format!("W:{c}"))
+                    } else {
+                        CPP_CASTS.contains(&maker).then_some(t)
+                    }
                 }
                 _ => None,
             }
@@ -417,7 +552,7 @@ fn cpp_declared_type(d: tree_sitter::Node, n: tree_sitter::Node, anc: &[tree_sit
 /// C++: the class a node opens as the scope of `this` and unqualified members: a class or struct
 /// with a body, or a method defined outside its class (`void Car::go() {}`).
 fn cpp_class_context(n: tree_sitter::Node, src: &[u8]) -> Option<String> {
-    let name = |x: tree_sitter::Node| cpp_type(x, src).map(|t| t[2..].to_string());
+    let name = |x: tree_sitter::Node| cpp_type(x, src).filter(|t| t.starts_with("S:")).map(|t| t[2..].to_string());
     match n.kind() {
         "class_specifier" | "struct_specifier" => {
             n.child_by_field_name("body")?;
@@ -536,6 +671,9 @@ struct Walk<'t> {
     /// C++: the class whose members an identifier or `this` at a receiver position may name (the
     /// class of the method it is in), by start byte.
     recv_class: HashMap<usize, String>,
+    /// C++: the names template parameter lists of the file declare (`template <class T>`): no
+    /// class a receiver's type may name.
+    tparams: HashSet<String>,
 }
 
 /// One top-down pass over the tree (see [`Walk`]). Linear in the tree size: ancestors are kept
@@ -553,6 +691,7 @@ fn walk_tree<'t>(root: tree_sitter::Node<'t>, src: &[u8], c_lang: bool, cpp: boo
     // C++: open classes and out-of-line methods: (depth of the node, class name).
     let mut classes: Vec<(usize, String)> = vec![];
     let mut recv_class: HashMap<usize, String> = HashMap::new();
+    let mut tparams: HashSet<String> = HashSet::new();
     // (start byte, innermost scope, name) of identifiers in value slots and receiver positions.
     let mut uses: Vec<(usize, usize, String)> = vec![];
     let mut anc: Vec<tree_sitter::Node> = vec![];
@@ -569,6 +708,18 @@ fn walk_tree<'t>(root: tree_sitter::Node<'t>, src: &[u8], c_lang: bool, cpp: boo
                     && anc.last().is_some_and(|p| p.kind() == "field_expression" && p.named_child(0).is_some_and(|f| f.id() == n.id())))
         {
             recv_class.insert(n.start_byte(), c.1.clone());
+        }
+        if cpp
+            && n.kind() == "type_identifier"
+            && anc.last().is_some_and(|p| {
+                matches!(
+                    p.kind(),
+                    "type_parameter_declaration" | "optional_type_parameter_declaration" | "variadic_type_parameter_declaration"
+                )
+            })
+            && let Ok(t) = n.utf8_text(src)
+        {
+            tparams.insert(t.to_string());
         }
         if is_scope(n.kind(), cfam) {
             let parent = open.last().map_or(0, |o| o.1);
@@ -658,7 +809,10 @@ fn walk_tree<'t>(root: tree_sitter::Node<'t>, src: &[u8], c_lang: bool, cpp: boo
             sc = scopes[sc].0;
         }
     }
-    Walk { locals, file_locals, parents, recv_types, recv_class }
+    if cpp {
+        recv_types.retain(|_, t| !cpp_tparam(t, &tparams));
+    }
+    Walk { locals, file_locals, parents, recv_types, recv_class, tparams }
 }
 
 /// Is identifier `x` in a declaring position (a parameter or variable name, not a use)?
@@ -838,6 +992,8 @@ pub fn extract(l: &Lang, src: &[u8]) -> Parsed {
                 ty = None;
             }
             let proto = cpp && !field_fn && kind == "method" && node.kind() == "field_declaration";
+            let virt = cpp && !field_fn && kind == "method" && cpp_virtual(node);
+            let dyn_bases = l.family == "python" && kind == "class" && py_dyn_bases(node);
             if field_fn {
                 kind = "method".into();
             }
@@ -864,6 +1020,8 @@ pub fn extract(l: &Lang, src: &[u8]) -> Parsed {
                 td,
                 tk,
                 proto,
+                virt,
+                dyn_bases,
             });
         } else if let Some(k) = cn.strip_prefix("reference.") {
             // A value in an argument list, keyed literal or initializer (`f(name)`, `Name: name`,
@@ -1301,9 +1459,16 @@ pub fn index_project_with(c: &mut Connection, p: &Project, delta: Option<&crate:
     };
     let mut cchange = CChange::default();
     let is_c = |path: &str| lang::for_path(path).is_some_and(|l| l.family == "c") || is_header(path);
+    let is_py = |path: &str| lang::for_path(path).is_some_and(|l| l.family == "python");
+    // Python: the files of the subclasses of classes whose bases changed (their `self.` calls
+    // follow the method resolution order).
+    let mut py_subs: HashSet<String> = HashSet::new();
     for path in &removed {
         old_names(path, &mut sc_names)?;
         sc_paths.insert(path.clone());
+        if !full && !bulk && is_py(path) {
+            py_subclass_files(&tx, p.id, path, None, &mut py_subs)?;
+        }
         if !full && !bulk && is_c(path) {
             cchange.add(&c_type_rows_stored(&tx, p.id, path)?, &HashSet::new());
         }
@@ -1332,14 +1497,17 @@ pub fn index_project_with(c: &mut Connection, p: &Project, delta: Option<&crate:
                 st.unchanged += 1;
             }
             Work::Parse { path, lang, hash, size, mtime, parsed, texts, words } => {
+                if !full && !bulk && is_py(&path) {
+                    py_subclass_files(&tx, p.id, &path, Some(&parsed), &mut py_subs)?;
+                }
                 if old.contains_key(&path) && !pre_dropped {
                     old_names(&path, &mut sc_names)?;
                     if !full && !bulk && is_c(&path) {
-                        cchange.add(&c_type_rows_stored(&tx, p.id, &path)?, &c_type_rows(&parsed));
+                        cchange.add(&c_type_rows_stored(&tx, p.id, &path)?, &c_type_rows(&parsed, is_cpp_path(&path)));
                     }
                     sc_names.extend(drop_file(&tx, &sink, p.id, &path)?);
                 } else if !full && !bulk && is_c(&path) {
-                    cchange.add(&HashSet::new(), &c_type_rows(&parsed));
+                    cchange.add(&HashSet::new(), &c_type_rows(&parsed, is_cpp_path(&path)));
                 }
                 sc_names.extend(parsed.defs.iter().map(|d| d.name.clone()));
                 sc_paths.insert(path.clone());
@@ -1367,6 +1535,7 @@ pub fn index_project_with(c: &mut Connection, p: &Project, delta: Option<&crate:
         )?;
     }
     trace("ts parse+store", t0);
+    sc_paths.extend(py_subs);
     // A store upgraded past the ambiguity column re-scores every reference once.
     let rescore = db::rescore_pending(&tx, p.id);
     if st.parsed > 0 || st.removed > 0 || rescore {
@@ -1619,6 +1788,12 @@ fn store_file(
         if d.proto {
             meta["b"] = 1.into();
         }
+        if d.virt {
+            meta["v"] = 1.into();
+        }
+        if d.dyn_bases {
+            meta["db"] = 1.into();
+        }
         // C: a member of a struct or union tag (not of an anonymous struct named by a typedef).
         if (d.kind == FIELD || d.field_fn)
             && let Some(c) = d.container
@@ -1735,6 +1910,10 @@ struct Cand {
     field_fn: bool,
     /// See [`Def::proto`].
     proto: bool,
+    /// The whole container name (`ns.Engine`).
+    parent_full: String,
+    /// See [`Def::virt`].
+    virt: bool,
 }
 
 /// One reference row to score.
@@ -1764,6 +1943,10 @@ struct RefRow {
     slot: i64,
     /// C++: the class a call's receiver is of, when its declared or inferred type says so.
     recv_ty: Option<String>,
+    /// C++: `recv_ty` is the only class of its last name in the project.
+    recv_unique: bool,
+    /// C++: the receiver is known to be outside the project (see [`CppRecv::External`]).
+    recv_ext: bool,
 }
 
 /// A C symbol a type path walks through: a struct member (field or function pointer), a
@@ -1777,6 +1960,19 @@ struct CSym {
     parent: String,
     ty: Option<String>,
     fnptr: bool,
+    /// The whole container name (`ns.Engine` for a member of `ns::Engine`).
+    full_parent: String,
+}
+
+/// C++: what a call's receiver is, from its type path.
+#[derive(Clone)]
+enum CppRecv {
+    /// A project class, by its whole name, and whether it is the only class of its last name.
+    Class(String, bool),
+    /// Known to be outside the project: no project method is called.
+    External,
+    /// Cannot be told: the name-based guess stands.
+    Unknown,
 }
 
 /// What a C type path names: the member's candidates and whether the receiver's type was known
@@ -1801,6 +1997,10 @@ struct CTypes {
     field_tys: HashMap<String, Vec<Option<String>>>,
     /// Per member name: the function-pointer members of that name.
     fnptrs: HashMap<String, Vec<i64>>,
+    /// C++: the classes, structs and unions of a name, by their whole names (`ns.Engine`).
+    classes: HashMap<String, Vec<String>>,
+    /// C++: names of methods (a call `f()` in a class may be one).
+    methods: HashSet<String>,
     /// Names read from the store (scoped runs).
     loaded: HashSet<String>,
     all: bool,
@@ -1820,6 +2020,11 @@ impl CTypes {
             self.member.entry((s.parent.clone(), name.to_string())).or_default().push(s);
         } else if matches!(s.kind.as_str(), "type" | "function") {
             self.named.entry(name.to_string()).or_default().push((s.kind, s.ty));
+        } else if matches!(s.kind.as_str(), "class" | "struct" | "union") {
+            let full = if s.full_parent.is_empty() { name.to_string() } else { format!("{}.{name}", s.full_parent) };
+            self.classes.entry(name.to_string()).or_default().push(full);
+        } else if s.kind == "method" {
+            self.methods.insert(name.to_string());
         }
     }
 
@@ -1882,15 +2087,53 @@ impl CTypes {
         }
     }
 
+    /// C++: the class type `t` (`S:Engine`, `S:ns::Engine`) names. An unqualified name must be
+    /// the only class, struct or typedef of that name in the project; a qualified one the only
+    /// class whose whole name ends in it, and one no project class matches is outside the
+    /// project (`std::string`).
+    fn cpp_class(&mut self, t: &str, fetch: &mut dyn FnMut(&str) -> Vec<CSym>) -> CppRecv {
+        let Some(q) = t.strip_prefix("S:") else { return CppRecv::Unknown };
+        let q = q.trim_start_matches("::").replace("::", ".");
+        if q.is_empty() || q.contains('<') {
+            return CppRecv::Unknown;
+        }
+        let last = q.rsplit('.').next().unwrap_or("").to_string();
+        self.load(&last, fetch);
+        let fulls: Vec<String> = self.classes.get(&last).cloned().unwrap_or_default();
+        let types = self.named.get(&last).into_iter().flatten().filter(|(k, _)| k == "type").count();
+        let unique = fulls.len() == 1 && types == 0;
+        if q.contains('.') {
+            let hits: Vec<&String> = fulls.iter().filter(|f| **f == q || f.ends_with(&format!(".{q}"))).collect();
+            return match hits.as_slice() {
+                [one] => CppRecv::Class((*one).clone(), unique),
+                [] if types == 0 => CppRecv::External,
+                _ => CppRecv::Unknown,
+            };
+        }
+        if unique { CppRecv::Class(fulls[0].clone(), true) } else { CppRecv::Unknown }
+    }
+
     /// C++: the class a call's receiver is of, from its type path (see [`cpp_chain`]): the base's
-    /// class and the fields read on the way, each found in the class before it. None when any
-    /// step is unknown (a field of a base class, an external type, two types for one field).
-    fn cpp_receiver(&mut self, path: &str, fetch: &mut dyn FnMut(&str) -> Vec<CSym>) -> Option<String> {
+    /// class and the fields read on the way, each found in the class before it. Unknown when any
+    /// step is in doubt: a field of a base class, an ambiguous type, two types for one field, a
+    /// call `f()` where `f` may be a method. External for a wrapper's own member (`p.reset()` on
+    /// a smart pointer) or a qualified type outside the project.
+    fn cpp_receiver(&mut self, path: &str, fetch: &mut dyn FnMut(&str) -> Vec<CSym>) -> CppRecv {
+        self.cpp_receiver_in(path, fetch).unwrap_or(CppRecv::Unknown)
+    }
+
+    fn cpp_receiver_in(&mut self, path: &str, fetch: &mut dyn FnMut(&str) -> Vec<CSym>) -> Option<CppRecv> {
         let segs: Vec<&str> = path.split('|').collect();
-        let (base, mids) = segs.split_last()?.1.split_first()?;
+        let (base, steps) = segs.split_first()?;
+        let steps: Vec<(char, &str)> = steps.iter().map(|s| s.chars().next().map(|op| (op, &s[1..]))).collect::<Option<_>>()?;
+        let ((last_op, _), mids) = steps.split_last()?;
         let mut ty = if let Some(f) = base.strip_prefix("F:") {
-            // A function's return type, else the class a constructor call `Engine()` makes.
+            // A function's return type, else the class a constructor call `Engine()` makes; a
+            // method of that name (called from inside its class) may be the one called.
             self.load(f, fetch);
+            if self.methods.contains(f) {
+                return None;
+            }
             let rets: HashSet<&String> =
                 self.named.get(f).into_iter().flatten().filter(|(k, _)| k == "function").filter_map(|(_, t)| t.as_ref()).collect();
             match rets.len() {
@@ -1899,17 +2142,34 @@ impl CTypes {
                 _ => return None,
             }
         } else {
-            base.starts_with("S:").then(|| base.to_string())?
+            (base.starts_with("S:") || base.starts_with("W:")).then(|| base.to_string())?
         };
-        for m in mids {
-            let found = self.members(&ty, m, fetch)?;
+        // Through `op`: a wrapper reaches its pointee only by `->`; by `.` its own members.
+        let step = |ty: String, op: char| -> Result<String, CppRecv> {
+            match ty.strip_prefix("W:") {
+                Some(c) if op == '>' => Ok(format!("S:{c}")),
+                Some(_) => Err(CppRecv::External),
+                None => Ok(ty),
+            }
+        };
+        for &(op, m) in mids {
+            let t = match step(ty, op) {
+                Ok(t) => t,
+                Err(e) => return Some(e),
+            };
+            let CppRecv::Class(full, _) = self.cpp_class(&t, fetch) else { return None };
+            let last = full.rsplit('.').next()?.to_string();
+            let found = self.members(&format!("S:{last}"), m, fetch)?;
             let tys: HashSet<&Option<String>> = found.iter().filter(|f| !f.fnptr).map(|f| &f.ty).collect();
             ty = match tys.into_iter().collect::<Vec<_>>().as_slice() {
                 [Some(t)] => t.clone(),
                 _ => return None,
             };
         }
-        ty.strip_prefix("S:").map(str::to_string)
+        Some(match step(ty, *last_op) {
+            Ok(t) => self.cpp_class(&t, fetch),
+            Err(e) => e,
+        })
     }
 
     /// Resolve a type path (see [`c_chain`]) to the member it ends in.
@@ -2228,19 +2488,31 @@ fn stem_of(p: &str) -> &str {
 fn score(r: &RefRow, cands: &[Cand], imp: Option<&FileImports>) -> (i64, i64) {
     let fam = lang::for_path(&r.path).map(|l| l.family).unwrap_or("");
     let call = r.kind == "call";
+    // C++: a receiver outside the project calls no project method.
+    if call && r.recv && r.recv_ext {
+        return (0, 0);
+    }
     // C++: a call through a receiver of a known class reaches that class's method. A class with
     // no method of the name (an inherited one, an external type) leaves the call a guess.
     if call
         && r.recv
         && let Some(t) = r.recv_ty.as_deref()
     {
+        // The class's own methods: by its whole name, or by its last name (an out-of-line
+        // definition `void Engine::start()`) when it is the only class of that name.
+        let last = t.rsplit('.').next().unwrap_or(t);
         let own: Vec<&Cand> = cands
             .iter()
-            .filter(|s| s.family == fam && s.parent == t && is_callable_kind(&s.kind) && !s.field_fn)
+            .filter(|s| s.family == fam && is_callable_kind(&s.kind) && !s.field_fn)
+            .filter(|s| s.parent_full == t || r.recv_unique && s.parent_full == last)
             .filter(|s| !(s.local && (s.path != r.path || !r.enclosing.contains(&s.pid))) && !(s.file_local && s.path != r.path))
             .collect();
+        let defs = own.iter().filter(|s| !s.proto).count();
+        // Overloads (two definitions, or two declarations without one) and virtual methods
+        // (any of the name: an override may run instead) leave the name-based guess.
+        let doubt = defs > 1 || defs == 0 && own.len() > 1 || cands.iter().any(|s| s.family == fam && s.virt);
         // The definition outside the class body stands for its declaration.
-        if let Some(best) = own.iter().find(|s| !s.proto).or(own.first()) {
+        if !doubt && let Some(best) = own.iter().find(|s| !s.proto).or(own.first()) {
             let mut classes: Vec<i64> = own.iter().map(|s| s.pid).filter(|&p| p != 0).collect();
             classes.sort_unstable();
             classes.dedup();
@@ -2415,6 +2687,8 @@ fn map_cand(r: &rusqlite::Row) -> rusqlite::Result<CandRow> {
             kind: r.get(3)?,
             pid: r.get(4)?,
             parent: r.get::<_, String>(5)?.rsplit('.').next().unwrap_or("").to_string(),
+            parent_full: r.get(5)?,
+            virt: r.get::<_, Option<i64>>(13)?.is_some(),
             family: lang::by_name(&lang).map(|l| l.family).unwrap_or(""),
             local: false,
             decl: r.get::<_, Option<i64>>(7)?.is_some(),
@@ -2429,18 +2703,24 @@ fn map_cand(r: &rusqlite::Row) -> rusqlite::Result<CandRow> {
 
 const CAND_COLS: &str = "id, name, path, json_extract(meta,'$.k'), COALESCE(json_extract(meta,'$.pid'),0), \
      COALESCE(json_extract(meta,'$.parent'),''), lang, json_extract(meta,'$.d'), json_extract(meta,'$.s'), json_extract(meta,'$.f'), \
-     json_extract(meta,'$.t'), json_extract(meta,'$.ps'), json_extract(meta,'$.b')";
+     json_extract(meta,'$.t'), json_extract(meta,'$.ps'), json_extract(meta,'$.b'), json_extract(meta,'$.v')";
 const REF_COLS: &str = "rowid, path, src, name, kind, dst, recv, amb, line, via, rtype, slot";
 
 /// The C symbol a candidate row stands for, when it is one a type path may walk through.
 fn c_sym_of(c: &Cand, ty: Option<String>, tag: bool) -> Option<CSym> {
-    (c.family == "c" && (c.kind == FIELD || c.field_fn || c.kind == "type" || c.kind == "function" && ty.is_some())).then(|| CSym {
-        id: c.id,
-        kind: c.kind.clone(),
-        parent: if c.parent.is_empty() { String::new() } else { format!("{}:{}", if tag { "S" } else { "T" }, c.parent) },
-        ty,
-        fnptr: c.field_fn,
-    })
+    // C++ receivers also need the classes of a name and whether a name is a method.
+    let cls = matches!(c.kind.as_str(), "class" | "struct" | "union");
+    let method = c.kind == "method" && !c.field_fn && is_cpp_path(&c.path);
+    (c.family == "c" && (c.kind == FIELD || c.field_fn || c.kind == "type" || c.kind == "function" && ty.is_some() || cls || method)).then(
+        || CSym {
+            id: c.id,
+            kind: c.kind.clone(),
+            parent: if c.parent.is_empty() { String::new() } else { format!("{}:{}", if tag { "S" } else { "T" }, c.parent) },
+            ty,
+            fnptr: c.field_fn,
+            full_parent: c.parent_full.clone(),
+        },
+    )
 }
 
 fn map_ref(r: &rusqlite::Row) -> rusqlite::Result<RefRow> {
@@ -2462,11 +2742,13 @@ fn map_ref(r: &rusqlite::Row) -> rusqlite::Result<RefRow> {
         rtype: r.get(10)?,
         slot: r.get(11)?,
         recv_ty: None,
+        recv_unique: false,
+        recv_ext: false,
     })
 }
 
 /// One class of a Python method resolution order: a project class, or a base the index cannot
-/// follow (a library's, a guess), which may define any name.
+/// follow (a library's, a call's value), which may define any name.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum MroEntry {
     Class(i64),
@@ -2474,38 +2756,67 @@ enum MroEntry {
 }
 
 /// Bases that define no method a call through `self` could reach.
-const PY_INERT_BASES: &[&str] = &["object", "Generic"];
+const PY_INERT_BASES: &[&str] = &["object", "Generic", "ABC", "Protocol"];
+
+/// Most subclasses of one class a call's walk checks; past it the call is in doubt.
+const PY_SUBS_MAX: usize = 200;
+
+/// Where a walk along a method resolution order ends for a name.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum MroHit {
+    /// The method this class defines.
+    Def(i64),
+    /// No class of the order defines it.
+    None,
+    /// Cannot be told: an unknown base, or an attribute of that name that is no method.
+    Doubt,
+}
 
 /// Python class hierarchy for method resolution: base classes in source order (as stored and
-/// as freshly scored), and each class's C3 linearization.
+/// as freshly scored), each class's C3 linearization, and its subclasses.
 struct Mro<'a> {
     tx: &'a Connection,
+    pid: i64,
     /// Fresh (target, ambiguity) of the `impl` references scored in this run, by rowid.
     fresh: HashMap<i64, (i64, i64)>,
-    /// A node's kind (`meta.k`).
-    kinds: HashMap<i64, Option<String>>,
-    /// Linearizations; None for a hierarchy C3 rejects (or a cycle).
+    /// Fresh `impl` links: base class -> the classes naming it.
+    fresh_subs: HashMap<i64, Vec<i64>>,
+    /// A node's kind (`meta.k`) and whether its bases include an expression the index cannot
+    /// follow (`meta.db`).
+    kinds: HashMap<i64, (Option<String>, bool)>,
+    /// Linearizations; None for a hierarchy C3 rejects, a cycle or a guessed base link.
     lin: HashMap<i64, Option<Vec<MroEntry>>>,
     open: HashSet<i64>,
+    /// Classes holding a symbol of a name that is no method (`step = _other`), by name.
+    attrs: HashMap<String, HashSet<i64>>,
+    /// [`Mro::subclasses`], by class.
+    subs: HashMap<i64, Option<Vec<i64>>>,
 }
 
 impl Mro<'_> {
-    fn kind(&mut self, id: i64) -> Result<Option<String>> {
+    fn node(&mut self, id: i64) -> Result<(Option<String>, bool)> {
         if let Some(k) = self.kinds.get(&id) {
             return Ok(k.clone());
         }
-        let k: Option<String> = self
+        let k: (Option<String>, bool) = self
             .tx
-            .prepare_cached("SELECT json_extract(meta,'$.k') FROM node WHERE id = ?1 AND kind = 'symbol'")?
-            .query_row([id], |r| r.get(0))
-            .unwrap_or(None);
+            .prepare_cached(
+                "SELECT json_extract(meta,'$.k'), json_extract(meta,'$.db') IS NOT NULL FROM node WHERE id = ?1 AND kind = 'symbol'",
+            )?
+            .query_row([id], |r| Ok((r.get(0)?, r.get(1)?)))
+            .unwrap_or((None, false));
         self.kinds.insert(id, k.clone());
         Ok(k)
     }
 
+    fn kind(&mut self, id: i64) -> Result<Option<String>> {
+        Ok(self.node(id)?.0)
+    }
+
     /// The bases class `k` names, in order: project classes, and [`MroEntry::Unknown`] for one
-    /// that is not (a library's) or whose link is a guess. `object` is left out.
-    fn bases(&mut self, k: i64) -> Result<Vec<MroEntry>> {
+    /// that resolves to nothing (a library's) or to no class, or an expression (`make()`).
+    /// `object` is left out. None when a base link is a guess among project classes.
+    fn bases(&mut self, k: i64) -> Result<Option<Vec<MroEntry>>> {
         let rows: Vec<(i64, i64, i64, String)> = self
             .tx
             .prepare_cached("SELECT rowid, dst, amb, name FROM ts_ref WHERE src = ?1 AND src != 0 AND kind = 'impl' ORDER BY rowid")?
@@ -2515,9 +2826,12 @@ impl Mro<'_> {
         let mut out = vec![];
         for (rowid, dst, amb, name) in rows {
             let (dst, amb) = self.fresh.get(&rowid).copied().unwrap_or((dst, amb));
-            let e = if dst != 0 && amb <= 0 && dst != k && self.kind(dst)?.as_deref() == Some("class") {
+            if dst != 0 && amb > 0 {
+                return Ok(None);
+            }
+            let e = if dst != 0 && dst != k && self.kind(dst)?.as_deref() == Some("class") {
                 MroEntry::Class(dst)
-            } else if PY_INERT_BASES.contains(&name.as_str()) {
+            } else if dst == 0 && PY_INERT_BASES.contains(&name.as_str()) {
                 continue;
             } else {
                 MroEntry::Unknown
@@ -2526,11 +2840,15 @@ impl Mro<'_> {
                 out.push(e);
             }
         }
-        Ok(out)
+        if self.node(k)?.1 {
+            out.push(MroEntry::Unknown);
+        }
+        Ok(Some(out))
     }
 
     /// Python's method resolution order of class `k` (C3; `k` first), an unknown base standing
-    /// for itself alone. None for a hierarchy C3 rejects (Python refuses it) or a cycle.
+    /// for itself alone. None for a hierarchy C3 rejects (Python refuses it), a cycle or a
+    /// guessed base link.
     fn linearize(&mut self, k: i64) -> Result<Option<Vec<MroEntry>>> {
         if let Some(l) = self.lin.get(&k) {
             return Ok(l.clone());
@@ -2538,7 +2856,11 @@ impl Mro<'_> {
         if !self.open.insert(k) {
             return Ok(None);
         }
-        let bases = self.bases(k)?;
+        let Some(bases) = self.bases(k)? else {
+            self.open.remove(&k);
+            self.lin.insert(k, None);
+            return Ok(None);
+        };
         let mut seqs: Vec<Vec<MroEntry>> = vec![];
         let mut ok = true;
         for b in &bases {
@@ -2584,16 +2906,96 @@ impl Mro<'_> {
         self.lin.insert(k, out.clone());
         Ok(out)
     }
+
+    /// The classes holding a non-method symbol named `name`.
+    fn attrs(&mut self, name: &str) -> Result<&HashSet<i64>> {
+        if !self.attrs.contains_key(name) {
+            let mut q = self.tx.prepare_cached(
+                "SELECT name, COALESCE(json_extract(meta,'$.pid'),0), json_extract(meta,'$.k') FROM node
+                 WHERE project_id = ?1 AND kind = 'symbol' AND name = ?2 COLLATE NOCASE AND source = 'treesitter'",
+            )?;
+            let set: HashSet<i64> = q
+                .query_map(params![self.pid, name], |r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?, r.get::<_, Option<String>>(2)?)))?
+                .flatten()
+                .filter(|(n, pid, k)| n == name && *pid != 0 && !k.as_deref().is_some_and(is_callable_kind))
+                .map(|x| x.1)
+                .collect();
+            self.attrs.insert(name.to_string(), set);
+        }
+        Ok(&self.attrs[name])
+    }
+
+    /// Where a walk along `line` from position `from` ends for `name`. With an unknown base
+    /// anywhere in the order, only a definition in its first class is sure: the unknown base's
+    /// own ancestors may come before any later one.
+    fn walk(&mut self, line: &[MroEntry], from: usize, name: &str, all: &[Cand]) -> Result<MroHit> {
+        let unknown = line.contains(&MroEntry::Unknown);
+        for (pos, e) in line.iter().enumerate().skip(from) {
+            let MroEntry::Class(k) = *e else { return Ok(MroHit::Doubt) };
+            let defs: Vec<&Cand> =
+                all.iter().filter(|s| s.pid == k && s.family == "python" && !s.local && is_callable_kind(&s.kind)).collect();
+            let attr = self.attrs(name)?.contains(&k);
+            if attr || defs.len() > 1 {
+                return Ok(MroHit::Doubt);
+            }
+            if let Some(s) = defs.first() {
+                return Ok(if unknown && pos > 0 { MroHit::Doubt } else { MroHit::Def(s.id) });
+            }
+        }
+        Ok(if unknown { MroHit::Doubt } else { MroHit::None })
+    }
+
+    /// Every project subclass of `k`, nearest first; None past [`PY_SUBS_MAX`].
+    fn subclasses(&mut self, k: i64) -> Result<Option<Vec<i64>>> {
+        if let Some(s) = self.subs.get(&k) {
+            return Ok(s.clone());
+        }
+        let s = self.subclasses_of(k)?;
+        self.subs.insert(k, s.clone());
+        Ok(s)
+    }
+
+    fn subclasses_of(&mut self, k: i64) -> Result<Option<Vec<i64>>> {
+        let mut out: Vec<i64> = vec![];
+        let mut seen: HashSet<i64> = HashSet::from([k]);
+        let mut todo = vec![k];
+        while let Some(c) = todo.pop() {
+            let stored: Vec<(i64, i64)> = self
+                .tx
+                .prepare_cached("SELECT rowid, src FROM ts_ref WHERE dst = ?1 AND dst != 0 AND kind = 'impl'")?
+                .query_map([c], |r| Ok((r.get(0)?, r.get(1)?)))?
+                .flatten()
+                .collect();
+            let mut subs: Vec<i64> = stored.into_iter().filter(|(rowid, _)| !self.fresh.contains_key(rowid)).map(|x| x.1).collect();
+            subs.extend(self.fresh_subs.get(&c).into_iter().flatten().copied());
+            for s in subs {
+                if s != 0 && seen.insert(s) {
+                    if out.len() >= PY_SUBS_MAX {
+                        return Ok(None);
+                    }
+                    out.push(s);
+                    todo.push(s);
+                }
+            }
+        }
+        Ok(Some(out))
+    }
 }
 
 /// Python: a call through `self`, `cls` or `super()` reaches the method Python would run: the
 /// first class of the calling class's method resolution order that defines it (`super()`: past
-/// the calling class itself), with certainty. Replaces the name-based pick, which cannot tell the
-/// classes of a hierarchy apart. A walk that meets a base the index cannot follow before a
-/// definition, or a hierarchy C3 rejects, leaves the name-based pick, except that `super().m()`
-/// never reaches a method of its own class; a `super()` call no project class of a fully known
-/// order defines stays unresolved.
-fn python_mro(tx: &Connection, refs: &[RefRow], cands: &HashMap<String, Vec<Cand>>, scored: &mut [(i64, i64, i64)]) -> Result<()> {
+/// the calling class itself), with certainty, when every subclass of the calling class would run
+/// the same one. Any doubt leaves a guess: a guessed base link, a base the index cannot follow,
+/// a class attribute of that name that is no method, a subclass that would run another
+/// definition, a hierarchy C3 rejects. `super().m()` never reaches a method of its own class; a
+/// `super()` call no class of a fully known order defines stays unresolved.
+fn python_mro(
+    tx: &Connection,
+    pid: i64,
+    refs: &[RefRow],
+    cands: &HashMap<String, Vec<Cand>>,
+    scored: &mut [(i64, i64, i64)],
+) -> Result<()> {
     let todo: Vec<usize> = refs
         .iter()
         .enumerate()
@@ -2608,8 +3010,27 @@ fn python_mro(tx: &Connection, refs: &[RefRow], cands: &HashMap<String, Vec<Cand
     if todo.is_empty() {
         return Ok(());
     }
-    let fresh = refs.iter().zip(scored.iter()).filter(|(r, _)| r.kind == "impl").map(|(r, s)| (r.rowid, (s.0, s.1))).collect();
-    let mut m = Mro { tx, fresh, kinds: HashMap::new(), lin: HashMap::new(), open: HashSet::new() };
+    let mut fresh: HashMap<i64, (i64, i64)> = HashMap::new();
+    let mut fresh_subs: HashMap<i64, Vec<i64>> = HashMap::new();
+    for (r, s) in refs.iter().zip(scored.iter()) {
+        if r.kind == "impl" {
+            fresh.insert(r.rowid, (s.0, s.1));
+            if s.0 != 0 {
+                fresh_subs.entry(s.0).or_default().push(r.src);
+            }
+        }
+    }
+    let mut m = Mro {
+        tx,
+        pid,
+        fresh,
+        fresh_subs,
+        kinds: HashMap::new(),
+        lin: HashMap::new(),
+        open: HashSet::new(),
+        attrs: HashMap::new(),
+        subs: HashMap::new(),
+    };
     for i in todo {
         let r = &refs[i];
         // The nearest class around the call (a call in a function nested in a method too).
@@ -2622,38 +3043,56 @@ fn python_mro(tx: &Connection, refs: &[RefRow], cands: &HashMap<String, Vec<Cand
         }
         let Some(class) = class else { continue };
         let is_super = r.via.as_deref() == Some("super");
-        let own_pick = |scored: &[(i64, i64, i64)], all: &[Cand]| all.iter().any(|s| s.id == scored[i].0 && s.pid == class);
         let all = cands.get(&r.name).map(Vec::as_slice).unwrap_or(&[]);
-        let Some(line) = m.linearize(class)? else {
-            if is_super && own_pick(scored, all) {
-                scored[i] = (0, 0, scored[i].2);
-            }
-            continue;
+        let own_pick = all.iter().any(|s| s.id == scored[i].0 && s.pid == class);
+        let mut hit = match m.linearize(class)? {
+            Some(line) => m.walk(&line, usize::from(is_super), &r.name, all)?,
+            None => MroHit::Doubt,
         };
-        // Some(Some(def)): the method Python runs; Some(None): an unknown base comes first.
-        let mut found: Option<Option<&Cand>> = None;
-        for e in line.iter().skip(is_super as usize) {
-            match e {
-                MroEntry::Unknown => {
-                    found = Some(None);
-                    break;
-                }
-                MroEntry::Class(k) => {
-                    if let Some(s) = all.iter().find(|s| s.pid == *k && s.family == "python" && !s.local && is_callable_kind(&s.kind)) {
-                        found = Some(Some(s));
-                        break;
+        let first = (hit != MroHit::Doubt).then_some(hit);
+        // Every subclass must run the same definition from here (for `super()`: from past this
+        // class in the subclass's own order).
+        if hit != MroHit::Doubt {
+            match m.subclasses(class)? {
+                None => hit = MroHit::Doubt,
+                Some(subs) => {
+                    for s in subs {
+                        let theirs = match m.linearize(s)? {
+                            Some(line) => match line.iter().position(|e| *e == MroEntry::Class(class)) {
+                                Some(at) => m.walk(&line, if is_super { at + 1 } else { 0 }, &r.name, all)?,
+                                None => MroHit::Doubt,
+                            },
+                            None => MroHit::Doubt,
+                        };
+                        if theirs != hit {
+                            hit = MroHit::Doubt;
+                            break;
+                        }
                     }
                 }
             }
+            if let MroHit::Def(id) = hit {
+                scored[i] = (id, 0, scored[i].2);
+                continue;
+            }
+            if let (MroHit::Doubt, Some(MroHit::Def(id))) = (hit, first) {
+                // The calling class's own order still gives the likeliest target.
+                scored[i] = (id, 2, scored[i].2);
+                continue;
+            }
+            if hit == MroHit::None && is_super {
+                scored[i] = (0, 0, scored[i].2);
+                continue;
+            }
+            if hit == MroHit::None {
+                continue;
+            }
         }
-        match found {
-            Some(Some(s)) => scored[i] = (s.id, 0, scored[i].2),
-            Some(None) if is_super && own_pick(scored, all) => scored[i] = (0, 0, scored[i].2),
-            // The unknown base may define it: a certain pick past it is a guess.
-            Some(None) if scored[i].0 != 0 && scored[i].1 == 0 => scored[i].1 = 2,
-            Some(None) => {}
-            None if is_super => scored[i] = (0, 0, scored[i].2),
-            None => {}
+        // In doubt: never the calling class's own method for `super()`, never certain.
+        if is_super && own_pick {
+            scored[i] = (0, 0, scored[i].2);
+        } else if scored[i].0 != 0 && scored[i].1 == 0 {
+            scored[i].1 = 2;
         }
     }
     Ok(())
@@ -2709,7 +3148,9 @@ fn type_sig(ty: String, td: Option<u8>, tk: Option<u8>) -> String {
 }
 
 /// The type facts of a parsed C file (see [`CTypeRow`]).
-fn c_type_rows(p: &Parsed) -> HashSet<CTypeRow> {
+/// A C++ class, struct or union counts as a typedef does (every type path is re-scored when the
+/// classes of a name change: a receiver's class must be the only one of its name).
+fn c_type_rows(p: &Parsed, cpp: bool) -> HashSet<CTypeRow> {
     (0..p.defs.len())
         .filter_map(|i| {
             let d = &p.defs[i];
@@ -2719,6 +3160,7 @@ fn c_type_rows(p: &Parsed) -> HashSet<CTypeRow> {
                 match d.kind.as_str() {
                     FIELD => "field",
                     "type" => "type",
+                    "class" | "struct" | "union" if cpp => "type",
                     "function" if d.ty.is_some() => "function",
                     _ => return None,
                 }
@@ -2748,6 +3190,7 @@ fn c_type_rows_stored(tx: &Connection, pid: i64, path: &str) -> Result<HashSet<C
             r.get::<_, Option<u8>>(6)?,
         ))
     })?;
+    let cpp = is_cpp_path(path);
     Ok(rows
         .flatten()
         .filter_map(|(name, k, parent, t, f, td, tk)| {
@@ -2760,6 +3203,7 @@ fn c_type_rows_stored(tx: &Connection, pid: i64, path: &str) -> Result<HashSet<C
                     FIELD => "field",
                     "method" if tk.is_some() => "field",
                     "type" => "type",
+                    "class" | "struct" | "union" if cpp => "type",
                     "function" if !t.is_empty() => "function",
                     _ => return None,
                 }
@@ -2802,12 +3246,19 @@ fn c_typedef_members(tx: &Connection, pid: i64, paths: Option<&HashSet<String>>)
     let map = |r: &rusqlite::Row| -> rusqlite::Result<Row> {
         Ok((r.get(0)?, r.get(1)?, r.get::<_, Option<i64>>(2)?.unwrap_or(0), r.get::<_, Option<String>>(3)?.unwrap_or_default()))
     };
+    // Nothing to do in a project without C-family files.
+    let has_c =
+        tx.query_row("SELECT 1 FROM ts_file WHERE project_id = ?1 AND lang IN ('c', 'cpp', 'objc') LIMIT 1", [pid], |_| Ok(())).is_ok();
+    if !has_c {
+        return Ok(());
+    }
     let mut members: Vec<Row> = vec![];
     match paths {
         None => members.extend(tx.prepare(&format!("{COLS} ORDER BY id"))?.query_map([pid], map)?.flatten()),
         Some(paths) => {
             let mut q = tx.prepare_cached(&format!("{COLS} AND path = ?2 ORDER BY id"))?;
-            let mut sorted: Vec<&String> = paths.iter().filter(|p| is_c_path(p) || is_header(p)).collect();
+            let mut sorted: Vec<&String> =
+                paths.iter().filter(|p| lang::for_path(p).is_some_and(|l| l.family == "c") || is_header(p)).collect();
             sorted.sort();
             for p in sorted {
                 members.extend(q.query_map(params![pid, p], map)?.flatten());
@@ -2819,22 +3270,31 @@ fn c_typedef_members(tx: &Connection, pid: i64, paths: Option<&HashSet<String>>)
     }
     // `name` with NOCASE so the lookup uses `node_sym_name`; the exact name is matched below.
     let mut named = tx.prepare_cached(
-        "SELECT name, lang, json_extract(meta,'$.td'), json_extract(meta,'$.t'), json_extract(meta,'$.tk') FROM node
-         WHERE project_id = ?1 AND name = ?2 COLLATE NOCASE AND kind = 'symbol' AND source = 'treesitter' AND json_extract(meta,'$.k') = 'type'",
+        "SELECT name, lang, json_extract(meta,'$.td'), json_extract(meta,'$.t'), json_extract(meta,'$.tk'), json_extract(meta,'$.k') FROM node
+         WHERE project_id = ?1 AND name = ?2 COLLATE NOCASE AND kind = 'symbol' AND source = 'treesitter'
+           AND json_extract(meta,'$.k') IN ('type', 'class', 'struct', 'union')",
     )?;
     // Pointers over a function that typedef `name` stands for: None when unknown, when it is no
     // function type, or when its definitions disagree.
     let mut depth = |name: &str| -> Option<i64> {
         fn go(q: &mut rusqlite::Statement, pid: i64, name: &str, steps: usize) -> Option<i64> {
-            type Row = (String, String, Option<i64>, Option<String>, Option<i64>);
+            type Row = (String, String, Option<i64>, Option<String>, Option<i64>, String);
             let rows: Vec<Row> = q
-                .query_map(params![pid, name], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)))
+                .query_map(params![pid, name], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?)))
                 .ok()?
                 .flatten()
                 .filter(|r: &Row| r.0 == name && lang::by_name(&r.1).is_some_and(|l| l.family == "c"))
                 .collect();
             let mut vals: HashSet<i64> = HashSet::new();
-            for (_, lang, td, t, tk) in rows {
+            for (_, lang, td, t, tk, k) in rows {
+                // A C++ class or struct of that name too (another namespace's): which one a
+                // member names cannot be told. C struct tags are a namespace of their own.
+                if k != "type" {
+                    if lang == "cpp" {
+                        return None;
+                    }
+                    continue;
+                }
                 let d = match td {
                     Some(d) => d,
                     None if steps > 0 => {
@@ -2924,7 +3384,12 @@ pub(crate) fn resolve_scoped_c(
             }
             if c.all || !c.fields.is_empty() {
                 let mut q = tx.prepare_cached("SELECT rowid, rtype FROM ts_ref WHERE project_id = ?1 AND rtype IS NOT NULL")?;
-                let touches = |t: &str| c.all || t.split('|').any(|seg| c.fields.contains(seg.split_once(':').map_or(seg, |x| x.1)));
+                // C++ steps lead with their operator (see [`cpp_chain`]).
+                let touches = |t: &str| {
+                    c.all
+                        || t.split('|')
+                            .any(|seg| c.fields.contains(seg.split_once(':').map_or(seg, |x| x.1).trim_start_matches(['.', '>'])))
+                };
                 rowids.extend(
                     q.query_map([pid], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?)))?
                         .flatten()
@@ -3087,7 +3552,7 @@ pub(crate) fn resolve_scoped_c(
             };
             cres.insert(i, k);
         }
-        let mut cpp_memo: HashMap<String, Option<String>> = HashMap::new();
+        let mut cpp_memo: HashMap<String, CppRecv> = HashMap::new();
         for &i in &cpp_refs {
             let path = refs[i].rtype.clone().unwrap_or_default();
             let ty = match cpp_memo.get(&path) {
@@ -3098,7 +3563,14 @@ pub(crate) fn resolve_scoped_c(
                     t
                 }
             };
-            refs[i].recv_ty = ty;
+            match ty {
+                CppRecv::Class(full, unique) => {
+                    refs[i].recv_ty = Some(full);
+                    refs[i].recv_unique = unique;
+                }
+                CppRecv::External => refs[i].recv_ext = true,
+                CppRecv::Unknown => {}
+            }
         }
         trace("resolve: C type paths", t0);
     }
@@ -3127,7 +3599,7 @@ pub(crate) fn resolve_scoped_c(
         })
         .collect();
     trace("resolve: scored", t0);
-    python_mro(tx, &refs, &cands, &mut scored)?;
+    python_mro(tx, pid, &refs, &cands, &mut scored)?;
     trace("resolve: python mro", t0);
     let mut out = Resolved { rescored: refs.len(), ..Default::default() };
     // 4. The precise tier: a fresh SCIP import overrides the name resolution where it knows the target.
@@ -3232,6 +3704,8 @@ mod via_tests {
             file_local: false,
             field_fn: false,
             proto: false,
+            parent_full: parent.into(),
+            virt: false,
         }
     }
 
@@ -3254,6 +3728,8 @@ mod via_tests {
             rtype: None,
             slot: 0,
             recv_ty: None,
+            recv_unique: false,
+            recv_ext: false,
         }
     }
 
