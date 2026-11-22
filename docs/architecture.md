@@ -7,7 +7,11 @@ foxdb is one Rust crate with two binaries: `fox` (CLI, MCP server over stdio, ho
 `fox index` walks a project (honouring `.gitignore` and the per-project tiers), stores files, directories, Markdown sections and milestone entries as rows of `node`, parses changed code files with tree-sitter in parallel (or reads Xcode index stores for Swift) and resolves call references by name with scope awareness. Unchanged files are skipped by size, mtime and content hash. Secrets are never read. A project is registered the first time `fox` or the MCP server runs inside it, keyed by its git common dir, so worktrees share one project.
 
 **C member calls.** A C function-pointer member (`void (*irq_mask)(struct irq_data *)`) is a
-method of its struct. Fields, functions and typedefs keep their type in `meta.t`, with struct
+method of its struct. So is a member declared through a typedef of a function pointer (`op_fn
+run;`, also a typedef of one or a function typedef behind a `*`): its typedef may live in any
+file, so each resolve re-reads the stored typedefs for the members of the files it scores (every
+member when a typedef changed) and turns them into methods or back into fields; a typedef whose
+definitions disagree leaves its members fields. Fields, functions and typedefs keep their type in `meta.t`, with struct
 tags and typedef names in separate namespaces (`S:inode`, `T:irq_chip_t`). A call through a
 member (`inode->i_mapping->a_ops->bmap(...)`) stores the receiver as a type path
 (`ts_ref.rtype`, `S:inode|i_mapping|a_ops|bmap`). Its base is the declared type of a parameter,

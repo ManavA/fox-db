@@ -42,6 +42,11 @@ pub struct Def {
     /// C/C++: the struct or typedef name of a field's, function's (its return value) or
     /// typedef's type (`struct inode *i_inode` -> `inode`), for typing member calls.
     pub ty: Option<String>,
+    /// C/C++: a typedef of a function (0) or of a function pointer (1, 2 for a pointer to one):
+    /// its pointer depth over a function.
+    td: Option<u8>,
+    /// C/C++: the pointers a typedef or field adds to its typedef'd type (`op_fn *x` -> 1).
+    tk: Option<u8>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -164,6 +169,37 @@ fn c_fn_pointer(nn: tree_sitter::Node, decl: tree_sitter::Node) -> bool {
         cur = p;
     }
     false
+}
+
+/// C/C++: what a typedef or a field declares besides its type name, from its declarators:
+/// `(td, tk)` (see [`Def`]). A typedef whose declarator is a function (`(*op_fn)(int)`, `op_t(int)`)
+/// has `td`, its pointers below the function; a typedef or a field of a typedef'd type
+/// (`ty` is `T:..`) has `tk`, its pointers. Arrays and functions leave both unset.
+fn c_decl_shape(kind: &str, nn: tree_sitter::Node, decl: tree_sitter::Node, ty: Option<&str>) -> (Option<u8>, Option<u8>) {
+    if !(kind == "type" && decl.kind() == "type_definition" || kind == FIELD && decl.kind() == "field_declaration") {
+        return (None, None);
+    }
+    let (mut ptrs, mut func, mut bad) = (0u8, false, false);
+    let mut cur = nn;
+    for _ in 0..8 {
+        let Some(p) = cur.parent() else { break };
+        if p.id() == decl.id() {
+            break;
+        }
+        match p.kind() {
+            "pointer_declarator" if !func => ptrs = ptrs.saturating_add(1),
+            "function_declarator" => func = true,
+            "array_declarator" | "reference_declarator" => bad = true,
+            _ => {}
+        }
+        cur = p;
+    }
+    match (kind == "type" && func, bad) {
+        (_, true) => (None, None),
+        (true, _) => (Some(ptrs), None),
+        _ if func => (None, None),
+        _ => (None, ty.is_some_and(|t| t.starts_with("T:")).then_some(ptrs)),
+    }
 }
 
 /// C: the type a declaration (or a cast's type descriptor) names, in its namespace: a struct or
@@ -610,11 +646,17 @@ pub fn extract(l: &Lang, src: &[u8]) -> Parsed {
             // A field spans its name: one declaration may name several (`A, B int`). One holding
             // a function spans its body, so the calls inside belong to it.
             let (node, last) = if kind == FIELD && !value_fn { (nn, nn) } else { (node, last) };
-            let ty = if c_family && matches!(kind.as_str(), "field" | "function" | "type") {
+            let mut ty = if c_family && matches!(kind.as_str(), "field" | "function" | "type") {
                 c_type_name(outer.map_or(node, |o| o.0), src)
             } else {
                 None
             };
+            let (td, tk) =
+                if c_family && !field_fn { c_decl_shape(&kind, nn, outer.map_or(node, |o| o.0), ty.as_deref()) } else { (None, None) };
+            // A function typedef's declared type is its return type, no alias.
+            if td.is_some() {
+                ty = None;
+            }
             if field_fn {
                 kind = "method".into();
             }
@@ -638,6 +680,8 @@ pub fn extract(l: &Lang, src: &[u8]) -> Parsed {
                 stat,
                 field_fn,
                 ty,
+                td,
+                tk,
             });
         } else if let Some(k) = cn.strip_prefix("reference.") {
             // A value in an argument list, keyed literal or initializer (`f(name)`, `Name: name`,
@@ -1382,6 +1426,12 @@ fn store_file(
         }
         if let Some(t) = &d.ty {
             meta["t"] = t.as_str().into();
+        }
+        if let Some(n) = d.td {
+            meta["td"] = n.into();
+        }
+        if let Some(n) = d.tk {
+            meta["tk"] = n.into();
         }
         // C: a member of a struct or union tag (not of an anonymous struct named by a typedef).
         if (d.kind == FIELD || d.field_fn)
@@ -2210,6 +2260,14 @@ pub(crate) struct CChange {
 /// One C file's type facts, as the store keeps them: (kind, name, container, type).
 type CTypeRow = (&'static str, String, String, String);
 
+/// A typedef's type fact: its type, and what its declarators make of it (see [`Def::td`]).
+fn type_sig(ty: String, td: Option<u8>, tk: Option<u8>) -> String {
+    match (td, tk) {
+        (None, None) => ty,
+        _ => format!("{ty}\u{1}{td:?}\u{1}{tk:?}"),
+    }
+}
+
 /// The type facts of a parsed C file (see [`CTypeRow`]).
 fn c_type_rows(p: &Parsed) -> HashSet<CTypeRow> {
     (0..p.defs.len())
@@ -2225,7 +2283,9 @@ fn c_type_rows(p: &Parsed) -> HashSet<CTypeRow> {
                     _ => return None,
                 }
             };
-            Some((kind, d.name.clone(), p.container_of(i).unwrap_or_default(), d.ty.clone().unwrap_or_default()))
+            let ty = d.ty.clone().unwrap_or_default();
+            let ty = if kind == "type" { type_sig(ty, d.td, d.tk) } else { ty };
+            Some((kind, d.name.clone(), p.container_of(i).unwrap_or_default(), ty))
         })
         .collect()
 }
@@ -2234,25 +2294,37 @@ fn c_type_rows(p: &Parsed) -> HashSet<CTypeRow> {
 fn c_type_rows_stored(tx: &Connection, pid: i64, path: &str) -> Result<HashSet<CTypeRow>> {
     let mut q = tx.prepare_cached(
         "SELECT name, json_extract(meta,'$.k'), COALESCE(json_extract(meta,'$.parent'),''), COALESCE(json_extract(meta,'$.t'),''),
-                json_extract(meta,'$.f')
+                json_extract(meta,'$.f'), json_extract(meta,'$.td'), json_extract(meta,'$.tk')
          FROM node WHERE project_id = ?1 AND path = ?2 AND kind = 'symbol' AND source = 'treesitter'",
     )?;
     let rows = q.query_map(params![pid, path], |r| {
-        Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?, r.get::<_, String>(2)?, r.get::<_, String>(3)?, r.get::<_, Option<i64>>(4)?))
+        Ok((
+            r.get::<_, String>(0)?,
+            r.get::<_, String>(1)?,
+            r.get::<_, String>(2)?,
+            r.get::<_, String>(3)?,
+            r.get::<_, Option<i64>>(4)?,
+            r.get::<_, Option<u8>>(5)?,
+            r.get::<_, Option<u8>>(6)?,
+        ))
     })?;
     Ok(rows
         .flatten()
-        .filter_map(|(name, k, parent, t, f)| {
-            let kind = if f.is_some() {
+        .filter_map(|(name, k, parent, t, f, td, tk)| {
+            // A member of a typedef'd type may have been made a function member (see
+            // `c_typedef_members`): the parse alone calls it a field.
+            let kind = if f.is_some() && tk.is_none() {
                 "fnptr"
             } else {
                 match k.as_str() {
                     FIELD => "field",
+                    "method" if tk.is_some() => "field",
                     "type" => "type",
                     "function" if !t.is_empty() => "function",
                     _ => return None,
                 }
             };
+            let t = if kind == "type" { type_sig(t, td, tk) } else { t };
             Some((kind, name, parent, t))
         })
         .collect())
@@ -2277,6 +2349,82 @@ impl CChange {
     }
 }
 
+/// C/C++: a member declared with a typedef'd function pointer (`typedef int (*op_fn)(int);
+/// struct ops { op_fn run; };`, also a typedef of a typedef, or `fn_t *run` of a function typedef)
+/// is a function member like `int (*run)(int)`; a member that no longer is one (its typedef
+/// changed) is a field again. The typedef may be in another file, so this reads the stored
+/// typedefs: for the members of `paths` only, or of every file with `None`.
+fn c_typedef_members(tx: &Connection, pid: i64, paths: Option<&HashSet<String>>) -> Result<()> {
+    const COLS: &str = "SELECT id, json_extract(meta,'$.t'), json_extract(meta,'$.tk'), json_extract(meta,'$.k') FROM node \
+         WHERE project_id = ?1 AND kind = 'symbol' AND source = 'treesitter' AND json_extract(meta,'$.tk') IS NOT NULL \
+         AND json_extract(meta,'$.k') IN ('field', 'method')";
+    type Row = (i64, Option<String>, i64, String);
+    let map = |r: &rusqlite::Row| -> rusqlite::Result<Row> {
+        Ok((r.get(0)?, r.get(1)?, r.get::<_, Option<i64>>(2)?.unwrap_or(0), r.get::<_, Option<String>>(3)?.unwrap_or_default()))
+    };
+    let mut members: Vec<Row> = vec![];
+    match paths {
+        None => members.extend(tx.prepare(&format!("{COLS} ORDER BY id"))?.query_map([pid], map)?.flatten()),
+        Some(paths) => {
+            let mut q = tx.prepare_cached(&format!("{COLS} AND path = ?2 ORDER BY id"))?;
+            let mut sorted: Vec<&String> = paths.iter().filter(|p| is_c_path(p) || is_header(p)).collect();
+            sorted.sort();
+            for p in sorted {
+                members.extend(q.query_map(params![pid, p], map)?.flatten());
+            }
+        }
+    }
+    if members.is_empty() {
+        return Ok(());
+    }
+    // `name` with NOCASE so the lookup uses `node_sym_name`; the exact name is matched below.
+    let mut named = tx.prepare_cached(
+        "SELECT name, lang, json_extract(meta,'$.td'), json_extract(meta,'$.t'), json_extract(meta,'$.tk') FROM node
+         WHERE project_id = ?1 AND name = ?2 COLLATE NOCASE AND kind = 'symbol' AND source = 'treesitter' AND json_extract(meta,'$.k') = 'type'",
+    )?;
+    // Pointers over a function that typedef `name` stands for: None when unknown, when it is no
+    // function type, or when its definitions disagree.
+    let mut depth = |name: &str| -> Option<i64> {
+        fn go(q: &mut rusqlite::Statement, pid: i64, name: &str, steps: usize) -> Option<i64> {
+            type Row = (String, String, Option<i64>, Option<String>, Option<i64>);
+            let rows: Vec<Row> = q
+                .query_map(params![pid, name], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)))
+                .ok()?
+                .flatten()
+                .filter(|r: &Row| r.0 == name && lang::by_name(&r.1).is_some_and(|l| l.family == "c"))
+                .collect();
+            let mut vals: HashSet<i64> = HashSet::new();
+            for (_, _, td, t, tk) in rows {
+                let d = match td {
+                    Some(d) => d,
+                    None if steps > 0 => {
+                        let base = t.as_deref().and_then(|t| t.strip_prefix("T:"))?;
+                        go(q, pid, base, steps - 1)? + tk.unwrap_or(0)
+                    }
+                    None => return None,
+                };
+                vals.insert(d);
+            }
+            if vals.len() == 1 { vals.into_iter().next() } else { None }
+        }
+        go(&mut named, pid, name, C_ALIAS_STEPS + 2)
+    };
+    let mut memo: HashMap<String, Option<i64>> = HashMap::new();
+    let mut set = tx.prepare_cached("UPDATE node SET meta = json_set(meta, '$.k', 'method', '$.f', 1) WHERE id = ?1")?;
+    let mut unset = tx.prepare_cached("UPDATE node SET meta = json_set(json_remove(meta, '$.f'), '$.k', 'field') WHERE id = ?1")?;
+    for (id, t, tk, k) in members {
+        let Some(name) = t.as_deref().and_then(|t| t.strip_prefix("T:")) else { continue };
+        let d = *memo.entry(name.to_string()).or_insert_with(|| depth(name));
+        let func = d.is_some_and(|d| d + tk == 1);
+        if func && k != "method" {
+            set.execute([id])?;
+        } else if !func && k == "method" {
+            unset.execute([id])?;
+        }
+    }
+    Ok(())
+}
+
 /// [`resolve_scoped`], also re-scoring the C references whose type path `c` touches.
 pub(crate) fn resolve_scoped_c(
     tx: &Connection,
@@ -2285,6 +2433,7 @@ pub(crate) fn resolve_scoped_c(
     c: &CChange,
 ) -> Result<Resolved> {
     let t0 = std::time::Instant::now();
+    c_typedef_members(tx, pid, scope.map(|s| s.0).filter(|_| !c.all))?;
     // 1. The references to score, and the imports of their files.
     let mut refs: Vec<RefRow> = vec![];
     let mut imports: HashMap<String, FileImports> = HashMap::new();

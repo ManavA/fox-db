@@ -6,6 +6,11 @@
 (declaration declarator: [(function_declarator declarator: (identifier) @name)
   (pointer_declarator declarator: (function_declarator declarator: (identifier) @name))]) @definition.function
 (type_definition declarator: (type_identifier) @name) @definition.type
+; A typedef of a function pointer or a function (`typedef int (*op_fn)(int);`, `typedef int op_t(int);`):
+; a member of that type is a function-pointer member.
+(type_definition declarator: [(function_declarator declarator: [(type_identifier) @name
+    (parenthesized_declarator (pointer_declarator declarator: (type_identifier) @name))])
+  (pointer_declarator declarator: (function_declarator declarator: (parenthesized_declarator (pointer_declarator declarator: (type_identifier) @name))))]) @definition.type
 (enum_specifier name: (type_identifier) @name) @definition.enum
 (call_expression function: (identifier) @name) @reference.call
 (call_expression function: (field_expression field: (field_identifier) @name)) @reference.call

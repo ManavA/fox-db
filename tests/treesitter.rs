@@ -2091,3 +2091,155 @@ fn c_unbraced_case_locals_reach_later_arms() {
     let out = fox_code(&p, "a_ops.op", "callers", 4000);
     assert!(resolved(&out).contains("2 call sites in 1 files") && certain_calls(&out) == 2, "{out}");
 }
+
+/// A function-pointer member whose type is a typedef (`typedef int (*op_fn)(int); struct ops {
+/// op_fn run; };`, also a typedef of a typedef, a function typedef behind a `*`, a typedef in
+/// another file) is a function member like `int (*run)(int)`: calls through it and functions
+/// stored in it resolve to it. A plain data field of a typedef type is no function member.
+#[test]
+fn c_typedef_function_pointer_members_are_function_members() {
+    let _g = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    let (_h, _r, p) = inline_project(&[
+        (
+            "types.h",
+            "typedef int (*op_fn)(int);\ntypedef op_fn op2_fn;\ntypedef int fn_t(int);\ntypedef unsigned int myint;\ntypedef myint myint2;\n",
+        ),
+        (
+            "ops.h",
+            "#include \"types.h\"\nstruct ops {\n\top_fn run;\n\top2_fn run2;\n\tfn_t *run3;\n\tmyint size;\n\tmyint2 size2;\n\top_fn *pp;\n};\nstruct ops *get_ops(void);\n",
+        ),
+        (
+            "impl.c",
+            "#include \"ops.h\"\nstatic int impl_run(int x) { return x; }\nstatic int impl_run2(int x) { return x; }\nstatic int impl_run3(int x) { return x; }\nstruct ops table = { .run = impl_run, .run2 = impl_run2, .run3 = impl_run3, .size = 4 };\n",
+        ),
+        ("use.c", "#include \"ops.h\"\nint go(struct ops *o, int x)\n{\n\to->run2(x);\n\to->run3(x);\n\treturn o->run(x) + o->size;\n}\n"),
+    ]);
+    for m in ["run", "run2", "run3"] {
+        let out = fox_code(&p, &format!("ops.{m}"), "callers", 4000);
+        assert!(resolved(&out).contains("1 call sites in 1 files") && out.contains("use.c (1)"), "{m}: {out}");
+        let out = fox_code(&p, &format!("ops.{m}"), "impact", 4000);
+        assert!(out.contains(&format!("impl_{m} c:")) && out.contains("implements"), "{m}: {out}");
+    }
+    let out = fox_code(&p, "impl_run", "impact", 4000);
+    assert!(out.contains("go"), "{out}");
+    let out = fox_code(&p, "ops.size", "callers", 4000);
+    assert!(!out.contains("call sites in") || resolved(&out).contains("0 call sites"), "{out}");
+    // Editing only the typedef re-types the member in another file, both ways.
+    let reindex = |repo: &std::path::Path, types: &str| {
+        std::fs::write(repo.join("types.h"), types).unwrap();
+        let mut c = db::open_rw().unwrap();
+        inventory::index_project(&mut c, &p).unwrap();
+        tsindex::index_project(&mut c, &p).unwrap();
+    };
+    reindex(_r.path(), "typedef long op_fn;\ntypedef op_fn op2_fn;\ntypedef int fn_t(int);\n");
+    let out = fox_code(&p, "ops.run", "callers", 4000);
+    assert!(!out.contains("use.c (1)"), "{out}");
+    let out = fox_code(&p, "ops.run2", "callers", 4000);
+    assert!(!out.contains("use.c (1)"), "{out}");
+    let out = fox_code(&p, "ops.run3", "callers", 4000);
+    assert!(out.contains("use.c (1)"), "{out}");
+    reindex(_r.path(), "typedef int (*op_fn)(int);\ntypedef op_fn op2_fn;\ntypedef int fn_t(int);\n");
+    for m in ["run", "run2", "run3"] {
+        let out = fox_code(&p, &format!("ops.{m}"), "callers", 4000);
+        assert!(resolved(&out).contains("1 call sites in 1 files") && out.contains("use.c (1)"), "{m}: {out}");
+    }
+}
+
+/// Call-site rows of a `callers` answer (`  :13 Child.go c:17 | ...`), joined.
+fn rows(out: &str) -> String {
+    out.lines()
+        .filter(|l| l.trim_start().starts_with(':') && l.trim_start()[1..].starts_with(|c: char| c.is_ascii_digit()))
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// Typedef'd function-pointer members (`typedef int (*op_fn)(int); struct ops { op_fn run; };`,
+/// also a typedef of a typedef) behave like `int (*run)(int)`.
+const C_TYPEDEF_FILES: &[(&str, &str)] = &[
+    (
+        "include/ops.h",
+        "typedef int (*op_fn)(int);\ntypedef op_fn op_alias;\nstruct ops {\n\tint count;\n\top_fn run;\n\top_alias stop;\n};\n",
+    ),
+    (
+        "core/call.c",
+        "#include \"ops.h\"\nint drive(struct ops *o, int x)\n{\n\treturn o->run(x);\n}\nint halt(struct ops *o)\n{\n\treturn o->stop(0);\n}\n",
+    ),
+    (
+        "drv/a.c",
+        "#include \"ops.h\"\nstatic int a_run(int x) { return x; }\nstatic int a_stop(int x) { return x; }\nstatic struct ops a_ops = {\n\t.count = 3,\n\t.run = a_run,\n\t.stop = a_stop,\n};\n",
+    ),
+    ("drv/b.c", "#include \"ops.h\"\nstatic int b_run(int x) { return x; }\nvoid b_init(struct ops *o)\n{\n\to->run = b_run;\n}\n"),
+];
+
+#[test]
+fn typedef_fn_pointer_member_callers_list_calls_and_stores() {
+    let _g = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    let (_h, _r, p) = inline_project(C_TYPEDEF_FILES);
+    let out = fox_code(&p, "ops.run", "callers", 6000);
+    assert!(out.contains("1 call sites in 1 files") && rows(&out).contains("drive"), "{out}");
+    assert!(out.contains("stores a function in it (not calls): 2\n"), "{out}");
+    assert!(out.contains("drv/a.c:6 |") && out.contains("drv/b.c:5 |"), "{out}");
+    assert!(!out.contains("references, not calls") && !out.contains("may be incomplete"), "{out}");
+}
+
+#[test]
+fn typedef_of_a_typedef_member_resolves_too() {
+    let _g = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    let (_h, _r, p) = inline_project(C_TYPEDEF_FILES);
+    let out = fox_code(&p, "ops.stop", "callers", 6000);
+    assert!(out.contains("1 call sites in 1 files") && rows(&out).contains("halt") && !rows(&out).contains("drive"), "{out}");
+    assert!(out.contains("stores a function in it (not calls): 1\n") && out.contains("drv/a.c:7 |"), "{out}");
+}
+
+#[test]
+fn function_stored_in_a_typedef_member_is_reached_through_its_calls() {
+    let _g = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    let (_h, _r, p) = inline_project(C_TYPEDEF_FILES);
+    let out = fox_code(&p, "a_run", "impact", 6000);
+    assert!(out.contains("drive") && out.contains("via ops.run"), "{out}");
+    assert!(!out.contains("halt"), "{out}");
+    let out = fox_code(&p, "b_run", "impact", 6000);
+    assert!(out.contains("drive") && out.contains("via ops.run"), "{out}");
+    let out = fox_code(&p, "ops.run", "impact", 6000);
+    assert!(out.contains("a_run c:") && out.contains("b_run c:") && out.contains("implements ops.run"), "{out}");
+    assert!(!out.contains("a_stop c:"), "{out}");
+    let out = fox_code(&p, "ops.stop", "impact", 6000);
+    assert!(out.contains("a_stop c:") && !out.contains("a_run c:") && !out.contains("b_run c:"), "{out}");
+}
+
+#[test]
+fn plain_data_fields_with_a_typedef_type_are_not_function_members() {
+    let _g = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    let (_h, _r, p) = inline_project(&[
+        ("include/t.h", "typedef unsigned long u64x;\nstruct stats { u64x hits; };\n"),
+        (
+            "src/s.c",
+            "#include \"t.h\"\nint get(struct stats *s) { return s->hits; }\nint hits_fn(void) { return 1; }\nstatic struct stats g = { .hits = 3 };\nint use(void) { return hits_fn(); }\n",
+        ),
+    ]);
+    // A call of the plain function stays the function's; the data field is not a call target.
+    let out = fox_code(&p, "hits_fn", "callers", 6000);
+    assert!(out.contains("1 call sites in 1 files") && rows(&out).contains("use"), "{out}");
+    assert!(!rows(&out).contains("get"), "{out}");
+}
+
+/// A typedef whose definitions disagree (a function pointer in one header, an integer in
+/// another) does not make its members function members.
+#[test]
+fn typedef_with_disagreeing_definitions_keeps_members_fields() {
+    let _g = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    let (_h, _r, p) = inline_project(&[
+        ("a/t.h", "typedef int (*cb_t)(int);\n"),
+        ("b/t.h", "typedef int cb_t;\nstruct s { cb_t f; };\n"),
+        ("u.c", "#include \"b/t.h\"\nint use(struct s *x) { return x->f(1); }\n"),
+    ]);
+    let c = db::open_ro().unwrap();
+    let k: String = c
+        .query_row(
+            "SELECT json_extract(meta,'$.k') FROM node WHERE project_id = ?1 AND name = 'f' AND kind = 'symbol' AND path = 'b/t.h'",
+            rusqlite::params![p.id],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(k, "field");
+}
