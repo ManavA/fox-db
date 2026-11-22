@@ -588,7 +588,8 @@ fn unlisted_files(c: &Connection, pid: i64, top: &TSym, listed: &HashSet<String>
             }
         }
     }
-    let mut v: Vec<String> = open.into_iter().filter(|p| !skip.contains(p)).collect();
+    // Code files only: documentation naming it is no use of it.
+    let mut v: Vec<String> = open.into_iter().filter(|p| !skip.contains(p) && crate::lang::for_path(p).is_some()).collect();
     v.sort();
     Ok(v)
 }

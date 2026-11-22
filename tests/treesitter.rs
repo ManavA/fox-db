@@ -168,7 +168,8 @@ fn copy_dir(from: &Path, to: &Path) {
 /// An answer without its accounting line and the groups at its end (unresolved mentions,
 /// same-name definitions elsewhere, imports, ...): its resolved rows.
 fn resolved(out: &str) -> String {
-    const GROUPS: [&str; 7] = [
+    const GROUPS: [&str; 8] = [
+        "stores a function in it (not calls)",
         "unresolved mentions",
         "references, not calls",
         "declarations and prototypes",
@@ -1859,16 +1860,17 @@ fn c_functions_assigned_to_members_are_dispatch_targets() {
     assert!(out.contains("mask_irq") && out.contains("chained_irq_enter"), "{out}");
 }
 
-/// A line storing a function in the member (`.bmap = ext4_bmap,`) is accounted for: a reference
-/// that is not a call for `callers`, resolved for `impact`; never unresolved.
+/// A line storing a function in the member (`.bmap = ext4_bmap,`) is accounted for: a store,
+/// not a call, for `callers`, resolved for `impact`; never unresolved.
 #[test]
 fn c_member_store_lines_are_accounted_for() {
     let _g = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
     let (_h, _r, p) = c_ops_project();
     let out = fox_code(&p, "address_space_operations.bmap", "callers", 4000);
     let head = out.lines().next().unwrap_or("");
-    assert!(head.contains("1 reference, not a call") && !head.contains("unresolved"), "{out}");
-    assert!(out.contains("references, not calls (what is called through them is not followed):\n  fs/ext4/inode.c:6"), "{out}");
+    assert!(head.contains("1 line stores a function in it (not a call)") && !head.contains("unresolved"), "{out}");
+    assert!(out.contains("stores a function in it (not calls): 1\n  fs/ext4/inode.c:6"), "{out}");
+    assert!(!out.contains("references, not calls"), "{out}");
     let out = fox_code(&p, "address_space_operations.bmap", "impact", 4000);
     assert!(!out.contains("unresolved mentions:\n  fs/ext4/inode.c:6"), "{out}");
 }

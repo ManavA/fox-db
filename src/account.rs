@@ -42,6 +42,9 @@ enum Cat {
     Unresolved,
     /// Not parsed (past the parse budget): a comment, a string or a use; never accounted for.
     Unparsed,
+    /// C: a line storing a function in the target member (`.op = fn,`, `x->op = fn;`): not a
+    /// call, and no use of the member's callers either (`callers` only).
+    Store,
     /// A reference to the target that is not a call (`callers` only).
     NotCall,
     /// A C/C++ prototype, `extern`, a forward declaration, a TypeScript `declare`, a Python
@@ -59,9 +62,14 @@ enum Cat {
 }
 
 /// Groups that list rows, in order, with the rows each keeps before the rest is shared out.
-const LISTED: [(Cat, usize); 4] = [(Cat::Unresolved, 8), (Cat::NotCall, 4), (Cat::Decl, 4), (Cat::Import, 4)];
-/// Most rows an answer lists, at any budget; the rest are counted.
+/// Stores come first, right after the answer's call sites.
+const LISTED: [(Cat, usize); 5] = [(Cat::Store, 4), (Cat::Unresolved, 8), (Cat::NotCall, 4), (Cat::Decl, 4), (Cat::Import, 4)];
+/// Most rows an answer lists, at any budget, besides the stores' own share; the rest are
+/// counted.
 const ROWS_MAX: usize = 20;
+/// Most doc files, and time, the count of doc lines naming the target reads.
+const DOCS_FILES_MAX: usize = 200;
+const DOCS_TIME_MAX: Duration = Duration::from_millis(300);
 
 /// Most files, bytes and time one accounting reads; past any, the scan stops and says so.
 const FILES_MAX: usize = 5000;
@@ -102,8 +110,10 @@ pub struct Ledger {
     same_defs: usize,
     /// (group, rows listed), in listing order.
     rows: Vec<(Cat, Vec<String>)>,
-    /// Lines of listed groups not shown.
-    more: usize,
+    /// `callers` of a function: lines of documentation files naming it (never listed), and
+    /// whether the count stopped at its cap.
+    docs: usize,
+    docs_capped: bool,
     fresh: Fresh,
     /// (files read, files naming it) when the scan stopped at a cap.
     capped: Option<(usize, usize)>,
@@ -231,7 +241,8 @@ fn build(
         counts: BTreeMap::new(),
         same_defs: 0,
         rows: vec![],
-        more: 0,
+        docs: 0,
+        docs_capped: false,
         fresh: Fresh::default(),
         capped: None,
         guessed: 0,
@@ -302,7 +313,8 @@ fn build(
     files.extend(defs.keys().cloned());
     files.extend(refs.keys().map(|k| k.0.clone()));
     files.extend(resolved.iter().map(|k| k.0.clone()));
-    let mut files: Vec<String> = files.into_iter().filter(|f| in_fam(f)).collect();
+    // Code files only: documentation is counted apart and never listed.
+    let mut files: Vec<String> = files.into_iter().filter(|f| family(f).is_some() && in_fam(f)).collect();
     files.sort();
     crate::tsindex::trace("account: names", t_all);
     let indexed = indexed_files(c, pid)?;
@@ -378,7 +390,8 @@ fn build(
     }
     // A few rows: each listed group up to its share, then the rest of the room in order.
     let mut keep: Vec<usize> = LISTED.iter().map(|(c, k)| rows.get(c).map_or(0, |v| v.len().min(*k))).collect();
-    let mut room = ROWS_MAX.saturating_sub(keep.iter().sum());
+    // The stores' share comes on top of the other groups' room.
+    let mut room = (ROWS_MAX + keep[0]).saturating_sub(keep.iter().sum());
     for (i, (c, _)) in LISTED.iter().enumerate() {
         let have = rows.get(c).map_or(0, Vec::len);
         let add = have.saturating_sub(keep[i]).min(room);
@@ -387,7 +400,6 @@ fn build(
     }
     for (i, (c, _)) in LISTED.iter().enumerate() {
         let Some(v) = rows.get(c) else { continue };
-        l.more += l.counts.get(c).copied().unwrap_or(0) - keep[i];
         if keep[i] > 0 {
             l.rows.push((*c, v[..keep[i]].iter().map(|r| r.3.clone()).collect()));
         }
@@ -396,10 +408,16 @@ fn build(
     crate::tsindex::trace("account: scan", t_all);
     freshness(c, p, name, fam, &indexed, &files, &mut l.fresh);
     l.changed_sig = sig(&changed(c, p, &indexed));
+    let mut docs: Vec<String> = vec![];
+    if mode == Mode::Calls {
+        (l.docs, l.docs_capped, docs) = doc_lines(c, p, name)?;
+        crate::tsindex::trace("account: docs", t_all);
+    }
     l.seen = pool().install(|| {
         use rayon::prelude::*;
         files
             .par_iter()
+            .chain(docs.par_iter())
             .filter_map(|f| std::fs::metadata(p.root.join(f)).ok().map(|md| (f.clone(), md.len(), crate::inventory::mtime_ms(&md))))
             .collect()
     });
@@ -443,6 +461,54 @@ fn scope(fam: Option<&str>) -> String {
 /// The interop family of a file's language.
 fn family(path: &str) -> Option<&'static str> {
     crate::lang::for_path(path).map(|l| l.family)
+}
+
+/// A documentation file: no code language, and a doc extension (`.md`, `.rst`, `.txt`, AsciiDoc)
+/// or a place under a `Documentation/`, `docs/` or `doc/` directory.
+pub(crate) fn doc_file(path: &str) -> bool {
+    if family(path).is_some() {
+        return false;
+    }
+    let lower = path.to_ascii_lowercase();
+    let ext = lower.rsplit_once('.').map_or("", |x| x.1);
+    matches!(ext, "md" | "markdown" | "rst" | "txt" | "adoc" | "asciidoc")
+        || ["documentation/", "docs/", "doc/"].iter().any(|d| lower.starts_with(d) || lower.contains(&format!("/{d}")))
+}
+
+/// Lines of the project's documentation files naming `name` as a whole word: (lines, whether
+/// the count stopped at [`DOCS_FILES_MAX`] or [`DOCS_TIME_MAX`], the files read). Candidates
+/// come from the indexed doc text, each read once to count its lines.
+fn doc_lines(c: &Connection, p: &Project, name: &str) -> Result<(usize, bool, Vec<String>)> {
+    let words: Vec<&str> = name.split(|ch: char| !ch.is_alphanumeric()).filter(|w| !w.is_empty()).collect();
+    if words.is_empty() {
+        return Ok((0, false, vec![]));
+    }
+    let mut q = c.prepare_cached(
+        "SELECT DISTINCT n.path FROM fts_node f JOIN node n ON n.id = f.rowid
+         WHERE fts_node MATCH ?1 AND n.project_id = ?2 AND n.kind IN ('doc_section', 'file', 'milestone') LIMIT 5000",
+    )?;
+    let mut paths: Vec<String> = q
+        .query_map(params![format!("body:\"{}\"", words.join(" ")), p.id], |r| r.get::<_, Option<String>>(0))?
+        .flatten()
+        .flatten()
+        .filter(|f| doc_file(f))
+        .collect();
+    paths.sort();
+    paths.dedup();
+    let mut capped = paths.len() > DOCS_FILES_MAX;
+    paths.truncate(DOCS_FILES_MAX);
+    let t0 = Instant::now();
+    let (mut n, mut read) = (0, vec![]);
+    for f in paths {
+        if t0.elapsed() > DOCS_TIME_MAX {
+            capped = true;
+            break;
+        }
+        let Some(text) = crate::guard::read_text(&p.root.join(&f), &f, 4 << 20, false) else { continue };
+        n += text.lines().filter(|l| word_at(l, name).is_some()).count();
+        read.push(f);
+    }
+    Ok((n, capped, read))
 }
 
 /// Files changed or added since indexing, per (store, project, generation): every indexed code
@@ -775,7 +841,9 @@ fn scan_file(cx: &Ctx, p: &Project, path: &str, raw: &[u8]) -> FileOut {
             continue;
         }
         if not_call {
-            out.lines.push((Cat::NotCall, row("", 0), false));
+            // A function stored in the target member: its own group, apart from other values.
+            let cat = if cx.stores.contains(&key) { Cat::Store } else { Cat::NotCall };
+            out.lines.push((cat, row("", 0), false));
             out.demoted += resolved_line as usize;
             continue;
         }
@@ -1013,6 +1081,9 @@ impl Ledger {
         if self.n(Cat::Definition) > 0 {
             parts.push(plural(self.n(Cat::Definition), "definition", "definition lines"));
         }
+        if self.n(Cat::Store) > 0 {
+            parts.push(plural(self.n(Cat::Store), "line stores a function in it (not a call)", "lines store a function in it (not calls)"));
+        }
         if self.n(Cat::NotCall) > 0 {
             parts.push(plural(self.n(Cat::NotCall), "reference, not a call", "references, not calls"));
         }
@@ -1086,33 +1157,41 @@ impl Ledger {
             format!("all accounted for in {}", self.scope)
         };
         let total = plural(total, "line names", "lines name");
-        Some(format!("{total} `{name}`: {}; {status}", parts.join(", ")))
+        // Documentation is no code: counted after the verdict, never listed.
+        let docs = match (self.docs, self.docs_capped) {
+            (0, false) => String::new(),
+            (n, false) => format!("; plus {n} in docs (not code, not listed)"),
+            (n, true) => format!("; plus at least {n} in docs (not code, not listed)"),
+        };
+        Some(format!("{total} `{name}`: {}; {status}{docs}", parts.join(", ")))
     }
 
     fn complete(&self) -> bool {
-        self.head(0).is_some_and(|h| h.ends_with(&format!("all accounted for in {}", self.scope)))
+        let verdict = format!("; all accounted for in {}", self.scope);
+        self.head(0).is_some_and(|h| h.ends_with(&verdict) || h.contains(&format!("{verdict}; plus ")))
     }
 
-    /// The few listed rows for the end of the answer: none when every line is accounted for.
+    /// The few listed rows for the end of the answer: when every line is accounted for, only
+    /// the lines storing a function in the target member.
     pub fn tail(&self) -> Vec<String> {
-        if self.complete() {
-            return vec![];
-        }
+        let complete = self.complete();
+        let shown = |c: &Cat| !complete || *c == Cat::Store;
         let mut out = vec![];
-        for (c, v) in &self.rows {
-            out.push(
-                match c {
-                    Cat::Unresolved => "unresolved mentions:",
-                    Cat::NotCall => "references, not calls (what is called through them is not followed):",
-                    Cat::Decl => "declarations and prototypes:",
-                    _ => "import lines:",
-                }
-                .to_string(),
-            );
+        for (c, v) in self.rows.iter().filter(|r| shown(&r.0)) {
+            out.push(match c {
+                Cat::Store => format!("stores a function in it (not calls): {}", self.n(Cat::Store)),
+                Cat::Unresolved => "unresolved mentions:".into(),
+                Cat::NotCall => "references, not calls (what is called through them is not followed):".into(),
+                Cat::Decl => "declarations and prototypes:".into(),
+                _ => "import lines:".into(),
+            });
             out.extend(v.iter().cloned());
         }
-        if self.more > 0 {
-            out.push(format!("{} counted, not listed", plural(self.more, "more line is", "more lines are")));
+        // Lines of the shown groups without a row.
+        let more = LISTED.iter().filter(|(c, _)| shown(c)).map(|(c, _)| self.n(*c)).sum::<usize>()
+            - self.rows.iter().filter(|r| shown(&r.0)).map(|r| r.1.len()).sum::<usize>();
+        if more > 0 {
+            out.push(format!("{} counted, not listed", plural(more, "more line is", "more lines are")));
         }
         out
     }

@@ -742,3 +742,91 @@ fn a_warm_answer_sees_edits_and_ignore_changes() {
     let out = fox_code(&p, "core.plan", "callers", 2000);
     assert!(first(&out).contains("stale") && first(&out).contains("gen/g.py"), "ignore changed: {out}");
 }
+
+// ---- callers answers keep stores and docs apart from calls ----
+
+const C_OPS: &[(&str, &str)] = &[
+    ("include/ops.h", "struct dev_ops {\n\tvoid (*op_mask)(int d);\n};\n"),
+    ("core/call.c", "#include \"ops.h\"\nvoid run(struct dev_ops *ops)\n{\n\tops->op_mask(1);\n}\n"),
+    ("drv/a.c", "#include \"ops.h\"\nstatic void a_mask(int d) { }\nstatic struct dev_ops a_ops = {\n\t.op_mask = a_mask,\n};\n"),
+    ("drv/b.c", "#include \"ops.h\"\nstatic void b_mask(int d) { }\nvoid b_init(struct dev_ops *o)\n{\n\to->op_mask = b_mask;\n}\n"),
+    ("Documentation/core/ops.rst", "Device ops\n==========\n\nA driver calls ``ops->op_mask(d)`` to mask.\nSee op_mask below.\n"),
+    ("docs/notes.md", "# Notes\n\nop_mask masks a line.\n"),
+];
+
+/// A callers answer of a C member lists the lines storing a function in it as their own group
+/// after the call sites, never among them and never as unresolved; documentation naming it is
+/// only counted on the accounting line.
+#[test]
+fn c_member_stores_are_their_own_group_and_docs_are_only_counted() {
+    let _g = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    let (_h, _r, p) = inline_project(C_OPS);
+    let out = fox_code(&p, "dev_ops.op_mask", "callers", 4000);
+    assert_eq!(
+        first(&out),
+        "4 lines name `op_mask`: 1 call, 1 definition, 2 lines store a function in it (not calls); all accounted for in indexed C/C++/Objective-C/Swift code; plus 3 in docs (not code, not listed)",
+        "{out}"
+    );
+    // The call site comes first; the stores follow under their own title.
+    let calls = out.find("core/").expect("call site");
+    let stores = out.find("stores a function in it (not calls): 2\n").expect("store group");
+    assert!(calls < stores, "{out}");
+    assert!(out.contains("\n  drv/a.c:4 | .op_mask = a_mask,\n  drv/b.c:5 | o->op_mask = b_mask;\n"), "{out}");
+    assert!(out.contains("1 call sites in 1 files"), "{out}");
+    // Neither the stores nor the docs are call sites, unresolved lines or "not calls" rows.
+    let sites = &out[..stores];
+    assert!(!sites.contains("drv/") && !sites.contains("a.c") && !sites.contains("b.c"), "{out}");
+    assert!(!out.contains(".rst") && !out.contains(".md") && !out.contains("unresolved"), "{out}");
+    assert!(!out.contains("references, not calls"), "{out}");
+    // `refs` and `impact` still count the stores as resolved, and say nothing of docs.
+    let out = fox_code(&p, "dev_ops.op_mask", "refs", 4000);
+    assert!(!out.contains("store a function") && !out.contains("in docs") && !out.contains(".rst"), "{out}");
+    let out = fox_code(&p, "dev_ops.op_mask", "impact", 4000);
+    assert!(!out.contains("store a function") && !out.contains("in docs") && !out.contains("unresolved mentions"), "{out}");
+}
+
+/// A store next to an unresolved line: the answer is incomplete, the unresolved line is listed
+/// as such and the store keeps its own group; a header prototype stays a declaration.
+#[test]
+fn c_member_stores_stay_apart_in_incomplete_answers() {
+    let _g = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    let mut files = C_OPS.to_vec();
+    files.push(("drv/c.c", "#include \"ops.h\"\nvoid c_go(void *v)\n{\n\tMACRO(v, op_mask);\n}\n"));
+    files.push(("include/plan.h", "int plan_query(int q);\n"));
+    files.push(("src/plan.c", "#include \"plan.h\"\nint plan_query(int q) { return q; }\nint run2(void) { return plan_query(1); }\n"));
+    files.push(("Documentation/plan.txt", "plan_query plans a query.\n"));
+    let (_h, _r, p) = inline_project(&files);
+    let out = fox_code(&p, "dev_ops.op_mask", "callers", 4000);
+    assert!(
+        first(&out).contains("2 lines store a function in it (not calls), 1 unresolved; may be incomplete: 1 unresolved line"),
+        "{out}"
+    );
+    assert!(out.contains("unresolved mentions:\n  drv/c.c:4 | MACRO(v, op_mask);"), "{out}");
+    assert!(out.contains("stores a function in it (not calls): 2\n  drv/a.c:4 "), "{out}");
+    let out = fox_code(&p, "plan_query", "callers", 4000);
+    assert!(first(&out).contains("1 declaration/prototype") && first(&out).ends_with("; plus 1 in docs (not code, not listed)"), "{out}");
+    assert!(!out.contains("plan.txt") && !out.contains("store a function"), "{out}");
+}
+
+/// Go and TypeScript callers answers have no store group: a function passed as a value is
+/// still a reference that is not a call; docs are counted the same way.
+#[test]
+fn go_and_typescript_have_no_store_group() {
+    let _g = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    let (_h, _r, p) = inline_project(&[
+        ("web/a.ts", "export function stamp(x: number) { return x }\n"),
+        ("web/b.ts", "import { stamp } from './a'\n\nexport const y = stamp(1)\nexport const ops = { f: stamp }\n"),
+        ("srv/srv.go", "package srv\n\nfunc Tick() {}\n\nfunc Run() { Tick(); go Tick() }\n"),
+        ("README.md", "# Readme\n\nCall stamp and Tick.\n"),
+    ]);
+    let out = fox_code(&p, "stamp", "callers", 2000);
+    assert_eq!(
+        first(&out),
+        "4 lines name `stamp`: 1 call, 1 definition, 1 import, 1 unresolved; may be incomplete: 1 unresolved line may use it; plus 1 in docs (not code, not listed)",
+        "{out}"
+    );
+    assert!(out.contains("unresolved mentions:\n  web/b.ts:4 | export const ops = { f: stamp }"), "{out}");
+    assert!(!out.contains("store a function") && !out.contains("README"), "{out}");
+    let out = fox_code(&p, "Tick", "callers", 2000);
+    assert!(!out.contains("store a function") && !out.contains("README"), "{out}");
+}
