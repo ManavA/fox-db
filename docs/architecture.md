@@ -29,6 +29,15 @@ members, and those whose type path passes through a field or function whose type
 type path when a typedef changed). A run that re-parses most of a big project drops the old rows
 in one pass per table and resolves everything again.
 
+**C++ receivers.** A C++ member call keeps its receiver as a type path too, with one namespace
+for type names (`S:Engine`): the declared type of a local, parameter or global (a smart
+pointer's pointee), the class `auto` gets from `Engine()`, `new`, `make_unique<T>()` or a cast,
+and for a name that is no local, or `this`, a field of the class whose method the call is in.
+Resolution follows the fields to the receiver's class; a method that class itself defines is the
+target with certainty (its out-of-line definition over the in-class declaration). Any unknown
+step, or a class that does not define the method (it may inherit it), leaves the name-based
+guess.
+
 **Python method resolution.** After name scoring, a Python call through `self`, `cls` or
 `super()` is re-targeted by the calling class's C3 linearization, built from the stored and
 freshly scored base-class references (`impl` rows), memoized per class in one resolve: the first

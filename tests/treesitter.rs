@@ -2384,3 +2384,242 @@ fn python_unknown_base_before_the_definition_keeps_the_call_a_guess() {
     let run = rows(&out).lines().find(|l| l.contains("Known.run")).map(str::to_string);
     assert!(run.as_deref().is_some_and(|l| !l.contains("guess")), "{out}");
 }
+
+fn cpp_recv_project() -> (tempfile::TempDir, tempfile::TempDir, project::Project) {
+    inline_project(&[
+        ("src/engine.hpp", "class Engine {\npublic:\n    void start();\n    int rpm = 0;\n};\n"),
+        ("src/engine.cpp", "#include \"engine.hpp\"\nvoid Engine::start() { rpm = 1; }\n"),
+        ("src/pump.hpp", "class Pump {\npublic:\n    void start() {}\n};\nclass Valve : public Pump {};\n"),
+        ("src/turbine.hpp", "namespace plant {\nclass Turbine {\npublic:\n    void start() {}\n};\n}\n"),
+        (
+            "src/uses.cpp",
+            "#include <memory>\n#include \"engine.hpp\"\n#include \"pump.hpp\"\n#include \"turbine.hpp\"\n\
+struct Car {\n    Engine engine;\n    Pump* pump;\n    std::unique_ptr<plant::Turbine> turbine;\n    void go() { engine.start(); }\n    void stop();\n};\n\
+void Car::stop() { this->pump->start(); }\n\
+void local_value() { Engine e; e.start(); }\n\
+void by_ptr(Pump* p) { p->start(); }\n\
+void by_ref(const Pump& p) { p.start(); }\n\
+void by_car(Car& car) { car.engine.start(); car.pump->start(); car.turbine->start(); }\n\
+void by_auto() { auto e = Engine(); e.start(); }\n\
+void by_make() { auto p = std::make_unique<Pump>(); p->start(); }\n\
+void by_new() { auto* t = new plant::Turbine(); t->start(); }\n\
+void by_ctor() { Engine e(3); e.start(); }\n\
+void shadow(Pump* e) { Engine e2; { Pump e; e.start(); } e2.start(); }\n\
+void lambdas(Engine* x) { auto f = [](Pump* x) { x->start(); }; x->start(); }\n\
+void unknown(auto& x) { x.start(); }\n\
+void unknown2() { auto v = lookup(); v.start(); }\n",
+        ),
+        (
+            "src/more.cpp",
+            "#include <memory>\n#include <vector>\n#include \"engine.hpp\"\n#include \"pump.hpp\"\n\
+Engine g_engine;\n\
+void globals() { g_engine.start(); }\n\
+void copy_init() { Engine e = Engine(); e.start(); }\n\
+void shared() { std::shared_ptr<Pump> p = std::make_shared<Pump>(); p->start(); }\n\
+void by_alias(Engine& e) { Engine& r = e; r.start(); }\n\
+void ranged(std::vector<Engine>& es) { for (Engine& e : es) e.start(); }\n\
+void ranged_auto(std::vector<Engine>& es) { for (auto& a : es) a.start(); }\n\
+void casted(void* v) { static_cast<Pump*>(v)->start(); ((Engine*)v)->start(); }\n",
+        ),
+    ])
+}
+
+fn call_lines(out: &str) -> Vec<String> {
+    resolved(out).lines().filter(|l| l.starts_with("  :")).map(|l| l.split(" | ").next().unwrap().to_string()).collect()
+}
+
+/// A call through a receiver whose type is plain in the code (a local, a parameter, a member of a
+/// typed struct, `auto` initialized by a constructor, `new` or `make_unique`) reaches that
+/// class's method with certainty, and no other class's; one whose type is unknown is a guess.
+#[test]
+fn cpp_member_calls_resolve_through_the_receivers_type() {
+    let _g = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    let (_h, _r, p) = cpp_recv_project();
+    let lines = |sym: &str| -> Vec<String> {
+        let out = fox_code(&p, sym, "callers", 4000);
+        call_lines(&out).into_iter().map(|l| l.trim().to_string()).collect()
+    };
+    let has = |ls: &[String], f: &str| ls.iter().any(|l| l.contains(&format!(" {f} ")));
+    let engine = lines("Engine.start");
+    for f in ["Car.go", "local_value", "by_car", "by_auto", "by_ctor", "shadow", "lambdas"] {
+        assert!(
+            has(&engine, f) && !engine.iter().filter(|l| l.contains(&format!(" {f} "))).any(|l| l.contains("guess")),
+            "{f}: {engine:?}"
+        );
+    }
+    for f in ["by_ptr", "by_ref", "by_make", "by_new", "Car.stop"] {
+        assert!(!has(&engine, f), "{f}: {engine:?}");
+    }
+    for f in ["globals", "copy_init", "by_alias", "ranged", "casted"] {
+        assert!(has(&engine, f), "{f}: {engine:?}");
+    }
+    // The receivers of unknown type (`auto x = lookup()`, `auto& a : es`) are guesses.
+    assert!(engine.iter().filter(|l| l.contains("guess")).count() == 3 && has(&engine, "ranged_auto"), "{engine:?}");
+    let pump = lines("Pump.start");
+    for f in ["by_ptr", "by_ref", "by_car", "by_make", "shadow", "lambdas", "Car.stop", "shared", "casted"] {
+        assert!(has(&pump, f), "{f}: {pump:?}");
+    }
+    assert!(pump.iter().all(|l| !l.contains("guess")), "{pump:?}");
+    for f in ["Car.go", "local_value", "by_auto", "by_new", "by_ctor", "unknown"] {
+        assert!(!has(&pump, f), "{f}: {pump:?}");
+    }
+    let turbine = lines("Turbine.start");
+    assert!(has(&turbine, "by_car") && has(&turbine, "by_new") && turbine.len() == 2, "{turbine:?}");
+    assert!(turbine.iter().all(|l| !l.contains("guess")), "{turbine:?}");
+    let out = fox_code(&p, "Turbine.start", "callers", 4000);
+    assert!(out.contains("2 call sites") && !out.contains("guessed by name"), "{out}");
+}
+
+/// A class that inherits the method, an external type and a name that is no local nor member of
+/// the class stay guesses; a receiver in a header-only class and an edit to a field's type
+/// follow.
+#[test]
+fn cpp_member_calls_without_a_known_class_stay_guesses_and_follow_edits() {
+    let _g = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    let (_h, repo, p) = inline_project(&[
+        (
+            "a.hpp",
+            "struct Base { void run() {} };\nstruct Derived : Base {};\nstruct Other { void run() {} };\nstruct Holder { Base* b; };\n",
+        ),
+        (
+            "use.cpp",
+            "#include \"a.hpp\"\n#include <string>\nvoid inherited(Derived* d) { d->run(); }\nvoid external(std::string& s) { s.run(); }\nvoid held(Holder& h) { h.b->run(); }\nvoid global_name() { g_thing.run(); }\n",
+        ),
+    ]);
+    let out = fox_code(&p, "Base.run", "callers", 4000);
+    let r = resolved(&out);
+    // The receiver of `held` is a plain `Base*`; the three others are guesses (or unresolved).
+    assert!(r.contains(":5 held c:") && !r.lines().any(|l| l.contains(":5 held") && l.contains("guess")), "{out}");
+    for f in [":3 inherited", ":4 external", ":6 global_name"] {
+        assert!(!r.lines().any(|l| l.contains(f) && !l.contains("guess")), "{f}: {out}");
+    }
+    let before = fox_code(&p, "Other.run", "callers", 4000);
+    assert!(!resolved(&before).contains(":5 held"), "{before}");
+    // The field's type changes in the header alone: the call in the unchanged file follows.
+    let mut c = db::open_rw().unwrap();
+    let h = repo.path().join("a.hpp");
+    let text = std::fs::read_to_string(&h).unwrap();
+    std::fs::write(&h, text.replace("Base* b;", "Other* b;")).unwrap();
+    inventory::index_project(&mut c, &p).unwrap();
+    assert_eq!(tsindex::index_project(&mut c, &p).unwrap().parsed, 1);
+    let base = fox_code(&p, "Base.run", "callers", 4000);
+    let other = fox_code(&p, "Other.run", "callers", 4000);
+    assert!(!resolved(&base).contains(":5 held") && resolved(&other).contains(":5 held c:"), "{base}\n{other}");
+    let snap = |c: &rusqlite::Connection| -> Vec<(i64, i64, i64)> {
+        let mut q = c.prepare("SELECT rowid, dst, amb FROM ts_ref ORDER BY rowid").unwrap();
+        q.query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?))).unwrap().flatten().collect()
+    };
+    let inc = snap(&c);
+    tsindex::resolve(&c, p.id).unwrap();
+    assert_eq!(snap(&c), inc);
+}
+
+/// C++ receivers of a known type reach their class; untyped ones stay guesses.
+const CPP_RECV_FILES: &[(&str, &str)] = &[
+    ("src/engine.hpp", "class Engine {\npublic:\n    int start(int x) { return x; }\n    int stop() { return 0; }\n};\n"),
+    ("src/pump.hpp", "class Pump {\npublic:\n    int start(int x) { return x + 1; }\n};\n"),
+    ("src/valve.hpp", "class Valve {\npublic:\n    int start(int x) { return x + 2; }\n};\n"),
+    (
+        "src/car.cpp",
+        "#include \"engine.hpp\"\n#include \"pump.hpp\"\n#include \"valve.hpp\"\n#include <memory>\nstruct Car {\n    Engine eng;\n    Pump* pump;\n};\nint local_obj() {\n    Engine e;\n    return e.start(1);\n}\nint by_ptr(Pump* p) {\n    return p->start(2);\n}\nint by_ref(const Pump& p) {\n    return p.start(3);\n}\nint by_member(Car& c) {\n    return c.eng.start(4) + c.pump->start(5);\n}\nint by_auto_ctor() {\n    auto e = Engine();\n    return e.start(6);\n}\nint by_make_unique() {\n    auto p = std::make_unique<Pump>();\n    return p->start(7);\n}\nint by_valve(Valve v) {\n    return v.start(8);\n}\nint unknown(T t) {\n    return t.start(9);\n}\n",
+    ),
+];
+
+fn cpp_row_for<'a>(out: &'a str, func: &str) -> Option<&'a str> {
+    out.lines().find(|l| l.trim_start().starts_with(':') && l.contains(&format!(" {func} c:")))
+}
+
+fn cpp_certain(out: &str, funcs: &[&str]) {
+    for f in funcs {
+        let r = cpp_row_for(out, f).unwrap_or_else(|| panic!("{f} missing: {out}"));
+        assert!(!r.contains("guess"), "{f} should be a certain call: {out}");
+    }
+}
+
+fn cpp_absent(out: &str, funcs: &[&str]) {
+    for f in funcs {
+        assert!(cpp_row_for(out, f).is_none(), "{f} must not call it: {out}");
+    }
+}
+
+#[test]
+fn locals_params_and_members_of_a_known_type_reach_their_class() {
+    let _g = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    let (_h, _r, p) = inline_project(CPP_RECV_FILES);
+    let out = fox_code(&p, "Engine.start", "callers", 6000);
+    cpp_certain(&out, &["local_obj", "by_member", "by_auto_ctor"]);
+    cpp_absent(&out, &["by_ptr", "by_ref", "by_make_unique", "by_valve"]);
+}
+
+#[test]
+fn pointer_and_reference_receivers_reach_their_class() {
+    let _g = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    let (_h, _r, p) = inline_project(CPP_RECV_FILES);
+    let out = fox_code(&p, "Pump.start", "callers", 6000);
+    cpp_certain(&out, &["by_ptr", "by_ref", "by_member"]);
+    cpp_absent(&out, &["local_obj", "by_valve", "by_auto_ctor"]);
+}
+
+#[test]
+fn smart_pointer_factories_give_the_receiver_its_type() {
+    let _g = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    let (_h, _r, p) = inline_project(CPP_RECV_FILES);
+    let out = fox_code(&p, "Pump.start", "callers", 6000);
+    cpp_certain(&out, &["by_make_unique"]);
+    let out = fox_code(&p, "Valve.start", "callers", 6000);
+    cpp_certain(&out, &["by_valve"]);
+    cpp_absent(&out, &["by_make_unique", "by_ptr"]);
+}
+
+#[test]
+fn an_untyped_receiver_stays_a_guess_or_unresolved_never_certain() {
+    let _g = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    let (_h, _r, p) = inline_project(CPP_RECV_FILES);
+    for q in ["Engine.start", "Pump.start", "Valve.start"] {
+        let out = fox_code(&p, q, "callers", 6000);
+        if let Some(r) = cpp_row_for(&out, "unknown") {
+            assert!(r.contains("guess"), "{q}: {out}");
+        }
+    }
+}
+
+#[test]
+fn only_the_untyped_receiver_is_still_a_guess() {
+    let _g = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    let (_h, _r, p) = inline_project(CPP_RECV_FILES);
+    let out = fox_code(&p, "Engine.start", "callers", 6000);
+    // Three typed calls are certain; only the receiver of unknown type is a guess.
+    assert!(out.contains("4 call sites in 1 files, 1 guessed by name"), "{out}");
+    // Engine.stop has one definition and no caller; nothing leaks onto it.
+    let out = fox_code(&p, "Engine.stop", "callers", 6000);
+    assert!(out.contains("0 call sites"), "{out}");
+}
+
+/// C++ too: a member declared through a function-pointer typedef is a function member; a
+/// pointer to one and a class-typed member stay fields.
+#[test]
+fn cpp_typedef_function_pointer_members_are_function_members() {
+    let _g = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    let (_h, _r, p) = inline_project(&[
+        (
+            "ops.hpp",
+            "typedef int (*op_fn)(int);\ntypedef op_fn op2_fn;\ntypedef op_fn *opp;\nclass Engine { public: int start(int x) { return x; } };\nstruct ops {\n\top_fn run;\n\top2_fn run2;\n\topp many;\n\tEngine eng;\n};\n",
+        ),
+        ("use.cpp", "#include \"ops.hpp\"\nint drive(ops *o) { return o->run(1) + o->run2(2); }\n"),
+    ]);
+    let c = db::open_ro().unwrap();
+    let kind = |n: &str| -> String {
+        c.query_row(
+            "SELECT json_extract(meta,'$.k') FROM node WHERE project_id = ?1 AND name = ?2 AND kind = 'symbol' AND path = 'ops.hpp'",
+            rusqlite::params![p.id, n],
+            |r| r.get(0),
+        )
+        .unwrap()
+    };
+    assert_eq!(kind("run"), "method");
+    assert_eq!(kind("run2"), "method");
+    assert_eq!(kind("many"), "field");
+    assert_eq!(kind("eng"), "field");
+    let out = fox_code(&p, "ops.run", "callers", 6000);
+    assert!(rows(&out).contains("drive"), "{out}");
+}

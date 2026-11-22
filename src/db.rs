@@ -482,6 +482,18 @@ pub(crate) fn migrate(c: &Connection) -> Result<()> {
              PRAGMA user_version = 26;",
         )?;
     }
+    if v < 27 {
+        // C++ calls through a receiver resolve by the receiver's declared or inferred class:
+        // references keep the receiver's type path (`rtype`), C++ types are one namespace (`S:`)
+        // and method declarations in a class body are marked. C++ files parse again once, and
+        // their projects re-score.
+        c.execute_batch(
+            "UPDATE ts_file SET hash = '', size = -1 WHERE lang = 'cpp';
+             INSERT OR REPLACE INTO meta(k, v)
+               SELECT 'rescore:' || p.id, 1 FROM project p WHERE EXISTS (SELECT 1 FROM ts_file f WHERE f.project_id = p.id AND f.lang = 'cpp');
+             PRAGMA user_version = 27;",
+        )?;
+    }
     // Cheap when already set: the setting lives in each table's own config.
     for t in MERGE_TABLES {
         defer_merges(c, t)?;
@@ -783,7 +795,7 @@ pub fn minority(c: &Connection, ranges: &[(i64, i64)]) -> bool {
 }
 
 /// The schema version this build writes.
-pub const LATEST: i64 = 26;
+pub const LATEST: i64 = 27;
 
 /// Read-only connection for the hot paths. None if the store does not exist yet.
 pub fn open_ro() -> Option<Connection> {
