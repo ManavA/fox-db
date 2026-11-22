@@ -180,6 +180,30 @@ fn python_edits_match_a_full_index() {
                     Some("from base import Base\n\n\ndef make():\n    return object\n\n\nclass Sub2(make(), Base):\n    pass\n"),
                 )],
             ),
+            (
+                "add a method to a base",
+                &[(
+                    "base.py",
+                    Some(
+                        "class Base:\n    def run(self):\n        return self.hook()\n\n    def hook(self):\n        return 0\n\n    def step(self):\n        return 3\n",
+                    ),
+                )],
+            ),
+            (
+                "change a root's bases",
+                &[("base.py", Some("from mixin import Mixin\n\n\nclass Base(Mixin):\n    def run(self):\n        return self.hook()\n"))],
+            ),
+            ("add a third same-name base", &[("pc/base.py", Some("class Base:\n    def hook(self):\n        return 7\n"))]),
+            ("remove it again", &[("pc/base.py", None)]),
+            (
+                "make an import name the only base",
+                &[(
+                    "sub.py",
+                    Some(
+                        "from pa.base import Base\nfrom mixin import Mixin\n\n\nclass Sub(Mixin, Base):\n    def go(self):\n        return self.step()\n",
+                    ),
+                )],
+            ),
             ("remove a subclass file", &[("sub2.py", None)]),
             ("remove a base file", &[("mixin.py", None)]),
             ("restore the base file", &[("mixin.py", Some(PY_MIXIN))]),

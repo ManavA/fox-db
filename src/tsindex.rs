@@ -55,6 +55,8 @@ pub struct Def {
     pub virt: bool,
     /// Python: a class whose bases include an expression the index cannot follow (`make()`).
     pub dyn_bases: bool,
+    /// C++: an `inline namespace`: its members are named from outside as if it were not there.
+    pub inline_ns: bool,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -87,6 +89,29 @@ pub struct Parsed {
 
 impl Parsed {
     /// Display name of a definition's container (`Outer.Inner`).
+    /// C++: the name a class is written with from outside (`absl.Status` for `Status` in
+    /// `namespace absl { inline namespace lts {` ...), when inline namespaces make it differ from
+    /// its container path.
+    pub fn outside_name(&self, i: usize) -> Option<String> {
+        let d = &self.defs[i];
+        if d.container_name.is_some() {
+            return None;
+        }
+        let mut names = vec![d.name.replace("::", ".")];
+        let mut skipped = false;
+        let mut cur = d.container;
+        while let Some(c) = cur {
+            if self.defs[c].inline_ns {
+                skipped = true;
+            } else {
+                names.push(self.defs[c].name.replace("::", "."));
+            }
+            cur = self.defs[c].container;
+        }
+        names.reverse();
+        skipped.then(|| names.join("."))
+    }
+
     pub fn container_of(&self, i: usize) -> Option<String> {
         let d = &self.defs[i];
         if let Some(n) = &d.container_name {
@@ -332,6 +357,11 @@ fn py_old_classes(tx: &Connection, pid: i64, path: &str, c: &mut CChange) -> Res
     {
         let bases: Vec<(i64, i64)> = b.query_map([id], |r| Ok((r.get(0)?, r.get(1)?)))?.flatten().collect();
         c.py_old.entry((path.to_string(), name)).or_default().push((id, bases, db));
+        // Base links from elsewhere to it lose their target when the file's rows go.
+        let mut inc = tx.prepare_cached("SELECT rowid FROM ts_ref WHERE dst = ?1 AND dst != 0 AND kind = 'impl'")?;
+        for rowid in inc.query_map([id], |r| r.get::<_, i64>(0))?.flatten() {
+            c.py_in.insert(rowid, id);
+        }
     }
     c.py_paths.insert(path.to_string());
     Ok(())
@@ -385,6 +415,9 @@ fn py_rescope(tx: &Connection, pid: i64, refs: &[RefRow], scored: &[(i64, i64, i
     }
     let norm = |id: i64| renum.get(&id).copied().unwrap_or(id);
     let mut seeds: Vec<i64> = vec![];
+    // The changed classes and their bases, old and new: the names they and their ancestors
+    // define are the only ones whose resolution order may have changed.
+    let mut names_of: Vec<i64> = vec![];
     let keys: HashSet<&(String, String)> = c.py_old.keys().chain(new.keys()).collect();
     for key in keys {
         let olds = c.py_old.get(key).map(Vec::as_slice).unwrap_or(&[]);
@@ -396,17 +429,22 @@ fn py_rescope(tx: &Connection, pid: i64, refs: &[RefRow], scored: &[(i64, i64, i
         if !same {
             for o in olds {
                 seeds.extend(o.1.iter().map(|b| norm(b.0)));
+                names_of.extend(o.1.iter().map(|b| norm(b.0)));
             }
             for n in news {
                 seeds.push(n.0);
                 seeds.extend(n.1.iter().map(|b| b.0));
+                names_of.push(n.0);
+                names_of.extend(n.1.iter().map(|b| b.0));
             }
         }
     }
     // Base links re-scored in other files (a base class added, removed or re-targeted).
     for (r, s) in refs.iter().zip(scored) {
-        if r.kind == "impl" && !c.py_paths.contains(&r.path) && is_py(&r.path) && (norm(r.dst), r.amb) != (s.0, s.1) {
-            seeds.extend([r.src, norm(r.dst), s.0]);
+        let old = if r.dst == 0 { c.py_in.get(&r.rowid).copied().unwrap_or(0) } else { r.dst };
+        if r.kind == "impl" && !c.py_paths.contains(&r.path) && is_py(&r.path) && (norm(old), r.amb) != (s.0, s.1) {
+            seeds.extend([r.src, norm(old), s.0]);
+            names_of.extend([r.src, norm(old), s.0]);
         }
     }
     seeds.retain(|&x| x > 0);
@@ -419,6 +457,27 @@ fn py_rescope(tx: &Connection, pid: i64, refs: &[RefRow], scored: &[(i64, i64, i
     let mut seen: HashSet<i64> = seeds.iter().copied().collect();
     let mut todo = seeds;
     let mut classes: Vec<i64> = vec![];
+    // The names: those defined in the changed classes, their old and new bases and the bases'
+    // ancestors (as stored now; a removed class's names were re-scored by name already).
+    let mut anc: HashSet<i64> = names_of.iter().copied().filter(|&x| x > 0).collect();
+    let mut up_todo: Vec<i64> = anc.iter().copied().collect();
+    while let Some(k) = up_todo.pop() {
+        for b in up.query_map([k], |r| r.get::<_, i64>(0))?.flatten() {
+            if b > 0 && anc.insert(b) {
+                up_todo.push(b);
+            }
+        }
+    }
+    let mut names: HashSet<String> = HashSet::new();
+    let anc: Vec<i64> = anc.into_iter().collect();
+    for chunk in anc.chunks(500) {
+        let ids = chunk.iter().map(i64::to_string).collect::<Vec<_>>().join(",");
+        let mut q = tx.prepare(&format!("SELECT name FROM node WHERE json_extract(meta,'$.pid') IN ({ids}) AND kind = 'symbol'"))?;
+        names.extend(q.query_map([], |r| r.get::<_, String>(0))?.flatten());
+    }
+    if names.is_empty() {
+        return Ok(vec![]);
+    }
     while let Some(k) = todo.pop() {
         classes.push(k);
         let near: Vec<i64> = up.query_map([k], |r| r.get(0))?.flatten().chain(down.query_map([k], |r| r.get(0))?.flatten()).collect();
@@ -428,20 +487,34 @@ fn py_rescope(tx: &Connection, pid: i64, refs: &[RefRow], scored: &[(i64, i64, i
             }
         }
     }
-    // Their calls through `self`, `cls` or `super()` (in methods, and functions nested in them).
-    let mut members = tx.prepare_cached("SELECT id FROM node WHERE json_extract(meta,'$.pid') = ?1 AND kind = 'symbol'")?;
-    let mut calls = tx.prepare_cached("SELECT rowid FROM ts_ref WHERE src = ?1 AND kind = 'call' AND via IN ('self', 'cls', 'super')")?;
-    let done: HashSet<i64> = refs.iter().map(|r| r.rowid).collect();
-    let mut out: Vec<i64> = vec![];
+    // Their calls through `self`, `cls` or `super()` (in methods, and functions nested in them),
+    // in batches: the members of the classes, theirs, then the calls of all of them.
     classes.sort_unstable();
-    for k in classes {
-        let ms: Vec<i64> = members.query_map([k], |r| r.get(0))?.flatten().collect();
-        for m in ms {
-            let nested: Vec<i64> = members.query_map([m], |r| r.get(0))?.flatten().collect();
-            for src in std::iter::once(m).chain(nested) {
-                out.extend(calls.query_map([src], |r| r.get::<_, i64>(0))?.flatten().filter(|x| !done.contains(x)));
-            }
+    let done: HashSet<i64> = refs.iter().map(|r| r.rowid).collect();
+    let mut srcs: Vec<i64> = vec![];
+    let mut level = classes;
+    for _ in 0..2 {
+        let mut next: Vec<i64> = vec![];
+        for chunk in level.chunks(500) {
+            let ids = chunk.iter().map(i64::to_string).collect::<Vec<_>>().join(",");
+            let mut q = tx.prepare(&format!("SELECT id FROM node WHERE json_extract(meta,'$.pid') IN ({ids}) AND kind = 'symbol'"))?;
+            next.extend(q.query_map([], |r| r.get::<_, i64>(0))?.flatten());
         }
+        srcs.extend(&next);
+        level = next;
+    }
+    let mut out: Vec<i64> = vec![];
+    for chunk in srcs.chunks(500) {
+        let ids = chunk.iter().map(i64::to_string).collect::<Vec<_>>().join(",");
+        let mut q = tx.prepare(&format!(
+            "SELECT rowid, name FROM ts_ref WHERE src IN ({ids}) AND src != 0 AND kind = 'call' AND via IN ('self', 'cls', 'super')"
+        ))?;
+        out.extend(
+            q.query_map([], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?)))?
+                .flatten()
+                .filter(|(x, n)| !done.contains(x) && names.contains(n))
+                .map(|x| x.0),
+        );
     }
     out.sort_unstable();
     out.dedup();
@@ -1062,6 +1135,10 @@ pub fn extract(l: &Lang, src: &[u8]) -> Parsed {
             let proto = cpp && !field_fn && kind == "method" && node.kind() == "field_declaration";
             let virt = cpp && !field_fn && kind == "method" && cpp_virtual(node);
             let dyn_bases = l.family == "python" && kind == "class" && py_dyn_bases(node);
+            let inline_ns = cpp && node.kind() == "namespace_definition" && {
+                let mut w = node.walk();
+                node.children(&mut w).any(|c| c.kind() == "inline")
+            };
             if field_fn {
                 kind = "method".into();
             }
@@ -1090,6 +1167,7 @@ pub fn extract(l: &Lang, src: &[u8]) -> Parsed {
                 proto,
                 virt,
                 dyn_bases,
+                inline_ns,
             });
         } else if let Some(k) = cn.strip_prefix("reference.") {
             // A value in an argument list, keyed literal or initializer (`f(name)`, `Name: name`,
@@ -1858,6 +1936,11 @@ fn store_file(
         if d.dyn_bases {
             meta["db"] = 1.into();
         }
+        if matches!(d.kind.as_str(), "class" | "struct" | "union")
+            && let Some(q) = p.outside_name(i)
+        {
+            meta["cq"] = q.into();
+        }
         // C: a member of a struct or union tag (not of an anonymous struct named by a typedef).
         if (d.kind == FIELD || d.field_fn)
             && let Some(c) = d.container
@@ -1978,6 +2061,8 @@ struct Cand {
     parent_full: String,
     /// See [`Def::virt`].
     virt: bool,
+    /// C++: a class's name from outside, past inline namespaces (`meta.cq`).
+    outside: Option<String>,
 }
 
 /// One reference row to score.
@@ -2028,6 +2113,8 @@ struct CSym {
     fnptr: bool,
     /// The whole container name (`ns.Engine` for a member of `ns::Engine`).
     full_parent: String,
+    /// See [`Cand::outside`].
+    outside: Option<String>,
 }
 
 /// C++: what a call's receiver is, from its type path.
@@ -2066,8 +2153,9 @@ struct CTypes {
     field_tys: HashMap<String, Vec<Option<String>>>,
     /// Per member name: the function-pointer members of that name.
     fnptrs: HashMap<String, Vec<i64>>,
-    /// C++: the classes, structs and unions of a name, by their whole names (`ns.Engine`).
-    classes: HashMap<String, Vec<String>>,
+    /// C++: the classes, structs and unions of a name: their whole names (`ns.Engine`) and the
+    /// names they are written with from outside (past inline namespaces).
+    classes: HashMap<String, Vec<(String, String)>>,
     /// C++: names of methods (a call `f()` in a class may be one).
     methods: HashSet<String>,
     /// Names read from the store (scoped runs).
@@ -2091,7 +2179,8 @@ impl CTypes {
             self.named.entry(name.to_string()).or_default().push((s.kind, s.ty));
         } else if matches!(s.kind.as_str(), "class" | "struct" | "union") {
             let full = if s.full_parent.is_empty() { name.to_string() } else { format!("{}.{name}", s.full_parent.replace("::", ".")) };
-            self.classes.entry(name.to_string()).or_default().push(full);
+            let outside = s.outside.clone().unwrap_or_else(|| full.clone());
+            self.classes.entry(name.to_string()).or_default().push((full, outside));
         } else if s.kind == "method" {
             self.methods.insert(name.to_string());
         }
@@ -2168,38 +2257,25 @@ impl CTypes {
         }
         let last = q.rsplit('.').next().unwrap_or("").to_string();
         self.load(&last, fetch);
-        let fulls: Vec<String> = self.classes.get(&last).cloned().unwrap_or_default();
+        let fulls: Vec<(String, String)> = self.classes.get(&last).cloned().unwrap_or_default();
         let types = self.named.get(&last).into_iter().flatten().filter(|(k, _)| k == "type").count();
         let unique = fulls.len() == 1 && types == 0;
         if q.contains('.') {
-            // `absl::Status` also names `absl.lts.Status` (an inline namespace): the qualifier's
-            // namespaces appear in the class's, in order.
-            let qs: Vec<&str> = q.split('.').collect();
-            let fits = |f: &String| {
-                let fs: Vec<&str> = f.split('.').collect();
-                let mut at = 0;
-                fs.last() == qs.last()
-                    && qs[..qs.len() - 1].iter().all(|n| match fs[at..fs.len() - 1].iter().position(|x| x == n) {
-                        Some(i) => {
-                            at += i + 1;
-                            true
-                        }
-                        None => false,
-                    })
-            };
-            let hits: Vec<&String> = fulls.iter().filter(|f| fits(f)).collect();
+            // The qualifier names the class as written from outside (past inline namespaces,
+            // see [`Parsed::outside_name`]), or a tail of that (from inside an enclosing
+            // namespace). Skipping any other namespace is no match: `a::Engine` is not
+            // `a::detail::Engine`.
+            let hits: Vec<&(String, String)> = fulls.iter().filter(|(_, o)| *o == q || o.ends_with(&format!(".{q}"))).collect();
             return match hits.as_slice() {
-                [one] => CppRecv::Class((*one).clone(), unique),
+                [one] => CppRecv::Class(one.0.clone(), unique),
                 [] if !fulls.is_empty() => CppRecv::Doubt,
                 // A library namespace; any other may be an alias or a macro's the index does not
                 // follow (`namespace c = b;`): the name-based pick stands.
-                [] if fulls.is_empty() && types == 0 && CPP_LIB_NAMESPACES.contains(&q.split('.').next().unwrap_or("")) => {
-                    CppRecv::External
-                }
+                [] if types == 0 && CPP_LIB_NAMESPACES.contains(&q.split('.').next().unwrap_or("")) => CppRecv::External,
                 _ => CppRecv::Unknown,
             };
         }
-        if unique { CppRecv::Class(fulls[0].clone(), true) } else { CppRecv::Unknown }
+        if unique { CppRecv::Class(fulls[0].0.clone(), true) } else { CppRecv::Unknown }
     }
 
     /// C++: the class a call's receiver is of, from its type path (see [`cpp_chain`]): the base's
@@ -2784,6 +2860,7 @@ fn map_cand(r: &rusqlite::Row) -> rusqlite::Result<CandRow> {
             parent: r.get::<_, String>(5)?.rsplit('.').next().unwrap_or("").to_string(),
             parent_full: r.get(5)?,
             virt: r.get::<_, Option<i64>>(13)?.is_some(),
+            outside: r.get(14)?,
             family: lang::by_name(&lang).map(|l| l.family).unwrap_or(""),
             local: false,
             decl: r.get::<_, Option<i64>>(7)?.is_some(),
@@ -2798,7 +2875,7 @@ fn map_cand(r: &rusqlite::Row) -> rusqlite::Result<CandRow> {
 
 const CAND_COLS: &str = "id, name, path, json_extract(meta,'$.k'), COALESCE(json_extract(meta,'$.pid'),0), \
      COALESCE(json_extract(meta,'$.parent'),''), lang, json_extract(meta,'$.d'), json_extract(meta,'$.s'), json_extract(meta,'$.f'), \
-     json_extract(meta,'$.t'), json_extract(meta,'$.ps'), json_extract(meta,'$.b'), json_extract(meta,'$.v')";
+     json_extract(meta,'$.t'), json_extract(meta,'$.ps'), json_extract(meta,'$.b'), json_extract(meta,'$.v'), json_extract(meta,'$.cq')";
 const REF_COLS: &str = "rowid, path, src, name, kind, dst, recv, amb, line, via, rtype, slot";
 
 /// The C symbol a candidate row stands for, when it is one a type path may walk through.
@@ -2814,6 +2891,7 @@ fn c_sym_of(c: &Cand, ty: Option<String>, tag: bool) -> Option<CSym> {
             ty,
             fnptr: c.field_fn,
             full_parent: c.parent_full.clone(),
+            outside: c.outside.clone(),
         },
     )
 }
@@ -2877,6 +2955,8 @@ struct Mro<'a> {
     fresh: HashMap<i64, (i64, i64)>,
     /// Fresh `impl` links: base class -> the classes naming it.
     fresh_subs: HashMap<i64, Vec<i64>>,
+    /// Names of the fresh `impl` links that are guesses.
+    fresh_guesses: HashSet<String>,
     /// A node's kind (`meta.k`) and whether its bases include an expression the index cannot
     /// follow (`meta.db`).
     kinds: HashMap<i64, (Option<String>, bool)>,
@@ -3063,6 +3143,20 @@ impl Mro<'_> {
     }
 
     fn subclasses_of(&mut self, k: i64) -> Result<Option<Vec<i64>>> {
+        // A base link guessed among same-name classes may be one to this class: some subclass
+        // cannot be told.
+        let name: Option<String> = self.tx.prepare_cached("SELECT name FROM node WHERE id = ?1")?.query_row([k], |r| r.get(0)).ok();
+        if let Some(n) = name {
+            let stored: Vec<i64> = self
+                .tx
+                .prepare_cached("SELECT rowid FROM ts_ref WHERE project_id = ?1 AND name = ?2 AND kind = 'impl' AND amb > 0")?
+                .query_map(params![self.pid, n], |r| r.get(0))?
+                .flatten()
+                .collect();
+            if self.fresh_guesses.contains(&n) || stored.iter().any(|r| !self.fresh.contains_key(r)) {
+                return Ok(None);
+            }
+        }
         let mut out: Vec<i64> = vec![];
         let mut seen: HashSet<i64> = HashSet::from([k]);
         let mut todo = vec![k];
@@ -3153,9 +3247,13 @@ fn python_mro(
     }
     let mut fresh: HashMap<i64, (i64, i64)> = HashMap::new();
     let mut fresh_subs: HashMap<i64, Vec<i64>> = HashMap::new();
+    let mut fresh_guesses: HashSet<String> = HashSet::new();
     for (r, s) in refs.iter().zip(scored.iter()) {
         if r.kind == "impl" {
             fresh.insert(r.rowid, (s.0, s.1));
+            if s.0 != 0 && s.1 > 0 {
+                fresh_guesses.insert(r.name.clone());
+            }
             if s.0 != 0 {
                 fresh_subs.entry(s.0).or_default().push(r.src);
             }
@@ -3166,6 +3264,7 @@ fn python_mro(
         pid,
         fresh,
         fresh_subs,
+        fresh_guesses,
         kinds: HashMap::new(),
         lin: HashMap::new(),
         open: HashSet::new(),
@@ -3280,6 +3379,8 @@ pub(crate) struct CChange {
     py_old: HashMap<(String, String), Vec<PyClass>>,
     /// Python files re-parsed or removed.
     py_paths: HashSet<String>,
+    /// Python base links (rowid) to classes of those files, with the class's old id.
+    py_in: HashMap<i64, i64>,
     /// References to re-score besides the scope (see [`py_rescope`]).
     extra: Vec<i64>,
 }
@@ -3579,7 +3680,8 @@ pub(crate) fn resolve_scoped_c(
         }
     }
     trace("resolve: refs loaded", t0);
-    // 2. Candidates by name (id order, so ties break the same way in full and scoped runs), and
+    // 2. Candidates by name (path, then id order: ties break the same way in full and scoped
+    //    runs, whatever ids a re-parsed file got), and
     //    the container of every definition involved.
     let mut cands: HashMap<String, Vec<Cand>> = HashMap::new();
     let mut parent_of: HashMap<i64, (i64, bool)> = HashMap::new(); // id -> (container id, callable)
@@ -3634,7 +3736,7 @@ pub(crate) fn resolve_scoped_c(
                     .filter(|(name, c, ..)| name == n && c.kind != FIELD)
                     .map(|x| x.1)
                     .collect();
-                v.sort_by_key(|c| c.id);
+                v.sort_by(|a, b| (&a.path, a.id).cmp(&(&b.path, b.id)));
                 cands.insert(n.to_string(), v);
             }
             let mut one = tx.prepare_cached(
@@ -3672,6 +3774,9 @@ pub(crate) fn resolve_scoped_c(
         }
     }
     for v in cands.values_mut() {
+        if scope.is_none() {
+            v.sort_by(|a, b| (&a.path, a.id).cmp(&(&b.path, b.id)));
+        }
         for c in v.iter_mut() {
             c.local = parent_of.get(&c.pid).is_some_and(|p| p.1);
         }
@@ -3793,9 +3898,12 @@ pub(crate) fn resolve_scoped_c(
         if dst != 0 {
             out.resolved += 1;
         }
-        for d in [r.dst, dst] {
-            if r.src != 0 && d != 0 && r.src != d {
-                touched.insert((r.src, d, class(&r.kind)));
+        // A pair's edge changes only when a reference's target does.
+        if dst != r.dst {
+            for d in [r.dst, dst] {
+                if r.src != 0 && d != 0 && r.src != d {
+                    touched.insert((r.src, d, class(&r.kind)));
+                }
             }
         }
         if dst != 0 && r.src != 0 && r.src != dst {
@@ -3881,6 +3989,7 @@ mod via_tests {
             proto: false,
             parent_full: parent.into(),
             virt: false,
+            outside: None,
         }
     }
 

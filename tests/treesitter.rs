@@ -2989,3 +2989,54 @@ fn python_lonely_class_rescores_little() {
     let st = tsindex::index_project(&mut c, &p).unwrap();
     assert!(st.rescored < 10, "{}", st.rescored);
 }
+
+/// C++: a qualifier never skips a namespace that is not inline: `a::Engine` is no
+/// `a::detail::Engine` (the real `a::Engine` may be declared by a macro the index cannot read).
+#[test]
+fn cpp_qualifier_skips_only_inline_namespaces() {
+    let _g = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    let (_h, _r, p) = inline_project(&[
+        (
+            "a.hpp",
+            "#define DECLARE_ENGINE(n) class n { public: void start(); };\nnamespace a {\nDECLARE_ENGINE(Engine)\nnamespace detail { class Engine { public: void start() {} }; }\n}\n",
+        ),
+        ("u.cpp", "#include \"a.hpp\"\nvoid f(a::Engine& e) { e.start(); }\n"),
+    ]);
+    let out = fox_code(&p, "detail.Engine.start", "callers", 6000);
+    not_certain(&out, "f");
+}
+
+/// Python: a base change under a ~400-class hierarchy re-indexes quickly.
+#[test]
+fn python_base_change_on_a_wide_hierarchy_is_fast() {
+    let _g = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    let mut files: Vec<(String, String)> = vec![
+        ("root.py".into(), "class Root:\n    def m0(self):\n        return 0\n".into()),
+        ("other.py".into(), "class Other:\n    def m0(self):\n        return 1\n".into()),
+    ];
+    for f in 0..40 {
+        let mut t = String::from("from root import Root\n\n");
+        for c in 0..10 {
+            t.push_str(&format!("\nclass C{f}_{c}(Root):\n"));
+            for m in 1..6 {
+                t.push_str(&format!("    def m{m}(self):\n        return self.m{}()\n\n", m - 1));
+            }
+        }
+        files.push((format!("f{f}.py"), t));
+    }
+    let refs: Vec<(&str, &str)> = files.iter().map(|(a, b)| (a.as_str(), b.as_str())).collect();
+    let (_h, repo, p) = inline_project(&refs);
+    std::fs::write(repo.path().join("root.py"), "from other import Other\n\n\nclass Root(Other):\n    pass\n").unwrap();
+    let mut c = db::open_rw().unwrap();
+    inventory::index_project(&mut c, &p).unwrap();
+    let t = std::time::Instant::now();
+    let st = tsindex::index_project(&mut c, &p).unwrap();
+    let took = t.elapsed();
+    assert!(took < std::time::Duration::from_millis(1500), "{took:?}");
+    // Only the calls of names the changed classes and their bases define (`m0`, 400 of them),
+    // not all 2000 `self.` calls of the hierarchy.
+    assert!(st.rescored < 1000, "{}", st.rescored);
+    let inc = ref_snapshot(&c);
+    tsindex::resolve(&c, p.id).unwrap();
+    assert_eq!(ref_snapshot(&c), inc);
+}
