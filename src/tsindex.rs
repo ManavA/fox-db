@@ -318,47 +318,134 @@ fn cpp_chain(e: tree_sitter::Node, walk: &Walk, src: &[u8], depth: usize) -> Opt
     }
 }
 
-/// Python: did file `path`'s classes change in what method resolution reads (`parsed`: its new
-/// parse, None when it is removed): its classes, their bases in order, whether a base is an
-/// expression, and the names defined in each class? Read before the file's rows go.
-fn py_classes_changed(tx: &Connection, pid: i64, path: &str, parsed: Option<&Parsed>) -> Result<bool> {
-    // (class, its bases in order, whether a base is an expression, its member names sorted).
-    type Sig = Vec<(String, Vec<String>, bool, Vec<String>)>;
-    let mut old: Sig = vec![];
+/// Python: record file `path`'s classes as the store holds them (their ids, resolved bases and
+/// expression-base flag) in `c`, before the file's rows go: the resolution after the re-parse
+/// compares them with the fresh ones (see [`py_rescope`]).
+fn py_old_classes(tx: &Connection, pid: i64, path: &str, c: &mut CChange) -> Result<()> {
+    let mut q = tx.prepare_cached(
+        "SELECT id, name, json_extract(meta,'$.db') IS NOT NULL FROM node
+         WHERE project_id = ?1 AND path = ?2 AND kind = 'symbol' AND json_extract(meta,'$.k') = 'class' ORDER BY id",
+    )?;
+    let mut b = tx.prepare_cached("SELECT dst, amb FROM ts_ref WHERE src = ?1 AND src != 0 AND kind = 'impl' ORDER BY rowid")?;
+    for (id, name, db) in
+        q.query_map(params![pid, path], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?, r.get::<_, bool>(2)?)))?.flatten()
+    {
+        let bases: Vec<(i64, i64)> = b.query_map([id], |r| Ok((r.get(0)?, r.get(1)?)))?.flatten().collect();
+        c.py_old.entry((path.to_string(), name)).or_default().push((id, bases, db));
+    }
+    c.py_paths.insert(path.to_string());
+    Ok(())
+}
+
+/// Python, after a scoped resolution wrote its results: the `self.`, `cls.` and `super()` calls
+/// outside this run whose answer may have changed. A class changed when it appeared, went, or
+/// its bases resolve differently (an edit, an import re-targeted, a base class added or
+/// removed elsewhere); every class connected to a changed one through base links (its
+/// subclasses, its bases, theirs) may now read another method resolution order, so their calls
+/// are re-scored.
+fn py_rescope(tx: &Connection, pid: i64, refs: &[RefRow], scored: &[(i64, i64, i64)], c: &CChange) -> Result<Vec<i64>> {
+    let is_py = |p: &str| lang::for_path(p).is_some_and(|l| l.family == "python");
+    // Old class ids -> the re-parsed class of the same file and name (0: gone or ambiguous).
+    let mut new: HashMap<(String, String), Vec<PyClass>> = HashMap::new();
     {
         let mut q = tx.prepare_cached(
             "SELECT id, name, json_extract(meta,'$.db') IS NOT NULL FROM node
              WHERE project_id = ?1 AND path = ?2 AND kind = 'symbol' AND json_extract(meta,'$.k') = 'class' ORDER BY id",
         )?;
-        let mut b = tx.prepare_cached("SELECT name FROM ts_ref WHERE src = ?1 AND src != 0 AND kind = 'impl' ORDER BY rowid")?;
-        let mut m = tx.prepare_cached(
-            "SELECT name FROM node WHERE project_id = ?1 AND path = ?2 AND kind = 'symbol' AND json_extract(meta,'$.pid') = ?3",
-        )?;
-        for (id, name, db) in
-            q.query_map(params![pid, path], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?, r.get::<_, bool>(2)?)))?.flatten()
-        {
-            let bases: Vec<String> = b.query_map([id], |r| r.get(0))?.flatten().collect();
-            let mut names: Vec<String> = m.query_map(params![pid, path, id], |r| r.get(0))?.flatten().collect();
-            names.sort();
-            old.push((name, bases, db, names));
+        let mut paths: Vec<&String> = c.py_paths.iter().collect();
+        paths.sort();
+        for path in paths {
+            for (id, name, db) in
+                q.query_map(params![pid, path], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?, r.get::<_, bool>(2)?)))?.flatten()
+            {
+                new.entry((path.clone(), name)).or_default().push((id, vec![], db));
+            }
         }
     }
-    let new: Sig = match parsed {
-        None => vec![],
-        Some(p) => p
-            .defs
-            .iter()
-            .enumerate()
-            .filter(|(_, d)| d.kind == "class")
-            .map(|(i, d)| {
-                let bases = p.refs.iter().filter(|r| r.kind == "impl" && r.caller == Some(i)).map(|r| r.name.clone()).collect();
-                let mut names: Vec<String> = p.defs.iter().filter(|x| x.container == Some(i)).map(|x| x.name.clone()).collect();
-                names.sort();
-                (d.name.clone(), bases, d.dyn_bases, names)
-            })
-            .collect(),
-    };
-    Ok(old != new)
+    let mut fresh: HashMap<i64, Vec<(i64, i64)>> = HashMap::new();
+    for (r, s) in refs.iter().zip(scored) {
+        if r.kind == "impl" && is_py(&r.path) {
+            fresh.entry(r.src).or_default().push((s.0, s.1));
+        }
+    }
+    for v in new.values_mut() {
+        for k in v.iter_mut() {
+            k.1 = fresh.get(&k.0).cloned().unwrap_or_default();
+        }
+    }
+    let mut renum: HashMap<i64, i64> = HashMap::new();
+    for (key, olds) in &c.py_old {
+        let to = match (olds.as_slice(), new.get(key).map(Vec::as_slice)) {
+            ([_], Some([n])) => n.0,
+            _ => 0,
+        };
+        for o in olds {
+            renum.insert(o.0, to);
+        }
+    }
+    let norm = |id: i64| renum.get(&id).copied().unwrap_or(id);
+    let mut seeds: Vec<i64> = vec![];
+    let keys: HashSet<&(String, String)> = c.py_old.keys().chain(new.keys()).collect();
+    for key in keys {
+        let olds = c.py_old.get(key).map(Vec::as_slice).unwrap_or(&[]);
+        let news = new.get(key).map(Vec::as_slice).unwrap_or(&[]);
+        let same = match (olds, news) {
+            ([o], [n]) => o.2 == n.2 && o.1.iter().map(|b| (norm(b.0), b.1)).eq(n.1.iter().copied()),
+            _ => false,
+        };
+        if !same {
+            for o in olds {
+                seeds.extend(o.1.iter().map(|b| norm(b.0)));
+            }
+            for n in news {
+                seeds.push(n.0);
+                seeds.extend(n.1.iter().map(|b| b.0));
+            }
+        }
+    }
+    // Base links re-scored in other files (a base class added, removed or re-targeted).
+    for (r, s) in refs.iter().zip(scored) {
+        if r.kind == "impl" && !c.py_paths.contains(&r.path) && is_py(&r.path) && (norm(r.dst), r.amb) != (s.0, s.1) {
+            seeds.extend([r.src, norm(r.dst), s.0]);
+        }
+    }
+    seeds.retain(|&x| x > 0);
+    if seeds.is_empty() {
+        return Ok(vec![]);
+    }
+    // Every class connected through base links, as stored now.
+    let mut up = tx.prepare_cached("SELECT dst FROM ts_ref WHERE src = ?1 AND src != 0 AND kind = 'impl'")?;
+    let mut down = tx.prepare_cached("SELECT src FROM ts_ref WHERE dst = ?1 AND dst != 0 AND kind = 'impl'")?;
+    let mut seen: HashSet<i64> = seeds.iter().copied().collect();
+    let mut todo = seeds;
+    let mut classes: Vec<i64> = vec![];
+    while let Some(k) = todo.pop() {
+        classes.push(k);
+        let near: Vec<i64> = up.query_map([k], |r| r.get(0))?.flatten().chain(down.query_map([k], |r| r.get(0))?.flatten()).collect();
+        for n in near {
+            if n > 0 && seen.insert(n) {
+                todo.push(n);
+            }
+        }
+    }
+    // Their calls through `self`, `cls` or `super()` (in methods, and functions nested in them).
+    let mut members = tx.prepare_cached("SELECT id FROM node WHERE json_extract(meta,'$.pid') = ?1 AND kind = 'symbol'")?;
+    let mut calls = tx.prepare_cached("SELECT rowid FROM ts_ref WHERE src = ?1 AND kind = 'call' AND via IN ('self', 'cls', 'super')")?;
+    let done: HashSet<i64> = refs.iter().map(|r| r.rowid).collect();
+    let mut out: Vec<i64> = vec![];
+    classes.sort_unstable();
+    for k in classes {
+        let ms: Vec<i64> = members.query_map([k], |r| r.get(0))?.flatten().collect();
+        for m in ms {
+            let nested: Vec<i64> = members.query_map([m], |r| r.get(0))?.flatten().collect();
+            for src in std::iter::once(m).chain(nested) {
+                out.extend(calls.query_map([src], |r| r.get::<_, i64>(0))?.flatten().filter(|x| !done.contains(x)));
+            }
+        }
+    }
+    out.sort_unstable();
+    out.dedup();
+    Ok(out)
 }
 
 /// Python: does class definition `n` name a base the index records no reference for (a call, a
@@ -1445,7 +1532,7 @@ pub fn index_project_with(c: &mut Connection, p: &Project, delta: Option<&crate:
         old_names(path, &mut sc_names)?;
         sc_paths.insert(path.clone());
         if !full && !bulk && is_py(path) {
-            cchange.py_self |= py_classes_changed(&tx, p.id, path, None)?;
+            py_old_classes(&tx, p.id, path, &mut cchange)?;
         }
         if !full && !bulk && is_c(path) {
             cchange.add(&c_type_rows_stored(&tx, p.id, path)?, &HashSet::new());
@@ -1476,7 +1563,7 @@ pub fn index_project_with(c: &mut Connection, p: &Project, delta: Option<&crate:
             }
             Work::Parse { path, lang, hash, size, mtime, parsed, texts, words } => {
                 if !full && !bulk && is_py(&path) {
-                    cchange.py_self |= !cchange.py_self && py_classes_changed(&tx, p.id, &path, Some(&parsed))?;
+                    py_old_classes(&tx, p.id, &path, &mut cchange)?;
                 }
                 if old.contains_key(&path) && !pre_dropped {
                     old_names(&path, &mut sc_names)?;
@@ -1924,6 +2011,8 @@ struct RefRow {
     recv_unique: bool,
     /// C++: the receiver is known to be outside the project (see [`CppRecv::External`]).
     recv_ext: bool,
+    /// C++: the receiver's type is in doubt (see [`CppRecv::Doubt`]).
+    recv_doubt: bool,
 }
 
 /// A C symbol a type path walks through: a struct member (field or function pointer), a
@@ -1948,6 +2037,9 @@ enum CppRecv {
     Class(String, bool),
     /// Known to be outside the project: no project method is called.
     External,
+    /// A qualified type naming no project class while classes of its last name exist (in other
+    /// namespaces): the name-based pick stands, as a guess.
+    Doubt,
     /// Cannot be told: the name-based guess stands.
     Unknown,
 }
@@ -1998,7 +2090,7 @@ impl CTypes {
         } else if matches!(s.kind.as_str(), "type" | "function") {
             self.named.entry(name.to_string()).or_default().push((s.kind, s.ty));
         } else if matches!(s.kind.as_str(), "class" | "struct" | "union") {
-            let full = if s.full_parent.is_empty() { name.to_string() } else { format!("{}.{name}", s.full_parent) };
+            let full = if s.full_parent.is_empty() { name.to_string() } else { format!("{}.{name}", s.full_parent.replace("::", ".")) };
             self.classes.entry(name.to_string()).or_default().push(full);
         } else if s.kind == "method" {
             self.methods.insert(name.to_string());
@@ -2080,12 +2172,30 @@ impl CTypes {
         let types = self.named.get(&last).into_iter().flatten().filter(|(k, _)| k == "type").count();
         let unique = fulls.len() == 1 && types == 0;
         if q.contains('.') {
-            let hits: Vec<&String> = fulls.iter().filter(|f| **f == q || f.ends_with(&format!(".{q}"))).collect();
+            // `absl::Status` also names `absl.lts.Status` (an inline namespace): the qualifier's
+            // namespaces appear in the class's, in order.
+            let qs: Vec<&str> = q.split('.').collect();
+            let fits = |f: &String| {
+                let fs: Vec<&str> = f.split('.').collect();
+                let mut at = 0;
+                fs.last() == qs.last()
+                    && qs[..qs.len() - 1].iter().all(|n| match fs[at..fs.len() - 1].iter().position(|x| x == n) {
+                        Some(i) => {
+                            at += i + 1;
+                            true
+                        }
+                        None => false,
+                    })
+            };
+            let hits: Vec<&String> = fulls.iter().filter(|f| fits(f)).collect();
             return match hits.as_slice() {
                 [one] => CppRecv::Class((*one).clone(), unique),
+                [] if !fulls.is_empty() => CppRecv::Doubt,
                 // A library namespace; any other may be an alias or a macro's the index does not
                 // follow (`namespace c = b;`): the name-based pick stands.
-                [] if types == 0 && CPP_LIB_NAMESPACES.contains(&q.split('.').next().unwrap_or("")) => CppRecv::External,
+                [] if fulls.is_empty() && types == 0 && CPP_LIB_NAMESPACES.contains(&q.split('.').next().unwrap_or("")) => {
+                    CppRecv::External
+                }
                 _ => CppRecv::Unknown,
             };
         }
@@ -2465,6 +2575,12 @@ fn stem_of(p: &str) -> &str {
 /// the number of same-name candidates a name-only guess chose between, 0 when the target is
 /// certain (same file, the only candidate, or the single best by scope).
 fn score(r: &RefRow, cands: &[Cand], imp: Option<&FileImports>) -> (i64, i64) {
+    let (d, a) = score_name(r, cands, imp);
+    // C++: a receiver type in doubt never makes the name-based pick certain.
+    if r.recv_doubt && d != 0 && a == 0 { (d, 2) } else { (d, a) }
+}
+
+fn score_name(r: &RefRow, cands: &[Cand], imp: Option<&FileImports>) -> (i64, i64) {
     let fam = lang::for_path(&r.path).map(|l| l.family).unwrap_or("");
     let call = r.kind == "call";
     // C++: a receiver outside the project calls no project method.
@@ -2723,6 +2839,7 @@ fn map_ref(r: &rusqlite::Row) -> rusqlite::Result<RefRow> {
         recv_ty: None,
         recv_unique: false,
         recv_ext: false,
+        recv_doubt: false,
     })
 }
 
@@ -3145,6 +3262,9 @@ pub fn resolve_scoped(tx: &Connection, pid: i64, scope: Option<(&HashSet<String>
 
 /// What changed in the C types of the files a run re-parsed or removed, so a scoped resolution
 /// also re-scores the member calls and stored functions whose type path passes through it.
+/// A Python class as resolution reads it: id, resolved bases (target, ambiguity), expression-base flag.
+type PyClass = (i64, Vec<(i64, i64)>, bool);
+
 #[derive(Default)]
 pub(crate) struct CChange {
     /// Functions whose return type changed (a path's `F:` base).
@@ -3155,9 +3275,13 @@ pub(crate) struct CChange {
     all: bool,
     /// C++ classes added or removed, by name: the type paths naming them read differently.
     classes: HashSet<String>,
-    /// Python classes changed (their bases or names): every call through `self`, `cls` or
-    /// `super()` may follow another method resolution order.
-    py_self: bool,
+    /// Python: the classes of re-parsed or removed files as stored before, by (path, name): id,
+    /// resolved bases, expression-base flag (see [`py_rescope`]).
+    py_old: HashMap<(String, String), Vec<PyClass>>,
+    /// Python files re-parsed or removed.
+    py_paths: HashSet<String>,
+    /// References to re-score besides the scope (see [`py_rescope`]).
+    extra: Vec<i64>,
 }
 
 /// One C file's type facts, as the store keeps them: (kind, name, container, type).
@@ -3413,8 +3537,15 @@ pub(crate) fn resolve_scoped_c(
                 let mut q = tx.prepare_cached("SELECT rowid, rtype FROM ts_ref WHERE project_id = ?1 AND rtype IS NOT NULL")?;
                 // C++ steps lead with their operator, and a type may be qualified (see
                 // [`cpp_chain`]): `S:ns::Engine` names the class `Engine`.
+                // A class added or removed may change any field step's type (a field of that
+                // class's name, in some namespace): every C++ path with a field step too.
+                let field_step = |t: &str| {
+                    let mut segs = t.split('|');
+                    segs.nth(1).is_some_and(|s| s.starts_with(['.', '>'])) && segs.next().is_some()
+                };
                 let touches = |t: &str| {
                     c.all
+                        || !c.classes.is_empty() && field_step(t)
                         || t.split('|').any(|seg| {
                             let name = seg.split_once(':').map_or(seg, |x| x.1).trim_start_matches(['.', '>']);
                             c.fields.contains(name) || c.classes.contains(name.rsplit("::").next().unwrap_or(name))
@@ -3427,17 +3558,7 @@ pub(crate) fn resolve_scoped_c(
                         .map(|x| x.0),
                 );
             }
-            if c.py_self {
-                let mut q = tx.prepare_cached(
-                    "SELECT rowid, path FROM ts_ref WHERE project_id = ?1 AND kind = 'call' AND via IN ('self', 'cls', 'super')",
-                )?;
-                rowids.extend(
-                    q.query_map([pid], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?)))?
-                        .flatten()
-                        .filter(|(_, p)| lang::for_path(p).is_some_and(|l| l.family == "python"))
-                        .map(|x| x.0),
-                );
-            }
+            rowids.extend(c.extra.iter().copied());
             rowids.sort_unstable();
             let mut one = tx.prepare_cached(&format!("SELECT {REF_COLS} FROM ts_ref WHERE rowid = ?1"))?;
             for id in rowids {
@@ -3610,6 +3731,7 @@ pub(crate) fn resolve_scoped_c(
                     refs[i].recv_unique = unique;
                 }
                 CppRecv::External => refs[i].recv_ext = true,
+                CppRecv::Doubt => refs[i].recv_doubt = true,
                 CppRecv::Unknown => {}
             }
         }
@@ -3681,6 +3803,7 @@ pub(crate) fn resolve_scoped_c(
         }
     }
     trace("resolve: refs written", t0);
+    let py_extra = if scope.is_some() { py_rescope(tx, pid, &refs, &scored, c)? } else { vec![] };
     let mut del = tx.prepare_cached("DELETE FROM edge WHERE src = ?1 AND dst = ?2 AND kind = ?3")?;
     let mut ins = tx.prepare_cached("INSERT OR IGNORE INTO edge(src, dst, kind, source, confidence) VALUES (?1,?2,?3,'treesitter',0.8)")?;
     match scope {
@@ -3719,6 +3842,17 @@ pub(crate) fn resolve_scoped_c(
                 }
             }
         }
+    }
+    // Python calls whose method resolution order a changed class may touch: a second pass, over
+    // what the first one stored.
+    if !py_extra.is_empty() {
+        let none = HashSet::new();
+        let more = CChange { extra: py_extra, ..Default::default() };
+        let r = resolve_scoped_c(tx, pid, Some((&none, &none)), &more)?;
+        out.rescored += r.rescored;
+        out.resolved += r.resolved;
+        out.precise += r.precise;
+        out.upgraded += r.upgraded;
     }
     Ok(out)
 }
@@ -3771,6 +3905,7 @@ mod via_tests {
             recv_ty: None,
             recv_unique: false,
             recv_ext: false,
+            recv_doubt: false,
         }
     }
 

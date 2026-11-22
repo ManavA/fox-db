@@ -2927,13 +2927,28 @@ fn cpp_unplaced_qualified_receivers_keep_the_name_pick() {
     ]);
     let out = fox_code(&p, "Real.start", "callers", 6000);
     assert!(row_of(&out, "f1").is_some() && row_of(&out, "f2").is_some(), "{out}");
-    // `std::` stays outside the project.
+    // `std::string` where only `mylib::string` exists: never certain.
     let (_h, _r, p) = inline_project(&[
         ("a.hpp", "namespace mylib { class string { public: int size() { return 0; } }; }\n"),
         ("u.cpp", "#include <string>\nint ext(std::string& s) { return s.size(); }\n"),
     ]);
     let out = fox_code(&p, "string.size", "callers", 6000);
-    assert!(row_of(&out, "ext").is_none(), "{out}");
+    not_certain(&out, "ext");
+    // A project that is the library: nested and inline namespaces still reach its classes.
+    let (_h, _r, p) = inline_project(&[
+        (
+            "a.hpp",
+            "namespace llvm::sys { class Path { public: void norm() {} }; }\nnamespace absl { inline namespace lts { class Status { public: void ok() {} }; } }\nnamespace fmt { class Buf { public: void ok() {} }; }\n",
+        ),
+        (
+            "u.cpp",
+            "#include \"a.hpp\"\nvoid f1(llvm::sys::Path& p) { p.norm(); }\nvoid f2(absl::Status& s) { s.ok(); }\nvoid f3(fmt::Buf& b) { b.ok(); }\n",
+        ),
+    ]);
+    for (sym, f) in [("Path.norm", "f1"), ("Status.ok", "f2"), ("Buf.ok", "f3")] {
+        let out = fox_code(&p, sym, "callers", 6000);
+        assert!(row_of(&out, f).is_some_and(|r| !r.contains("guess")), "{sym}: {out}");
+    }
 }
 
 /// C++: adding a class re-scores only the type paths that name it, not every member call.
@@ -2955,4 +2970,22 @@ fn cpp_new_class_rescores_only_paths_naming_it() {
     let inc = ref_snapshot(&c);
     tsindex::resolve(&c, p.id).unwrap();
     assert_eq!(ref_snapshot(&c), inc);
+}
+
+/// Python: a new class outside every hierarchy re-scores only its own calls, not every `self.`
+/// call of the project.
+#[test]
+fn python_lonely_class_rescores_little() {
+    let _g = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    let mut files: Vec<(String, String)> = vec![("root.py".into(), "class Root:\n    def m0(self):\n        return 0\n".into())];
+    for i in 0..30 {
+        files.push((format!("f{i}.py"), format!("from root import Root\n\n\nclass C{i}(Root):\n    def m1(self):\n        return self.m0()\n\n    def m2(self):\n        return self.m1()\n")));
+    }
+    let refs: Vec<(&str, &str)> = files.iter().map(|(a, b)| (a.as_str(), b.as_str())).collect();
+    let (_h, repo, p) = inline_project(&refs);
+    std::fs::write(repo.path().join("lonely.py"), "class Lonely:\n    def zz(self):\n        return 1\n").unwrap();
+    let mut c = db::open_rw().unwrap();
+    inventory::index_project(&mut c, &p).unwrap();
+    let st = tsindex::index_project(&mut c, &p).unwrap();
+    assert!(st.rescored < 10, "{}", st.rescored);
 }
