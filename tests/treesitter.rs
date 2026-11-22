@@ -2243,3 +2243,144 @@ fn typedef_with_disagreeing_definitions_keeps_members_fields() {
         .unwrap();
     assert_eq!(k, "field");
 }
+
+/// Python: `self.m()`, `cls.m()` and `super().m()` reach the method Python would run, by the
+/// calling class's method resolution order, diamonds and overriding subclasses included.
+#[test]
+fn python_calls_through_self_and_super_follow_the_mro() {
+    let _g = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    let (_h, _r, p) = inline_project(&[
+        (
+            "mro/a.py",
+            "class Base:\n    def step(self):\n        return 1\n\n\nclass Mixin:\n    def step(self):\n        return 2\n\n\nclass Child(Mixin, Base):\n    def run(self):\n        return self.step()\n\n\nclass Own(Mixin, Base):\n    def step(self):\n        return super().step()\n\n    def run(self):\n        return self.step()\n\n\nclass Grand(Own):\n    def go(self):\n        return self.step()\n",
+        ),
+        (
+            "mro/d.py",
+            "class A:\n    def hook(self):\n        return 0\n\n\nclass B(A):\n    def other(self):\n        return 1\n\n\nclass C(A):\n    def hook(self):\n        return 2\n\n\nclass D(B, C):\n    def run(self):\n        return self.hook()\n\n    def hook(self):\n        return super().hook()\n\n\nclass E(B, C):\n    def run(self):\n        return self.hook()\n\n    @classmethod\n    def make(cls):\n        return cls.hook(cls)\n",
+        ),
+    ]);
+    let id_of = |path: &str, line: i64| -> String {
+        let c = db::open_ro().unwrap();
+        let id: i64 = c
+            .query_row(
+                "SELECT id FROM node WHERE name = ?1 AND path = ?2 AND line = ?3",
+                rusqlite::params![if path.ends_with("a.py") { "step" } else { "hook" }, path, line],
+                |r| r.get(0),
+            )
+            .unwrap();
+        format!("c:{id:x}")
+    };
+    // Base.step (line 2): nothing in this hierarchy reaches it through Mixin.
+    let out = fox_code(&p, &id_of("mro/a.py", 2), "callers", 800);
+    assert!(out.contains("0 call sites"), "{out}");
+    // Mixin.step (line 7): Child.run, and Own's super() call.
+    let out = fox_code(&p, &id_of("mro/a.py", 7), "callers", 800);
+    assert!(out.contains("Child.run") && out.contains("Own.step") && !out.contains("Own.run") && !out.contains("Grand.go"), "{out}");
+    // Own.step (line 17): Own.run and the subclass Grand.go that does not override it.
+    let out = fox_code(&p, &id_of("mro/a.py", 17), "callers", 800);
+    assert!(out.contains("Own.run") && out.contains("Grand.go") && !out.contains("Child.run"), "{out}");
+    // Diamond: D(B, C) -> D, B, C, A. A.hook is never reached; C.hook is reached by E and by
+    // D's super() call.
+    let out = fox_code(&p, &id_of("mro/d.py", 2), "callers", 800);
+    assert!(out.contains("0 call sites"), "{out}");
+    let out = fox_code(&p, &id_of("mro/d.py", 12), "callers", 800);
+    assert!(out.contains("E.run") && out.contains("E.make") && out.contains("D.hook") && !out.contains("D.run"), "{out}");
+    let out = fox_code(&p, &id_of("mro/d.py", 20), "callers", 800);
+    assert!(out.contains("D.run"), "{out}");
+}
+
+/// Python method resolution order: mixins, `super()`, diamonds and overriding subclasses.
+const PY_MRO_FILES: &[(&str, &str)] = &[
+    ("pkg/__init__.py", ""),
+    ("pkg/base.py", "class Base:\n    def run(self):\n        return self.step()\n\n    def step(self):\n        return 1\n"),
+    ("pkg/mixins.py", "class Mixin:\n    def step(self):\n        return 2\n\n    def hook(self):\n        return 0\n"),
+    (
+        "pkg/child.py",
+        "from pkg.base import Base\nfrom pkg.mixins import Mixin\n\n\nclass Child(Mixin, Base):\n    def go(self):\n        return self.step()\n\n    def both(self):\n        return super().step()\n\n\nclass Leaf(Child):\n    def step(self):\n        return super().step() + 1\n\n    def deep(self):\n        return self.step()\n\n    def inherited(self):\n        return self.go()\n",
+    ),
+    (
+        "pkg/diamond.py",
+        "class A:\n    def f(self):\n        return 0\n\n\nclass B(A):\n    def f(self):\n        return 1\n\n\nclass C(A):\n    def f(self):\n        return 2\n\n\nclass D(B, C):\n    def g(self):\n        return self.f()\n",
+    ),
+    (
+        "pkg/skip.py",
+        "class Q:\n    def other(self):\n        return 0\n\n\nclass P:\n    def hook(self):\n        return 1\n\n\nclass R(Q, P):\n    def go(self):\n        return self.hook()\n",
+    ),
+];
+
+#[test]
+fn self_call_reaches_the_first_override_in_mro_order() {
+    let _g = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    let (_h, _r, p) = inline_project(PY_MRO_FILES);
+    let out = fox_code(&p, "Mixin.step", "callers", 6000);
+    assert!(rows(&out).contains("Child.go"), "Child(Mixin, Base).go calls Mixin.step: {out}");
+    let out = fox_code(&p, "Base.step", "callers", 6000);
+    assert!(!rows(&out).contains("Child.go"), "Mixin overrides it for Child: {out}");
+    assert!(rows(&out).contains("Base.run"), "{out}");
+}
+
+#[test]
+fn super_calls_follow_the_mro_after_the_current_class() {
+    let _g = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    let (_h, _r, p) = inline_project(PY_MRO_FILES);
+    let out = fox_code(&p, "Mixin.step", "callers", 6000);
+    assert!(
+        rows(&out).contains("Child.both") && rows(&out).contains("Leaf.step"),
+        "super() in Child and in Leaf both reach Mixin.step: {out}"
+    );
+    let out = fox_code(&p, "Base.step", "callers", 6000);
+    assert!(!rows(&out).contains("Child.both") && !rows(&out).contains("Leaf.step"), "{out}");
+}
+
+#[test]
+fn a_subclass_override_takes_its_own_self_calls() {
+    let _g = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    let (_h, _r, p) = inline_project(PY_MRO_FILES);
+    let out = fox_code(&p, "Leaf.step", "callers", 6000);
+    assert!(rows(&out).contains("Leaf.deep"), "{out}");
+    assert!(!rows(&out).contains("Child.go") && !rows(&out).contains("Leaf.inherited"), "{out}");
+    let out = fox_code(&p, "Mixin.step", "callers", 6000);
+    assert!(!rows(&out).contains("Leaf.deep"), "{out}");
+}
+
+#[test]
+fn diamond_inheritance_picks_the_left_base_first() {
+    let _g = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    let (_h, _r, p) = inline_project(PY_MRO_FILES);
+    let out = fox_code(&p, "B.f", "callers", 6000);
+    assert!(rows(&out).contains("D.g"), "{out}");
+    let out = fox_code(&p, "C.f", "callers", 6000);
+    assert!(!rows(&out).contains("D.g"), "{out}");
+    let out = fox_code(&p, "A.f", "callers", 6000);
+    assert!(!rows(&out).contains("D.g"), "{out}");
+}
+
+#[test]
+fn a_method_defined_only_further_along_the_mro_is_found() {
+    let _g = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    let (_h, _r, p) = inline_project(PY_MRO_FILES);
+    let out = fox_code(&p, "P.hook", "callers", 6000);
+    assert!(rows(&out).contains("R.go"), "{out}");
+    let out = fox_code(&p, "Mixin.hook", "callers", 6000);
+    assert!(!rows(&out).contains("R.go"), "{out}");
+}
+
+/// Python: a base the index cannot follow (a library class) ahead of the definition leaves the
+/// call to name resolution as a guess, never a certain call of the later base's method.
+#[test]
+fn python_unknown_base_before_the_definition_keeps_the_call_a_guess() {
+    let _g = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    let (_h, _r, p) = inline_project(&[
+        ("a.py", "class Base:\n    def step(self):\n        return 1\n"),
+        (
+            "b.py",
+            "from external import External\nfrom a import Base\n\n\nclass Ext(External, Base):\n    def go(self):\n        return self.step()\n",
+        ),
+        ("c.py", "from a import Base\n\n\nclass Known(object, Base):\n    def run(self):\n        return self.step()\n"),
+    ]);
+    let out = fox_code(&p, "Base.step", "callers", 6000);
+    let go = rows(&out).lines().find(|l| l.contains("Ext.go")).map(str::to_string);
+    assert!(go.as_deref().is_none_or(|l| l.contains("guess")), "{out}");
+    let run = rows(&out).lines().find(|l| l.contains("Known.run")).map(str::to_string);
+    assert!(run.as_deref().is_some_and(|l| !l.contains("guess")), "{out}");
+}

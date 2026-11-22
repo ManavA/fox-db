@@ -21,6 +21,7 @@
 (keyword_argument value: [(identifier) @name (attribute attribute: (identifier) @name)]) @reference.ref
 ; Base classes (`class A(Base)`, `class A(mod.Base)`): named supertypes.
 (class_definition superclasses: (argument_list [(identifier) @name (attribute attribute: (identifier) @name)])) @reference.implementation
+(class_definition superclasses: (argument_list (subscript value: [(identifier) @name (attribute attribute: (identifier) @name)]))) @reference.implementation
 ; `from json import loads as parse`: the name the file uses.
 (import_from_statement name: (aliased_import alias: (identifier) @name)) @reference.import
 

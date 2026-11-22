@@ -140,6 +140,10 @@ fn receiver_name(n: tree_sitter::Node, p: Option<tree_sitter::Node>, src: &[u8])
         r = p.named_child(0).filter(|c| c.id() != n.id());
     }
     let mut r = r?;
+    // Python `super().f()` and `super(Child, self).f()`: the receiver is the class's parent.
+    if r.kind() == "call" && r.child_by_field_name("function").and_then(|f| f.utf8_text(src).ok()) == Some("super") {
+        return Some(("super".to_string(), r.start_byte()));
+    }
     // A chain: its last name (`a.b` -> `b`).
     while r.named_child_count() > 0 && ["navigation", "member", "field", "selector", "attribute"].iter().any(|w| r.kind().contains(w)) {
         let last = r.named_child(r.named_child_count() as u32 - 1)?;
@@ -2219,6 +2223,200 @@ fn map_ref(r: &rusqlite::Row) -> rusqlite::Result<RefRow> {
     })
 }
 
+/// One class of a Python method resolution order: a project class, or a base the index cannot
+/// follow (a library's, a guess), which may define any name.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum MroEntry {
+    Class(i64),
+    Unknown,
+}
+
+/// Bases that define no method a call through `self` could reach.
+const PY_INERT_BASES: &[&str] = &["object", "Generic"];
+
+/// Python class hierarchy for method resolution: base classes in source order (as stored and
+/// as freshly scored), and each class's C3 linearization.
+struct Mro<'a> {
+    tx: &'a Connection,
+    /// Fresh (target, ambiguity) of the `impl` references scored in this run, by rowid.
+    fresh: HashMap<i64, (i64, i64)>,
+    /// A node's kind (`meta.k`).
+    kinds: HashMap<i64, Option<String>>,
+    /// Linearizations; None for a hierarchy C3 rejects (or a cycle).
+    lin: HashMap<i64, Option<Vec<MroEntry>>>,
+    open: HashSet<i64>,
+}
+
+impl Mro<'_> {
+    fn kind(&mut self, id: i64) -> Result<Option<String>> {
+        if let Some(k) = self.kinds.get(&id) {
+            return Ok(k.clone());
+        }
+        let k: Option<String> = self
+            .tx
+            .prepare_cached("SELECT json_extract(meta,'$.k') FROM node WHERE id = ?1 AND kind = 'symbol'")?
+            .query_row([id], |r| r.get(0))
+            .unwrap_or(None);
+        self.kinds.insert(id, k.clone());
+        Ok(k)
+    }
+
+    /// The bases class `k` names, in order: project classes, and [`MroEntry::Unknown`] for one
+    /// that is not (a library's) or whose link is a guess. `object` is left out.
+    fn bases(&mut self, k: i64) -> Result<Vec<MroEntry>> {
+        let rows: Vec<(i64, i64, i64, String)> = self
+            .tx
+            .prepare_cached("SELECT rowid, dst, amb, name FROM ts_ref WHERE src = ?1 AND src != 0 AND kind = 'impl' ORDER BY rowid")?
+            .query_map([k], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))?
+            .flatten()
+            .collect();
+        let mut out = vec![];
+        for (rowid, dst, amb, name) in rows {
+            let (dst, amb) = self.fresh.get(&rowid).copied().unwrap_or((dst, amb));
+            let e = if dst != 0 && amb <= 0 && dst != k && self.kind(dst)?.as_deref() == Some("class") {
+                MroEntry::Class(dst)
+            } else if PY_INERT_BASES.contains(&name.as_str()) {
+                continue;
+            } else {
+                MroEntry::Unknown
+            };
+            if !(matches!(e, MroEntry::Class(_)) && out.contains(&e)) {
+                out.push(e);
+            }
+        }
+        Ok(out)
+    }
+
+    /// Python's method resolution order of class `k` (C3; `k` first), an unknown base standing
+    /// for itself alone. None for a hierarchy C3 rejects (Python refuses it) or a cycle.
+    fn linearize(&mut self, k: i64) -> Result<Option<Vec<MroEntry>>> {
+        if let Some(l) = self.lin.get(&k) {
+            return Ok(l.clone());
+        }
+        if !self.open.insert(k) {
+            return Ok(None);
+        }
+        let bases = self.bases(k)?;
+        let mut seqs: Vec<Vec<MroEntry>> = vec![];
+        let mut ok = true;
+        for b in &bases {
+            match b {
+                MroEntry::Class(c) => match self.linearize(*c)? {
+                    Some(l) => seqs.push(l),
+                    None => ok = false,
+                },
+                MroEntry::Unknown => seqs.push(vec![MroEntry::Unknown]),
+            }
+        }
+        seqs.push(bases);
+        self.open.remove(&k);
+        let mut out = ok.then(|| vec![MroEntry::Class(k)]);
+        while out.is_some() {
+            seqs.retain(|s| !s.is_empty());
+            if seqs.is_empty() {
+                break;
+            }
+            // Unknown bases are told apart by position only: each one is its own entry, so
+            // the merge never holds one back for another.
+            let next = seqs.iter().map(|s| s[0]).find(|c| *c == MroEntry::Unknown || seqs.iter().all(|s| !s[1..].contains(c)));
+            let Some(c) = next else {
+                out = None;
+                break;
+            };
+            if let Some(o) = out.as_mut() {
+                o.push(c);
+            }
+            if c == MroEntry::Unknown {
+                // Only the first sequence it heads gives it up.
+                if let Some(s) = seqs.iter_mut().find(|s| s[0] == c) {
+                    s.remove(0);
+                }
+            } else {
+                for s in seqs.iter_mut() {
+                    if s[0] == c {
+                        s.remove(0);
+                    }
+                }
+            }
+        }
+        self.lin.insert(k, out.clone());
+        Ok(out)
+    }
+}
+
+/// Python: a call through `self`, `cls` or `super()` reaches the method Python would run: the
+/// first class of the calling class's method resolution order that defines it (`super()`: past
+/// the calling class itself), with certainty. Replaces the name-based pick, which cannot tell the
+/// classes of a hierarchy apart. A walk that meets a base the index cannot follow before a
+/// definition, or a hierarchy C3 rejects, leaves the name-based pick, except that `super().m()`
+/// never reaches a method of its own class; a `super()` call no project class of a fully known
+/// order defines stays unresolved.
+fn python_mro(tx: &Connection, refs: &[RefRow], cands: &HashMap<String, Vec<Cand>>, scored: &mut [(i64, i64, i64)]) -> Result<()> {
+    let todo: Vec<usize> = refs
+        .iter()
+        .enumerate()
+        .filter(|(_, r)| {
+            r.kind == "call"
+                && r.recv
+                && matches!(r.via.as_deref(), Some("self" | "cls" | "super"))
+                && lang::for_path(&r.path).is_some_and(|l| l.family == "python")
+        })
+        .map(|(i, _)| i)
+        .collect();
+    if todo.is_empty() {
+        return Ok(());
+    }
+    let fresh = refs.iter().zip(scored.iter()).filter(|(r, _)| r.kind == "impl").map(|(r, s)| (r.rowid, (s.0, s.1))).collect();
+    let mut m = Mro { tx, fresh, kinds: HashMap::new(), lin: HashMap::new(), open: HashSet::new() };
+    for i in todo {
+        let r = &refs[i];
+        // The nearest class around the call (a call in a function nested in a method too).
+        let mut class = None;
+        for &e in &r.enclosing {
+            if m.kind(e)?.as_deref() == Some("class") {
+                class = Some(e);
+                break;
+            }
+        }
+        let Some(class) = class else { continue };
+        let is_super = r.via.as_deref() == Some("super");
+        let own_pick = |scored: &[(i64, i64, i64)], all: &[Cand]| all.iter().any(|s| s.id == scored[i].0 && s.pid == class);
+        let all = cands.get(&r.name).map(Vec::as_slice).unwrap_or(&[]);
+        let Some(line) = m.linearize(class)? else {
+            if is_super && own_pick(scored, all) {
+                scored[i] = (0, 0, scored[i].2);
+            }
+            continue;
+        };
+        // Some(Some(def)): the method Python runs; Some(None): an unknown base comes first.
+        let mut found: Option<Option<&Cand>> = None;
+        for e in line.iter().skip(is_super as usize) {
+            match e {
+                MroEntry::Unknown => {
+                    found = Some(None);
+                    break;
+                }
+                MroEntry::Class(k) => {
+                    if let Some(s) = all.iter().find(|s| s.pid == *k && s.family == "python" && !s.local && is_callable_kind(&s.kind)) {
+                        found = Some(Some(s));
+                        break;
+                    }
+                }
+            }
+        }
+        match found {
+            Some(Some(s)) => scored[i] = (s.id, 0, scored[i].2),
+            Some(None) if is_super && own_pick(scored, all) => scored[i] = (0, 0, scored[i].2),
+            // The unknown base may define it: a certain pick past it is a guess.
+            Some(None) if scored[i].0 != 0 && scored[i].1 == 0 => scored[i].1 = 2,
+            Some(None) => {}
+            None if is_super => scored[i] = (0, 0, scored[i].2),
+            None => {}
+        }
+    }
+    Ok(())
+}
+
 /// What resolution did: references scored, and how many of those now have a target.
 #[derive(Debug, Default, Clone, Copy)]
 pub struct Resolved {
@@ -2664,6 +2862,8 @@ pub(crate) fn resolve_scoped_c(
         })
         .collect();
     trace("resolve: scored", t0);
+    python_mro(tx, &refs, &cands, &mut scored)?;
+    trace("resolve: python mro", t0);
     let mut out = Resolved { rescored: refs.len(), ..Default::default() };
     // 4. The precise tier: a fresh SCIP import overrides the name resolution where it knows the target.
     if crate::scip::active(tx, pid) {

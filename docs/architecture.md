@@ -29,6 +29,14 @@ members, and those whose type path passes through a field or function whose type
 type path when a typedef changed). A run that re-parses most of a big project drops the old rows
 in one pass per table and resolves everything again.
 
+**Python method resolution.** After name scoring, a Python call through `self`, `cls` or
+`super()` is re-targeted by the calling class's C3 linearization, built from the stored and
+freshly scored base-class references (`impl` rows), memoized per class in one resolve: the first
+class in that order (past the caller's own for `super()`) defining the name is the target, with
+certainty. A base the index cannot follow (a library class, a guessed link) is an unknown entry:
+a walk reaching it first leaves the name-based pick, as a guess when it was certain. A hierarchy
+C3 rejects is left to name scoring.
+
 **Change detection on big trees** (`walkcache`). A tree of at least 50,000 files keeps its last
 walk in `$FOXDB_HOME/walk/<project id>`: the directories it entered with their modification
 times (nanoseconds), the files in each with size and mtime, the notes on directories it left out,
