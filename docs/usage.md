@@ -58,6 +58,7 @@ cd ~/src/my-app && ~/.foxdb/bin/fox index .
 | `FOXDB_SESSION` | unset | Session id for CLI "already sent" references |
 | `FOXDB_CODEX_SESSIONS` | `~/.codex/sessions` | Codex rollouts for `fox ingest sessions` |
 | `[hooks] skip_agents` (config.toml) | `["egm-*", "*goldfish*", "*reviewer*"]` | Agents that get no SubagentStart brief |
+| `[hooks] swarm_board` (config.toml) | `false` | Add the swarm board protocol line to SubagentStart briefs ([multi-agent](multi-agent.md)) |
 | `[search] backend` (config.toml) | `fts5` | `fts5`: never use tantivy; `auto` (opt-in): a project with at least `tantivy_min_docs` rows gets a tantivy index, smaller ones keep FTS5 only; `tantivy`: every project. `[search.projects]` overrides it per project name. See [Big projects](#big-projects-tantivy-and-the-walk-record) |
 | `[search] tantivy_min_docs` (config.toml) | `1000000` | Rows a project needs before `auto` gives it a tantivy index |
 | `[search] writer_mb` (config.toml) | `64` | Indexing memory of `foxd`'s tantivy writer (one thread) |

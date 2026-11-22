@@ -21,9 +21,9 @@ For past decisions, handoffs and long logs: `fox_memory op=recall q=<words>`; `o
 
 ## Swarm protocol
 
-When several agents work one task, the board is their shared log.
+When several agents work one task, the board is their shared log. Subagent briefs restate these rules only when `[hooks] swarm_board = true` is set in foxdb's `config.toml`; they hold either way.
 
-1. **Read what is new before each new lead.** `fox_memory op=read since=me` (a subagent adds `agent=<its name>`: subagents share their parent's server), or `since=h:N` from the brief, then the `since=h:N` each read ends with.
+1. **Read what is new before each new lead.** `fox_memory op=read since=me` (a subagent adds `agent=<its name>`: subagents share their parent's server), or `since=h:N` from the `parent packet h:N` line of your brief, then the `since=h:N` each read ends with.
 2. **Post what you learn, as you learn it.** `op=post kind=fact` for a finding, `kind=failed` for an approach that did not work and why, `kind=question` for an open question. One claim per entry, under 600 characters.
 3. **Attach handles, not content.** `evidence=` takes handles (`f:1a`, `c:2b`, `h:3`) or paths; `fox_read` opens them. The files your parent already read are in your brief as handles: read the slice you need.
 4. **Return handles.** Your final answer becomes a report and a `summary` entry: findings with `path:line` and handles, not file contents.

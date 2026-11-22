@@ -1,5 +1,9 @@
 # Changelog
 
+## Unreleased
+
+- The SubagentStart brief no longer carries the swarm board protocol line by default: in A/B runs it gave parallel subagents nothing and cost more. `[hooks] swarm_board = true` in `config.toml` brings it back. The parent packet and parent read lines stay.
+
 ## 0.2.5 (2026-11-21)
 
 - C and C++ function-pointer struct members are indexed; a call through a member (`a_ops->bmap(...)`) resolves through the receiver's declared type to that member, never to a same-name global, and functions stored in members (`.bmap = ext4_bmap`) are dispatch targets for impact and overrides. On a Linux kernel benchmark, ops-table dispatch recall went from 0 to 1.0. Schema 24; C and C++ files re-parse once.

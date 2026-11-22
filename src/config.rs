@@ -86,6 +86,10 @@ pub struct Hooks {
     /// indexed definition or file, add its location (`fox hook user-prompt-submit`). Off unless set.
     #[serde(default)]
     pub prompt_context: bool,
+    /// SubagentStart: add the swarm board protocol line (read the board from the parent's
+    /// snapshot on, post fact/failed/question with handles). Off unless set.
+    #[serde(default)]
+    pub swarm_board: bool,
 }
 
 pub const DEFAULT_SKIP_AGENTS: &[&str] = &["egm-*", "*goldfish*", "*reviewer*"];

@@ -22,6 +22,8 @@ skip_agents = ["egm-*", "*goldfish*", "*reviewer*"]
 # file, add its location (`fox hook user-prompt-submit`). Both off by default.
 grep_context = false
 prompt_context = false
+# Add the swarm board protocol line to SubagentStart briefs (docs/multi-agent.md). Off by default.
+swarm_board = false
 
 # Full-text engine per project. "fts5" (default) never uses tantivy. "auto" (opt-in) gives a
 # project of at least tantivy_min_docs rows a tantivy index kept by foxd (builds with the tantivy

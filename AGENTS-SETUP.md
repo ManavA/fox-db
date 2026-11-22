@@ -88,6 +88,8 @@ skip_agents = ["egm-*", "*goldfish*", "*reviewer*"]
 # Opt-in tool hooks (step 6, "Search hooks"); each also needs its Claude Code hook entry.
 grep_context = false
 prompt_context = false
+# Restate the swarm board protocol in SubagentStart briefs (docs/multi-agent.md).
+swarm_board = false
 EOF
 cat ~/.foxdb/config.toml
 ```

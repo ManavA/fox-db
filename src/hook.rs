@@ -215,11 +215,11 @@ pub const SUBAGENT_BRIEF_CHARS: usize = 1_500;
 
 /// The brief for a subagent. It depends only on the project's index and board, never on the
 /// agent's id or task, so sibling subagents of one type get byte-identical text.
-fn subagent_start(input: &Value, h: Harness) -> Result<String> {
+fn subagent_start(cfg: &crate::config::Config, input: &Value, h: Harness) -> Result<String> {
     let agent_type = input["agent_type"].as_str().unwrap_or("");
     let agent_id = input["agent_id"].as_str().or_else(|| input["agent_name"].as_str()).unwrap_or("");
     let cwd = cwd_of(input);
-    if skip_agent_with(crate::config::get(), agent_type, agent_id, Some(&cwd)) {
+    if skip_agent_with(cfg, agent_type, agent_id, Some(&cwd)) {
         return Ok(String::new());
     }
     let loc = project::locate(&cwd);
@@ -233,8 +233,9 @@ fn subagent_start(input: &Value, h: Harness) -> Result<String> {
     // The savings and stale-memory lines are of no use to a helper.
     text = text.lines().filter(|l| !l.starts_with("fox saved") && !l.starts_with("stale memory:")).map(|l| format!("{l}\n")).collect();
     // A pointer to the parent's frozen board snapshot, not the live board: siblings started
-    // before and after a post still get the same bytes. The board protocol reads from that
-    // snapshot on; the subagent carries its own cursor (`since=h:N`), since subagents call
+    // before and after a post still get the same bytes. The board protocol (opt-in, `[hooks]
+    // swarm_board`: in A/B runs it cost parallel subagents more and gained nothing) reads from
+    // that snapshot on; the subagent carries its own cursor (`since=h:N`), since subagents call
     // through their parent's MCP server and share its identity.
     if let Ok(w) = db::open_rw()
         && let Some(sid) = input["session_id"].as_str().filter(|s| !s.is_empty())
@@ -243,10 +244,12 @@ fn subagent_start(input: &Value, h: Harness) -> Result<String> {
     {
         let h = crate::handoff::handle(h);
         text.push_str(&format!("parent packet {h} - open decisions/requests (fox_read target={h})\n"));
-        text.push_str(&format!(
-            "board: before each new lead, fox_memory op=read since={h}, then the since=h:N it ends with. \
+        if cfg.hooks.swarm_board {
+            text.push_str(&format!(
+                "board: before each new lead, fox_memory op=read since={h}, then the since=h:N it ends with. \
              Post fact|failed (approach, why)|question with agent=<your name>, evidence=handles, not content.\n"
-        ));
+            ));
+        }
     }
     const LAST: &str = "Final answer: findings and handles (path:line, s:/f:), not file contents; it is saved for the parent.\n";
     let cap = SUBAGENT_BRIEF_CHARS.min(h.cap_chars());
@@ -497,7 +500,7 @@ pub fn run_with(cfg: &crate::config::Config, event: &str, stdin: &str, h: Harnes
     }
     let r = match event {
         "session-start" => session_start(&input, h),
-        "subagent-start" => subagent_start(&input, h),
+        "subagent-start" => subagent_start(cfg, &input, h),
         "subagent-stop" => subagent_stop(&input, h),
         "pre-compact" => pre_compact(&input, h),
         // Opt-in (`[hooks] grep_context` / `prompt_context`): off, they print nothing.

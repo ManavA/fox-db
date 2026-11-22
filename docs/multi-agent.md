@@ -72,8 +72,8 @@ fox mem post <text> --topic T [--kind fact|failed|question]     fox mem read --s
 ## Swarm protocol
 
 Agents working one task share what they learn through the board, as an append-only log each
-reads incrementally (the design DeLM measured against native subagents). The rules every brief
-repeats:
+reads incrementally (the design DeLM measured against native subagents). The rules (the skill
+states them; subagent briefs repeat them only with `[hooks] swarm_board = true`, below):
 
 1. **Read what is new before each new lead**: `fox_memory op=read since=me`, or the `since=h:N`
    the brief gives and then the one each read ends with. Repeated reads return only new rows.
@@ -96,10 +96,20 @@ that row clipped and moves past it.
 
 ```
 parent packet h:30 - open decisions/requests (fox_read target=h:30)
-board: before each new lead, fox_memory op=read since=h:30, then the since=h:N it ends with. Post fact|failed (approach, why)|question with agent=<your name>, evidence=handles, not content.
 parent read (fox_read a handle, lines=a-b for a slice): f:1c src/search.rs, f:9 src/query.rs
 Final answer: findings and handles (path:line, s:/f:), not file contents; it is saved for the parent.
 ```
+
+With `swarm_board = true` under `[hooks]` in `config.toml` (`$FOXDB_HOME`, default `~/.foxdb`),
+a board line follows the parent packet line:
+
+```
+board: before each new lead, fox_memory op=read since=h:30, then the since=h:N it ends with. Post fact|failed (approach, why)|question with agent=<your name>, evidence=handles, not content.
+```
+
+It is off by default: in two A/B runs it gave parallel subagents no benefit and cost about a
+tenth more. The board itself works either way; agents that follow the skill's protocol still
+read and post.
 
 `h:30` is the parent's board snapshot, shared by siblings started together, so their briefs stay
 byte-identical. The `parent read` line lists indexed files the parent read (Claude Code `Read`

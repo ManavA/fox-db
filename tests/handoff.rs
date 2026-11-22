@@ -399,11 +399,12 @@ fn parent_transcript(dir: &Path, repo: &Path) -> std::path::PathBuf {
     p
 }
 
-/// The SubagentStart brief carries the board protocol (read posts after the parent's snapshot,
-/// post fact/failed/question with handles) and the handles of files the parent already read
-/// (from its transcript), never their content. Siblings still get the same bytes, within the cap.
+/// The SubagentStart brief carries the handles of files the parent already read (from its
+/// transcript), never their content, and the board protocol (read posts after the parent's
+/// snapshot, post fact/failed/question with handles) only with `[hooks] swarm_board = true`.
+/// Siblings get the same bytes, within the cap, with the option on or off.
 #[test]
-fn subagent_brief_has_the_board_protocol_and_the_parents_files_as_handles() {
+fn subagent_brief_has_the_parents_files_as_handles_and_the_board_protocol_only_when_asked() {
     let _g = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
     let (_h, repo, c, _p) = setup_ts();
     let tx = tempfile::tempdir().unwrap();
@@ -413,11 +414,25 @@ fn subagent_brief_has_the_board_protocol_and_the_parents_files_as_handles() {
             "agent_type": "worker", "transcript_path": t})
         .to_string()
     };
-    let a = hook::run("subagent-start", &input("a1"), hook::Harness::Claude);
-    let b = hook::run("subagent-start", &input("b2"), hook::Harness::Claude);
+    let ctx_of = |out: &str| {
+        let v: serde_json::Value = serde_json::from_str(out).unwrap();
+        v["hookSpecificOutput"]["additionalContext"].as_str().unwrap().to_string()
+    };
+    // Off by default: the parent packet and parent read lines, no board line.
+    let off = foxdb::config::Config::default();
+    let a = hook::run_with(&off, "subagent-start", &input("a1"), hook::Harness::Claude);
+    let b = hook::run_with(&off, "subagent-start", &input("b2"), hook::Harness::Claude);
     assert_eq!(a, b, "sibling briefs must be byte-identical");
-    let v: serde_json::Value = serde_json::from_str(&a).unwrap();
-    let ctx = v["hookSpecificOutput"]["additionalContext"].as_str().unwrap();
+    let plain = ctx_of(&a);
+    assert!(plain.contains("parent packet h:") && plain.contains("parent read"), "{plain}");
+    assert!(!plain.lines().any(|l| l.starts_with("board:")) && !plain.contains("since=h:"), "the board line is opt-in: {plain}");
+    // On: the board protocol, from the snapshot.
+    let on = foxdb::config::parse("[hooks]\nswarm_board = true\n");
+    let a = hook::run_with(&on, "subagent-start", &input("a1"), hook::Harness::Claude);
+    let b = hook::run_with(&on, "subagent-start", &input("b2"), hook::Harness::Claude);
+    assert_eq!(a, b, "sibling briefs must be byte-identical");
+    let ctx = ctx_of(&a);
+    let ctx = ctx.as_str();
     let snap = ctx.split_whitespace().find(|w| w.starts_with("h:")).unwrap();
     assert!(ctx.contains(&format!("since={snap}")), "board cursor from the snapshot: {ctx}");
     for want in ["fact", "failed", "question", "agent="] {
@@ -430,7 +445,7 @@ fn subagent_brief_has_the_board_protocol_and_the_parents_files_as_handles() {
     // Without a transcript the brief just leaves the line out.
     let bare =
         json!({"hook_event_name": "SubagentStart", "session_id": "s1", "cwd": repo.path(), "agent_id": "c3", "agent_type": "worker"});
-    let out = hook::run("subagent-start", &bare.to_string(), hook::Harness::Claude);
+    let out = hook::run_with(&on, "subagent-start", &bare.to_string(), hook::Harness::Claude);
     assert!(!out.contains("src/lib.rs") && out.contains("since=h:"), "{out}");
 }
 
