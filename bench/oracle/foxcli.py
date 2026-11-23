@@ -8,6 +8,7 @@ from dataclasses import dataclass
 HEAD = re.compile(r"^(callers|refs) of (\S+) (\S+) (.+?)\s+(\S+):(\d+)\s*$")
 ROW = re.compile(r"^  :(?P<lines>\d+(?:,\d+)*) (?P<who>.+?)(?: \| .*)?$")
 WHO = re.compile(r"^(?P<name>\(top\)|\S+?)(?: c:[0-9a-f]+)?(?P<guess> guess.*)?$")
+CUT = re.compile(r"^\+\d+ more \(answer cut\) · cursor=(\d+)\s*$", re.M)
 OUTLINE = re.compile(r"^(?P<ind> *)(?P<line>\d+) (?P<kind>\S+) (?P<name>.+?) c:[0-9a-f]+(?: \.\.(?P<end>\d+))?\s*$")
 
 
@@ -40,12 +41,22 @@ class Fox:
     def index(self, path: str) -> str:
         return self.run("index", path, "--quiet", "--no-global")
 
+    def code_all(self, *args: str) -> str:
+        """`fox code ARGS`, following `+N more (answer cut) · cursor=K` pages to the end."""
+        pages, cursor = [], None
+        while True:
+            out = self.run("code", *args, "--budget", "400000", *(["--cursor", cursor] if cursor else []))
+            m = CUT.search(out)
+            pages.append(out[: m.start()] if m else out)
+            if not m or m[1] == cursor:
+                return "".join(pages)
+            cursor = m[1]
+
     def graph(self, sym: str, rel: str) -> Graph:
-        out = self.run("code", sym, "--rel", rel, "--budget", "400000")
-        return parse_graph(out)
+        return parse_graph(self.code_all(sym, "--rel", rel))
 
     def outline(self, path: str) -> list:
-        return parse_outline(self.run("code", path, "--rel", "outline", "--budget", "400000"))
+        return parse_outline(self.code_all(path, "--rel", "outline"))
 
 
 def parse_graph(text: str) -> Graph:
@@ -100,15 +111,3 @@ def parse_outline(text: str) -> list:
 
 
 FN_KINDS = {"function", "method", "fn"}
-
-
-def enclosing(outline: list, line: int) -> Sym | None:
-    """Innermost function or method whose range holds `line`; a row without `..end` is one line."""
-    best = None
-    for s in outline:
-        end = s.line if s.end is None else s.end
-        if s.line <= line <= end and s.kind in FN_KINDS and (best is None or s.line >= best.line):
-            best = s
-    return best
-
-

@@ -2,24 +2,31 @@
 """Compiler-oracle tasks: ground truth for "who calls X" and "what stores X as a function value".
 
 For each target function it adds a parameter to the definition (and every declaration the
-compiler says conflicts), compiles every translation unit, and classifies each new diagnostic:
-`call` (too few arguments), `store` (the function used as a value: initializer, assignment,
-return, callback argument) or `other`. The source is restored afterwards, also on error.
+compiler says conflicts), compiles every unit of the build, and classifies each new diagnostic:
+`call` (too few arguments to the target), `store` (the target used as a value: initializer,
+assignment, return, callback argument) or `other`. Files are restored byte for byte afterwards,
+also on an exception, Ctrl-C, SIGTERM or SIGHUP.
 
-Only code the chosen build compiles counts: platform #ifdef branches, files the build skips and
-code that never names the function's type (a cast to void *) are invisible to the oracle.
+Targets, their definitions and every enclosing-function name come from the source and the
+compiler, never from fox: a C brace scan of the compiled units, a Rust brace scan, go/ast for Go
+(goast/main.go). Fox is only queried to be compared, and its sites in code the build does not
+compile (files outside the build, inactive #if branches, cfg'd-off Rust items) are counted apart.
 
-    # C: record the build's compile commands once, then run (no fox or git store is touched
-    # outside --fox-home, which must be scratch):
+Only code the chosen build compiles counts: other platforms' branches, files the build skips and
+code that never names the function's type (a cast to void *; in Rust `let g = S::foo;` with
+the fn item type inferred) are invisible to the oracle.
+
+    # C: record the build's compile commands once, then run (--fox-home must be scratch):
     make -j CC=$PWD/bench/oracle/cc_log.py ORACLE_COMPDB=/scratch/compdb.jsonl ORACLE_REAL_CC=gcc
     python3 bench/oracle/oracle.py c --repo /scratch/repo --compdb /scratch/compdb.jsonl \
         --fox-home /scratch/foxhome --out bench/private/oracle/repo --config "default make, gcc, Linux"
-    # Rust (one crate, `cargo check --all-targets`) and Go (`go vet ./...`):
+    # Rust workspace (`cargo check --workspace --all-targets`) and Go module (`go build`, `go test -c`):
     python3 bench/oracle/oracle.py rust --repo /scratch/crate --fox-home ... --out ...
     python3 bench/oracle/oracle.py go --repo /scratch/module --fox-home ... --out ...
 
 Outputs in --out: tasks.toml (callers-only and stores tasks with `expect`), oracle.json (every
-site), comparison.txt (fox callers and non-call refs against the oracle, per kind).
+site), comparison.txt (fox callers and non-call refs against the oracle, per kind, plus fox's
+misses on definitions).
 """
 
 import argparse
@@ -28,6 +35,7 @@ import json
 import os
 import random
 import re
+import signal
 import subprocess
 import sys
 import time
@@ -37,6 +45,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import diag  # noqa: E402
 import foxcli  # noqa: E402
+import scan  # noqa: E402
 
 MARK = "oracle_extra"
 
@@ -63,9 +72,11 @@ def _match(text: str, i: int, open_: str, close: str) -> int:
 
 def add_param(text: str, line: int, name: str, lang: str) -> str:
     """`text` with one parameter appended to the parameter list of `name` declared on `line`."""
-    starts = [0] + [m.end() for m in re.finditer("\n", text)]
+    starts = scan.line_starts(text)
+    if not 0 < line <= len(starts):
+        raise Skip(f"no line {line}")
     lo = starts[line - 1]
-    hi = starts[min(line + 3, len(starts) - 1)] if line + 3 < len(starts) else len(text)
+    hi = starts[line + 3] if line + 3 < len(starts) else len(text)
     m = re.compile(rf"\b{re.escape(name)}\b").search(text, lo, hi)
     if not m:
         raise Skip(f"{name} not on line {line}")
@@ -84,58 +95,138 @@ def add_param(text: str, line: int, name: str, lang: str) -> str:
         raise Skip("variadic")
     param = {"c": f"double {MARK}", "rust": f"_{MARK}: f64", "go": f"{MARK} float64"}[lang]
     s = inner.strip()
-    if lang == "c" and s in ("", "void"):
-        return text[: i + 1] + param + text[close:]
-    if s == "":
+    if s == "" or lang == "c" and s == "void":
         return text[: i + 1] + param + text[close:]
     if s.endswith(","):
         return text[:close] + param + text[close:]
     return text[:close] + ", " + param + text[close:]
 
 
+ACTIVE: list = []  # mutations not yet restored, for the signal handler
+
+
 class Mutation:
-    """Edits applied to files, undone by restore() (also on exceptions, via `with`)."""
+    """Edits to files under `root`, undone byte for byte by restore()."""
 
     def __init__(self, root: Path):
-        self.root, self.orig = root, {}
+        self.root, self.orig = root.resolve(), {}
 
     def edit(self, rel: str, line: int, name: str, lang: str):
-        p = self.root / rel
-        text = p.read_text(errors="surrogateescape")
-        self.orig.setdefault(rel, text)
-        p.write_text(add_param(text, line, name, lang), errors="surrogateescape")
+        p = (self.root / rel).resolve()
+        if not p.is_relative_to(self.root):
+            raise Skip(f"{rel} is outside the repo")
+        raw = p.read_bytes()
+        self.orig.setdefault(p, raw)
+        p.write_bytes(add_param(raw.decode("utf-8", "surrogateescape"), line, name, lang).encode("utf-8", "surrogateescape"))
 
     def restore(self):
-        for rel, text in self.orig.items():
-            (self.root / rel).write_text(text, errors="surrogateescape")
+        for p, raw in self.orig.items():
+            p.write_bytes(raw)
         self.orig = {}
 
     def __enter__(self):
+        ACTIVE.append(self)
         return self
 
     def __exit__(self, *a):
         self.restore()
+        ACTIVE.remove(self)
+
+
+def restore_on_signal(signum, _frame):
+    for m in list(ACTIVE):
+        m.restore()
+    raise SystemExit(128 + signum)
+
+
+def pool_map(fn, items, jobs: int) -> list:
+    """`fn` over `items` on threads; an interrupt cancels the queued calls."""
+    ex = cf.ThreadPoolExecutor(jobs)
+    try:
+        return list(ex.map(fn, items))
+    except BaseException:
+        ex.shutdown(wait=False, cancel_futures=True)
+        raise
+    finally:
+        ex.shutdown(wait=True)
 
 
 def leftovers(root: Path, exts: tuple) -> list:
     out = []
     for p in root.rglob("*"):
-        if p.suffix in exts and p.is_file():
-            try:
-                if MARK in p.read_text(errors="ignore"):
-                    out.append(str(p))
-            except OSError:
-                pass
+        if p.suffix in exts and p.is_file() and MARK.encode() in p.read_bytes():
+            out.append(str(p))
     return out
+
+
+def read(root: Path, rel: str) -> str:
+    try:
+        return (root / rel).read_bytes().decode("utf-8", "replace")
+    except OSError:
+        return ""
 
 
 # ---------- language back ends ----------
 
-class C:
+class Backend:
+    """Per language: compile, classify, the build's files and inactive lines, definitions, names."""
+
+    lang, exts = "", ()
+
+    def __init__(self, root: Path, jobs: int):
+        self.root, self.jobs = root.resolve(), jobs
+        self._defs: dict = {}
+        self._src: dict = {}
+
+    def rel(self, d: str, f: str) -> str:
+        return os.path.relpath(os.path.normpath(os.path.join(d, f)), self.root)
+
+    def text(self, rel: str) -> str:
+        if rel not in self._src:
+            self._src[rel] = read(self.root, rel)
+        return self._src[rel]
+
+    def defs_in(self, rel: str) -> list:
+        if rel not in self._defs:
+            self._defs[rel] = self.scan_defs(rel)
+        return self._defs[rel]
+
+    def enclosing(self, rel: str, line: int, d=None) -> str | None:
+        f = d.func_at(rel) if d is not None else None
+        if f:
+            return f
+        best = scan.innermost(self.defs_in(rel), line)
+        return best.name if best else None
+
+    def top_name(self, rel: str, line: int) -> str | None:
+        """The variable a file-scope initializer on `line` fills, or None."""
+        ls = self.text(rel).split("\n")
+        pat = {"c": r"([A-Za-z_]\w*)\s*(?:\[[^\]]*\]\s*)*=",
+               "rust": r"^(?:pub(?:\([^)]*\))?\s+)?(?:static|const)\s+(?:mut\s+)?([A-Za-z_]\w*)",
+               "go": r"^var\s+([A-Za-z_]\w*)"}[self.lang]
+        for i in range(min(line, len(ls)) - 1, -1, -1):
+            s = ls[i]
+            if s and not s[0].isspace() and s[0] not in "}#/*)":
+                m = re.search(pat, s)
+                return m[1] if m else None
+        return None
+
+    def in_macro_def(self, rel: str, line: int) -> bool:
+        return False
+
+    def inactive(self) -> tuple[set, dict]:
+        """(files the build compiles, file -> lines its configuration leaves out)."""
+        raise NotImplementedError
+
+    def local_only(self, d) -> bool:
+        return True
+
+
+class C(Backend):
     lang, exts = "c", (".c", ".h")
 
     def __init__(self, root: Path, compdb: Path, jobs: int):
-        self.root, self.jobs = root, jobs
+        super().__init__(root, jobs)
         seen, self.units = set(), []
         for raw in compdb.read_text().splitlines():
             e = json.loads(raw)
@@ -144,13 +235,13 @@ class C:
                 seen.add(k)
                 self.units.append(e)
 
-    def files(self) -> list:
+    def sources(self) -> list:
         return sorted({self.rel(e["directory"], e["file"]) for e in self.units})
 
-    def rel(self, d: str, f: str) -> str:
-        return os.path.relpath(os.path.normpath(os.path.join(d, f)), self.root)
+    def scan_defs(self, rel: str) -> list:
+        return scan.c_functions(self.text(rel))
 
-    def argv(self, e: dict) -> list:
+    def base_argv(self, e: dict) -> list:
         out, skip = [], False
         for a in e["arguments"]:
             if skip:
@@ -159,26 +250,33 @@ class C:
             if a in ("-o", "-MF", "-MT", "-MQ"):
                 skip = True
                 continue
-            if a in ("-c", "-MMD", "-MD", "-MP") or a.startswith("-Werror") and a != "-Werror=incompatible-pointer-types":
+            if a in ("-c", "-MMD", "-MD", "-MP") or a.startswith("-Werror"):
                 continue
             out.append(a)
-        return out + ["-fsyntax-only", "-fdiagnostics-plain-output", "-fmax-errors=0", "-Werror=incompatible-pointer-types"]
+        return out
 
     def _one(self, e: dict) -> list:
-        r = subprocess.run(self.argv(e), cwd=e["directory"], capture_output=True, text=True, errors="replace",
+        argv = self.base_argv(e) + ["-fsyntax-only", "-fdiagnostics-plain-output", "-fmax-errors=0",
+                                    "-Werror=incompatible-pointer-types"]
+        r = subprocess.run(argv, cwd=e["directory"], capture_output=True, text=True, errors="replace",
                            env=dict(os.environ, LC_ALL="C"))
         ds = diag.parse_gcc(r.stderr)
         for d in ds:
             d.file = self.rel(e["directory"], d.file)
             d.notes = [(self.rel(e["directory"], f), ln, c, m) for f, ln, c, m in d.notes]
+            d.exp = [(self.rel(e["directory"], f), ln) for f, ln in d.exp]
+            if d.ctx:
+                d.ctx = (self.rel(e["directory"], d.ctx[0]), d.ctx[1])
         return ds
 
     def compile(self) -> list:
-        with cf.ThreadPoolExecutor(self.jobs) as ex:
-            return [d for ds in ex.map(self._one, self.units) for d in ds]
+        return [d for ds in pool_map(self._one, self.units, self.jobs) for d in ds]
 
     def classify(self, d, name):
         return diag.classify_c(d, name)
+
+    def in_macro_def(self, rel: str, line: int) -> bool:
+        return scan.c_in_define(self.text(rel), line)
 
     def mutate(self, m: Mutation, name: str, path: str, line: int, base: set) -> list:
         m.edit(path, line, name, "c")
@@ -193,42 +291,104 @@ class C:
                 done.add((f, ln))
         raise Skip("declarations kept conflicting")
 
+    def _pp(self, e: dict) -> dict:
+        r = subprocess.run(self.base_argv(e) + ["-E"], cwd=e["directory"], capture_output=True, text=True,
+                           errors="replace", env=dict(os.environ, LC_ALL="C"))
+        return {self.rel(e["directory"], f): ls for f, ls in scan.preprocessed_lines(r.stdout, str(self.root)).items()}
 
-class Rust:
+    def inactive(self):
+        active = defaultdict(set)
+        for got in pool_map(self._pp, self.units, self.jobs):
+            for f, ls in got.items():
+                active[f] |= ls
+        files = {f for f in active if not f.startswith("..")}
+        return files, {f: scan.inactive_lines(self.text(f), active[f]) for f in files}
+
+
+class Rust(Backend):
     lang, exts = "rust", (".rs",)
 
     def __init__(self, root: Path, jobs: int):
-        self.root, self.jobs = root, jobs
+        super().__init__(root, jobs)
+        meta = subprocess.run(["cargo", "metadata", "--format-version", "1", "--no-deps"], cwd=root,
+                              capture_output=True, text=True, check=True)
+        self.target_dir = Path(json.loads(meta.stdout)["target_directory"])
+        self._files = None
 
-    def files(self) -> list:
-        return sorted(str(p.relative_to(self.root)) for p in self.root.rglob("*.rs") if "target" not in p.parts)
+    def scan_defs(self, rel: str) -> list:
+        return scan.rust_fns(self.text(rel))
+
+    def compiled(self) -> set:
+        """Source files in the dep-info (.d) files of the last check."""
+        if self._files is None:
+            out = set()
+            for d in (self.target_dir / "debug" / "deps").glob("*.d"):
+                for tok in re.split(r"(?<!\\)\s+", d.read_text(errors="replace")):
+                    tok = tok.rstrip(":").replace("\\ ", " ")
+                    if not tok.endswith(".rs"):
+                        continue
+                    rel = os.path.relpath(os.path.join(self.root, tok), self.root)
+                    if not rel.startswith(".."):
+                        out.add(rel)
+            self._files = out
+        return self._files
+
+    def sources(self) -> list:
+        return sorted(self.compiled())
 
     def compile(self) -> list:
         r = subprocess.run(["cargo", "check", "--workspace", "--all-targets", "--keep-going", "--message-format=json", "-q"],
                            cwd=self.root, capture_output=True, text=True)
         ds = diag.parse_rustc_json(r.stdout)
         for d in ds:
-            d.file = os.path.relpath(os.path.normpath(os.path.join(self.root, d.file)), self.root)
+            d.file = self.rel(str(self.root), d.file)
+            d.exp = [(self.rel(str(self.root), f), ln) for f, ln in d.exp]
         return ds
 
     def classify(self, d, name):
         return diag.classify_rust(d, name)
 
+    def in_macro_def(self, rel: str, line: int) -> bool:
+        return any(a <= line <= b for a, b in scan.rust_macro_defs(self.text(rel)))
+
     def mutate(self, m, name, path, line, base):
         m.edit(path, line, name, "rust")
         return [d for d in self.compile() if d.key() not in base]
 
+    def inactive(self):
+        files = self.compiled()
+        return files, {f: scan.rust_cfg_off(self.text(f)) for f in files}
 
-class Go:
+    def local_only(self, d) -> bool:
+        return not d.public and not d.trait
+
+
+class Go(Backend):
     lang, exts = "go", (".go",)
 
-    def __init__(self, root: Path, jobs: int):
-        self.root, self.jobs = root, jobs
-        r = subprocess.run(["go", "list", "./..."], cwd=root, capture_output=True, text=True, check=True)
-        self.pkgs = r.stdout.split()
+    def __init__(self, root: Path, jobs: int, out: Path):
+        super().__init__(root, jobs)
+        fmt = "{{.Dir}}|{{join .GoFiles \",\"}},{{join .CgoFiles \",\"}},{{join .TestGoFiles \",\"}},{{join .XTestGoFiles \",\"}}"
+        r = subprocess.run(["go", "list", "-f", fmt, "./..."], cwd=root, capture_output=True, text=True, check=True)
+        self.pkgs, files = [], set()
+        for ln in r.stdout.splitlines():
+            d, names = ln.split("|", 1)
+            self.pkgs.append(d)
+            files |= {os.path.relpath(os.path.join(d, n), self.root) for n in names.split(",") if n}
+        self.files = files
+        tool = out / "goast"
+        subprocess.run(["go", "build", "-o", str(tool), "."], cwd=Path(__file__).resolve().parent / "goast", check=True)
+        r = subprocess.run([str(tool), *sorted(files)], cwd=self.root, capture_output=True, text=True, check=True)
+        for ln in r.stdout.splitlines():
+            j = json.loads(ln)
+            q = f"{j['recv']}.{j['name']}" if j["recv"] else j["name"]
+            self._defs.setdefault(j["file"], []).append(scan.Def(q, j["name"], j["line"], j["end"], j["exported"]))
 
-    def files(self) -> list:
-        return sorted(str(p.relative_to(self.root)) for p in self.root.rglob("*.go"))
+    def sources(self) -> list:
+        return sorted(self.files)
+
+    def scan_defs(self, rel: str) -> list:
+        return []
 
     def _one(self, cmd: list) -> str:
         r = subprocess.run(cmd, cwd=self.root, capture_output=True, text=True)
@@ -240,13 +400,12 @@ class Go:
         cmds = [["go", "build", "-gcflags=-e", "./..."]]
         cmds += [["go", "test", "-c", "-o", os.devnull, "-gcflags=-e", p] for p in self.pkgs]
         seen, out = set(), []
-        with cf.ThreadPoolExecutor(self.jobs) as ex:
-            for text in ex.map(self._one, cmds):
-                for d in diag.parse_go(text):
-                    d.file = os.path.relpath(os.path.normpath(os.path.join(self.root, d.file)), self.root)
-                    if d.key() not in seen:
-                        seen.add(d.key())
-                        out.append(d)
+        for text in pool_map(self._one, cmds, self.jobs):
+            for d in diag.parse_go(text):
+                d.file = self.rel(str(self.root), d.file)
+                if d.key() not in seen:
+                    seen.add(d.key())
+                    out.append(d)
         return out
 
     def classify(self, d, name):
@@ -259,6 +418,12 @@ class Go:
             if diag.classify_go(d, name) == "call":
                 d.line = call_line((self.root / d.file).read_bytes(), d.line, d.col, name)
         return ds
+
+    def inactive(self):
+        return set(self.files), {}
+
+    def local_only(self, d) -> bool:
+        return not d.public
 
 
 def call_line(src: bytes, line: int, col: int, name: str) -> int:
@@ -289,267 +454,121 @@ def call_line(src: bytes, line: int, col: int, name: str) -> int:
     return best
 
 
-# ---------- naming sites ----------
-
-RUST_CHAR = re.compile(r"'(?:\\u\{[0-9a-fA-F]+\}|\\.|[^\\'\n])'")
-_blocks: dict = {}
-
-
-def rust_blocks(text: str) -> list:
-    """Per line (index 0 = line 1): the header of the innermost `{` block open at the line's start.
-    Skips comments, strings, raw strings and char literals."""
-    out, stack, seg, i, n = [""], [], 0, 0, len(text)
-    while i < n:
-        c = text[i]
-        if c == "\n":
-            out.append(stack[-1] if stack else "")
-        elif text.startswith("//", i):
-            i = text.find("\n", i) - 1 if text.find("\n", i) >= 0 else n
-        elif text.startswith("/*", i):
-            depth, i = 1, i + 2
-            while i < n and depth:
-                depth += text.startswith("/*", i) - text.startswith("*/", i)
-                if text[i] == "\n":
-                    out.append(stack[-1] if stack else "")
-                i += 2 if text.startswith(("/*", "*/"), i) else 1
-            continue
-        elif (m := re.compile(r'b?r(#*)"').match(text, i)) and (i == 0 or not (text[i - 1].isalnum() or text[i - 1] == "_")):
-            end = text.find('"' + m[1], m.end())
-            end = n if end < 0 else end + 1 + len(m[1])
-            out += [stack[-1] if stack else ""] * text.count("\n", i, end)
-            i = end
-            continue
-        elif c == '"':
-            j = i + 1
-            while j < n and text[j] != '"':
-                j += 2 if text[j] == "\\" else 1
-            out += [stack[-1] if stack else ""] * text.count("\n", i, j)
-            i = j + 1
-            continue
-        elif c == "'" and (m := RUST_CHAR.match(text, i)):
-            i = m.end()
-            continue
-        elif c == "{":
-            stack.append(" ".join(re.sub(r"//[^\n]*|/\*.*?\*/", "", text[seg:i], flags=re.S).split()))
-            seg = i + 1
-        elif c == "}":
-            if stack:
-                stack.pop()
-            seg = i + 1
-        elif c == ";":
-            seg = i + 1
-        i += 1
-    return out
-
-
-def rust_container(src: list, line: int) -> str:
-    """The `impl`, `trait` or `mod` header of the block holding a Rust fn on `line`, or ""."""
-    key = hash("\n".join(src))
-    if key not in _blocks:
-        _blocks[key] = rust_blocks("\n".join(src))
-    heads = _blocks[key]
-    head = heads[line - 1] if 0 < line <= len(heads) else ""
-    head = re.sub(r"^(?:#!?\[[^\]]*\]\s*)+", "", head)
-    return head if re.match(r"(?:pub(?:\([^)]*\))?\s+)?(?:unsafe\s+)?(?:impl|mod|trait)\b", head) else ""
-
-
-def skip_generics(s: str) -> str:
-    s = s.lstrip()
-    if not s.startswith("<"):
-        return s
-    depth = 0
-    for i, ch in enumerate(s):
-        depth += (ch == "<") - (ch == ">" and s[i - 1] != "-")
-        if depth == 0:
-            return s[i + 1 :]
-    return ""
-
-
-def qualify(lang: str, src: list, line: int, name: str) -> str:
-    """`name` as fox's graph names the definition on `line`: Type.name for a Go method, and for a
-    Rust fn in an impl, trait or mod, that container's name."""
-    here = src[line - 1] if 0 < line <= len(src) else ""
-    if lang == "go":
-        m = re.match(r"\s*func\s*\(\s*(?:\w+\s+)?\*?\s*(\w+)", here)
-        return f"{m[1]}.{name}" if m else name
-    if lang != "rust":
-        return name
-    head = rust_container(src, line)
-    m = re.match(r"(?:pub(?:\([^)]*\))?\s+)?(?:unsafe\s+)?(impl|mod|trait)\b(.*)", head)
-    if not m:
-        return name
-    rest = skip_generics(m[2]) if m[1] == "impl" else m[2]
-    rest = re.split(r"\bfor\b", rest)[-1]
-    ty = re.match(r"\s*(?:&\s*)?(?:dyn\s+)?(?:\w+::)*(\w+)", rest)
-    return f"{ty[1]}.{name}" if ty else name
-
-
-class Namer:
-    """Site -> enclosing function (fox outline), or the variable a file-scope initializer fills."""
-
-    def __init__(self, fox: foxcli.Fox, root: Path, lang: str):
-        self.fox, self.root, self.lang, self.cache, self.src = fox, root, lang, {}, {}
-
-    def lines(self, path: str) -> list:
-        if path not in self.src:
-            try:
-                self.src[path] = (self.root / path).read_text(errors="replace").splitlines()
-            except OSError:
-                self.src[path] = []
-        return self.src[path]
-
-    def code(self, path: str, line: int) -> str:
-        ls = self.lines(path)
-        return ls[line - 1].strip()[:140] if 0 < line <= len(ls) else ""
-
-    def top_var(self, path: str, line: int) -> str:
-        ls = self.lines(path)
-        for i in range(min(line, len(ls)) - 1, -1, -1):
-            s = ls[i]
-            if s and not s[0].isspace() and s[0] not in "}#/*":
-                m = re.search(r"([A-Za-z_]\w*)\s*(?:\[[^\]]*\]\s*)*=", s)
-                if m:
-                    return m[1]
-                break
-        return f"(top {Path(path).name})"
-
-    def name(self, path: str, line: int, compiler_func: str | None = None) -> str:
-        if compiler_func:
-            return compiler_func
-        if path not in self.cache:
-            self.cache[path] = self.fox.outline(path)
-        sym = foxcli.enclosing(self.cache[path], line)
-        return qualify(self.lang, self.lines(path), sym.line, sym.name) if sym else self.top_var(path, line)
-
-
 # ---------- targets ----------
 
-IDENT = re.compile(r"\b([A-Za-z_]\w*)\b\s*\(")
+def all_defs(be) -> dict:
+    """file -> definitions, over the source files the build compiles."""
+    return {f: be.defs_in(f) for f in be.sources() if not (be.lang == "c" and f.endswith(".h"))}
 
 
-def local_only(be, path: str, line: int, name: str) -> bool:
-    """Whether every user of the function compiles in the same unit as it does: Rust items that are
-    not plain `pub`, unexported Go functions. A broken crate or package hides its dependents."""
-    if be.lang == "c":
-        return True
-    if be.lang == "go":
-        return name[:1].islower()
-    src = (be.root / path).read_text(errors="ignore").splitlines()
-    text = src[line - 1] if 0 < line <= len(src) else ""
-    return not re.match(r"\s*pub(\s|$)", text)
-
-
-def in_trait(src: list, line: int) -> bool:
-    """Whether the Rust fn on `line` sits in a trait or a trait impl (`impl X for Y`), whose
-    signature the trait fixes."""
-    head = rust_container(src, line)
-    return bool(re.match(r"(?:unsafe\s+)?(?:impl\b.*\bfor\b|(?:pub(?:\([^)]*\))?\s+)?trait\b)", head))
-
-
-def defs_of(be, fox) -> dict:
-    """Query name -> [(path, line)] of function definitions in fox's outlines; methods as Type.name."""
-    defs = defaultdict(list)
-    for f in be.files():
-        if be.lang == "c" and f.endswith(".h"):
-            continue
-        src = (be.root / f).read_text(errors="ignore").splitlines()
-        for s in fox.outline(f):
-            if s.kind not in foxcli.FN_KINDS or be.lang == "rust" and in_trait(src, s.line):
-                continue
-            defs[qualify(be.lang, src, s.line, s.name)].append((f, s.line))
-    return defs
-
-
-def pick_targets(be, fox: foxcli.Fox, n: int, seed: int, lo: int, hi: int, log) -> list:
-    """Functions fox's graph gives `lo`..`hi` distinct callers; half of them with non-call refs in fox's graph."""
-    defs = defs_of(be, fox)
-    calls, macros = Counter(), set()
-    for f in be.files() + ([str(p.relative_to(be.root)) for p in be.root.rglob("*.h")] if be.lang == "c" else []):
-        try:
-            text = (be.root / f).read_text(errors="ignore")
-        except OSError:
-            continue
-        macros.update(re.findall(r"#\s*define\s+([A-Za-z_]\w*)", text))
-        calls.update(IDENT.findall(text))
-    pool = sorted(q for q, ds in defs.items() if len(ds) == 1 and q.split(".")[-1] not in macros
-                  and lo + 1 <= calls[q.split(".")[-1]] <= hi * 4 and len(q.split(".")[-1]) > 3
-                  and not q.split(".")[-1].startswith(("main", "test")) and local_only(be, *ds[0], q.split(".")[-1]))
-    random.Random(seed).shuffle(pool)
-    want = {True: n - n // 2, False: n // 2}
-    got = {True: [], False: []}
-    for q in pool:
-        if len(got[True]) >= want[True] and len(got[False]) >= n - min(len(got[True]), want[True]):
-            break
-        path, line = defs[q][0]
-        g = fox.graph(q, "callers")
-        if g.target != f"{path}:{line}":
-            continue
-        who = {(s.path, s.who) for s in g.sites}
-        if not lo <= len(who) <= hi:
-            continue
-        at = {(s.path, s.line) for s in g.sites} | {(path, line)}
-        values = len({(s.path, s.line) for s in fox.graph(q, "refs").sites} - at)
-        got[values > 0].append({"name": q, "path": path, "line": line, "fox_callers": len(who), "fox_value_refs": values})
-    # Half with non-call refs when the repo has them; the rest of the n from the other half.
-    picked = got[True][: want[True]]
-    picked += got[False][: n - len(picked)]
-    for t in picked:
-        log(f"target {t['name']} {t['path']}:{t['line']} fox callers={t['fox_callers']} non-call refs={t['fox_value_refs']}")
-    return picked
+def candidates(be, defs: dict, lo: int, hi: int, seed: int) -> tuple[list, list]:
+    """Shuffled unique definitions with lo..hi call-like mentions, split by whether the name is
+    also mentioned as a value. All counts come from the cleaned source, not from fox."""
+    by = defaultdict(list)
+    for f, ds in defs.items():
+        for d in ds:
+            if be.local_only(d):
+                by[d.name].append((f, d))
+    every = Counter(d.name for ds in defs.values() for d in ds)
+    calls, values, macros = Counter(), Counter(), set()
+    texts = list(defs) + ([str(p.relative_to(be.root)) for p in be.root.rglob("*.h")] if be.lang == "c" else [])
+    for f in texts:
+        t = be.text(f)
+        macros.update(re.findall(r"#\s*define\s+([A-Za-z_]\w*)", t))
+        cl = scan.clean(t, be.lang)
+        for m in re.finditer(r"(\.|->|::)?\b([A-Za-z_]\w*)\b(\s*\()?", cl):
+            if m[3]:
+                calls[m[2]] += 1
+            elif not m[1]:
+                values[m[2]] += 1
+    pool = sorted(q for q, xs in by.items() if len(xs) == 1 and every[q] == 1 and xs[0][1].bare not in macros
+                  and lo + 1 <= calls[xs[0][1].bare] <= 2 * hi + 1 and len(xs[0][1].bare) > 3
+                  and not xs[0][1].bare.startswith(("main", "test", "Test", "Benchmark")))
+    rng = random.Random(seed)
+    rng.shuffle(pool)
+    out = [{"name": q, "path": by[q][0][0], "line": by[q][0][1].line, "bare": by[q][0][1].bare} for q in pool]
+    return [t for t in out if values[t["bare"]] > 0], [t for t in out if values[t["bare"]] == 0]
 
 
 # ---------- oracle run ----------
 
-def run_oracle(be, targets: list, namer: Namer, log) -> list:
+def run_one(be, t: dict, base: set, log) -> dict | None:
     t0 = time.time()
-    base_diags = be.compile()
-    base = {d.key() for d in base_diags}
-    log(f"baseline: {len(base_diags)} diagnostics in {time.time() - t0:.0f}s")
-    results = []
-    for t in targets:
-        t0 = time.time()
-        bare = t["name"].split(".")[-1]
-        try:
-            with Mutation(be.root) as m:
-                ds = be.mutate(m, bare, t["path"], t["line"], base)
-        except Skip as e:
-            log(f"skip {t['name']}: {e}")
+    bare = t["bare"]
+    try:
+        with Mutation(be.root) as m:
+            ds = be.mutate(m, bare, t["path"], t["line"], base)
+    except Skip as e:
+        log(f"skip {t['name']}: {e}")
+        return None
+    sites, dropped = {}, []
+    for d in ds:
+        if d.sev not in ("error", "warning", "fatal error"):
             continue
-        sites = {}
-        for d in ds:
-            if d.sev not in ("error", "warning", "fatal error"):
-                continue
-            kind = be.classify(d, bare)
-            if kind == "decl":
-                continue
-            f, ln = d.site()
-            if (f, ln) == (t["path"], t["line"]):
-                continue
-            k = (f, ln)
-            prev = sites.get(k)
-            if prev and prev["kind"] != "other":
-                continue
-            sites[k] = {"path": f, "line": ln, "kind": kind, "msg": d.msg[:200],
-                        "func": namer.name(f, ln, d.func), "code": namer.code(f, ln)}
-        if not sites:
-            log(f"skip {t['name']}: the change broke nothing, so no caller (or the definition) compiles in this config")
+        kind = be.classify(d, bare)
+        if kind == "decl":
             continue
-        r = dict(t, sites=sorted(sites.values(), key=lambda s: (s["path"], s["line"])))
-        c = Counter(s["kind"] for s in r["sites"])
-        log(f"{t['name']}: {dict(c)} in {time.time() - t0:.0f}s")
-        results.append(r)
+        f, ln = d.site(be.in_macro_def)
+        if (f, ln) == (t["path"], t["line"]):
+            continue
+        prev = sites.get((f, ln))
+        if prev and prev["kind"] != "other":
+            continue
+        name = be.enclosing(f, ln, d)
+        via_macro = (f, ln) != (d.file, d.line)
+        if name is None and kind != "other":
+            name = None if via_macro else be.top_name(f, ln)
+            if name is None:
+                dropped.append(f"{f}:{ln} {kind} (file scope{' macro use' if via_macro else ''}, no item name)")
+                continue
+        sites[(f, ln)] = {"path": f, "line": ln, "kind": kind, "msg": d.msg[:200], "func": name or "(top)",
+                          "code": be.text(f).split("\n")[ln - 1].strip()[:140]}
+    for x in dropped:
+        log(f"  {t['name']}: dropped {x}")
+    r = dict(t, sites=sorted(sites.values(), key=lambda s: (s["path"], s["line"])), dropped=dropped)
+    c = Counter(s["kind"] for s in r["sites"])
+    log(f"{t['name']} {t['path']}:{t['line']}: {dict(c)} in {time.time() - t0:.0f}s")
+    return r
+
+
+def run_oracle(be, picks, n: int, lo: int, hi: int, base: set, log) -> list:
+    """Oracle on candidates until n targets with lo..hi calling functions (or any store); half of
+    them with stores when the candidates allow."""
+    with_val, without = picks
+    want_store, results, tried = n - n // 2, [], 0
+    for group, need_store in ((with_val, True), (without + with_val, False)):
+        for t in group:
+            if len(results) >= n or tried >= 6 * n or need_store and sum(1 for r in results if r["stores"]) >= want_store:
+                break
+            if any(r["name"] == t["name"] for r in results):
+                continue
+            tried += 1
+            r = run_one(be, t, base, log)
+            if r is None:
+                continue
+            callers = {(s["path"], s["func"]) for s in r["sites"] if s["kind"] == "call"}
+            r["stores"] = sum(1 for s in r["sites"] if s["kind"] == "store")
+            if not r["sites"]:
+                log(f"skip {t['name']}: the change broke nothing in this config")
+            elif (lo <= len(callers) <= hi or r["stores"]) and len(callers) <= hi:
+                results.append(r)
+            else:
+                log(f"skip {t['name']}: {len(callers)} calling functions")
     return results
 
 
 # ---------- fox vs oracle ----------
 
-def fox_sites(fox, namer, r) -> dict:
+def fox_sites(fox, be, r) -> dict:
     callers = fox.graph(r["name"], "callers")
     refs = fox.graph(r["name"], "refs")
     call_at = {(s.path, s.line) for s in callers.sites}
 
     def nm(s):
-        return namer.name(s.path, s.line) if s.who == "(top)" else s.who
+        if s.who != "(top)":
+            return s.who
+        inside = scan.innermost(be.defs_in(s.path), s.line)
+        return "(top)" if inside else (be.top_name(s.path, s.line) or "(top)")
 
     calls = {(s.path, s.line): (nm(s), s.guess) for s in callers.sites}
     vals = {(s.path, s.line): (nm(s), s.guess) for s in refs.sites if (s.path, s.line) not in call_at
@@ -563,56 +582,90 @@ def pr(tp, fp, fn) -> str:
     return f"precision {p} ({tp}/{tp + fp}), recall {rc} ({tp}/{tp + fn})"
 
 
-def compare(results, fox, namer, config: str) -> tuple[str, list]:
+def def_misses(be, fox, defs: dict) -> tuple[int, int, list]:
+    """Definitions the source scan finds that fox's outline of the same file lacks."""
+    total, missed = 0, []
+    for f, ds in defs.items():
+        if not ds:
+            continue
+        have = Counter(s.name for s in fox.outline(f) if s.kind in foxcli.FN_KINDS)
+        need = Counter(d.bare for d in ds)
+        total += sum(need.values())
+        for nm, k in need.items():
+            if have[nm] < k:
+                missed += [f"{f}:{d.line} {d.name}" for d in ds if d.bare == nm][: k - have[nm]]
+    return total, len(missed), missed
+
+
+def compare(results, fox, be, files: set, off: dict, config: str, defstat) -> str:
+    total, nmiss, missed = defstat
     out = [f"fox callers vs compiler oracle. Config: {config}.",
-           "Only code compiled in that config counts; sites the build skips are absent from the oracle.",
+           "Only code compiled in that config counts. Fox sites outside it are counted apart: `excluded (file)` for",
+           "files the build does not compile, `excluded (config)` for inactive #if branches (C, from gcc -E) or cfg'd-off",
+           "Rust items (heuristic: Linux x86_64, tests on, every feature on). They are neither hits nor false positives.",
            "call = fox `--rel callers` sites vs oracle too-few-argument sites.",
            "store = fox non-call refs (`--rel refs` minus callers) vs oracle function-pointer sites; fox non-call",
-           "refs that the oracle saw as `other` (comparisons, casts) count as neither hit nor miss.",
-           ""]
+           "refs at sites the oracle saw as `other` (comparisons, casts) count as neither.",
+           f"Definitions: fox's outline lacks {nmiss} of {total} function definitions the source scan finds"
+           f" ({nmiss / total:.1%})." if total else "Definitions: none scanned.", ""]
     tot = Counter()
     rows = []
     for r in results:
-        fs = fox_sites(fox, namer, r)
+        fs = fox_sites(fox, be, r)
         o_call = {(s["path"], s["line"]): s for s in r["sites"] if s["kind"] == "call"}
         o_store = {(s["path"], s["line"]): s for s in r["sites"] if s["kind"] == "store"}
         o_other = {(s["path"], s["line"]) for s in r["sites"] if s["kind"] == "other"}
-        f_call, f_val = fs["calls"], fs["values"]
         res = {}
-        for kind, o, f in (("call", o_call, f_call), ("store", o_store, {k: v for k, v in f_val.items() if k not in o_other})):
-            tp, fp, fn = len(o.keys() & f.keys()), len(f.keys() - o.keys()), len(o.keys() - f.keys())
+        for kind, o, f in (("call", o_call, fs["calls"]), ("store", o_store, {k: v for k, v in fs["values"].items() if k not in o_other})):
+            ex_file = {k for k in f if k not in o and k[0] not in files}
+            ex_cfg = {k for k in f if k not in o and k not in ex_file and k[1] in off.get(k[0], ())}
+            fk = set(f) - ex_file - ex_cfg
+            tp, fp, fn = len(fk & o.keys()), len(fk - o.keys()), len(o.keys() - fk)
             of = {(k[0], v["func"]) for k, v in o.items()}
-            ff = {(k[0], v[0]) for k, v in f.items()}
-            ftp, ffp, ffn = len(of & ff), len(ff - of), len(of - ff)
-            tot.update({f"{kind}_tp": tp, f"{kind}_fp": fp, f"{kind}_fn": fn,
-                        f"{kind}_ftp": ftp, f"{kind}_ffp": ffp, f"{kind}_ffn": ffn})
-            res[kind] = (tp, fp, fn, ftp, ffp, ffn, sorted(f.keys() - o.keys()), sorted(o.keys() - f.keys()), f, o)
+            ff = {(k[0], f[k][0]) for k in fk}
+            c = {"tp": tp, "fp": fp, "fn": fn, "ftp": len(of & ff), "ffp": len(ff - of), "ffn": len(of - ff),
+                 "exf": len(ex_file), "exc": len(ex_cfg), "gfp": sum(1 for k in fk - o.keys() if f[k][1])}
+            tot.update({f"{kind}_{k}": v for k, v in c.items()})
+            res[kind] = (c, f, o, fk, ex_file, ex_cfg)
         rows.append((r, fs, res))
-    out.append("TOTAL over %d targets" % len(results))
+    out.append(f"TOTAL over {len(results)} targets ({sum(1 for r in results if r['stores'])} with stores)")
     for kind in ("call", "store"):
-        out.append(f"  {kind} sites:     " + pr(tot[f'{kind}_tp'], tot[f'{kind}_fp'], tot[f'{kind}_fn']))
-        out.append(f"  {kind} functions: " + pr(tot[f'{kind}_ftp'], tot[f'{kind}_ffp'], tot[f'{kind}_ffn']))
+        g = lambda k: tot[f"{kind}_{k}"]  # noqa: E731
+        out.append(f"  {kind} sites:     {pr(g('tp'), g('fp'), g('fn'))}; fox sites excluded by config:"
+                   f" {g('exf')} (file not built), {g('exc')} (#if/cfg); false positives fox marks guess: {g('gfp')}")
+        out.append(f"  {kind} functions: {pr(g('ftp'), g('ffp'), g('ffn'))}")
+    dropped = sum(len(r["dropped"]) for r in results)
+    if dropped:
+        out.append(f"  file-scope macro uses with no item name, left out of both sides: {dropped}")
     out.append("")
     for r, fs, res in rows:
         out.append(f"== {r['name']}  {r['path']}:{r['line']}  (fox resolved {fs['resolved'] or 'nothing'})")
         for kind in ("call", "store"):
-            tp, fp, fn, ftp, ffp, ffn, fps, fns, f, o = res[kind]
-            if not (tp or fp or fn):
+            c, f, o, fk, ex_file, ex_cfg = res[kind]
+            if not (c["tp"] or c["fp"] or c["fn"] or ex_file or ex_cfg):
                 out.append(f"  {kind}: none either side")
                 continue
-            out.append(f"  {kind} sites: {pr(tp, fp, fn)}; functions: {pr(ftp, ffp, ffn)}")
-            for k in fps:
+            out.append(f"  {kind} sites: {pr(c['tp'], c['fp'], c['fn'])}; functions: {pr(c['ftp'], c['ffp'], c['ffn'])}")
+            code = lambda k: be.text(k[0]).split("\n")[k[1] - 1].strip()[:120]  # noqa: E731
+            for k in sorted(fk - o.keys()):
                 g = " (fox marks guess)" if f[k][1] else ""
-                out.append(f"    fox only  {k[0]}:{k[1]} {f[k][0]}{g} | {namer.code(*k)}")
-            for k in fns:
+                out.append(f"    fox only  {k[0]}:{k[1]} {f[k][0]}{g} | {code(k)}")
+            for k in sorted(o.keys() - fk):
                 out.append(f"    oracle only {k[0]}:{k[1]} {o[k]['func']} | {o[k]['code']}")
-            for k in sorted(o.keys() & f.keys()):
+            for k in sorted(ex_file):
+                out.append(f"    excluded (file not built) {k[0]}:{k[1]} {f[k][0]}")
+            for k in sorted(ex_cfg):
+                out.append(f"    excluded (#if/cfg) {k[0]}:{k[1]} {f[k][0]}")
+            for k in sorted(o.keys() & fk):
                 if o[k]["func"] != f[k][0]:
-                    out.append(f"    same site, fox names {f[k][0]}, compiler names {o[k]['func']}: {k[0]}:{k[1]}")
-        others = [s for s in r["sites"] if s["kind"] == "other"]
-        for s in others:
-            out.append(f"  other {s['path']}:{s['line']} {s['func']} | {s['msg'][:100]}")
-    return "\n".join(out) + "\n", rows
+                    out.append(f"    same site, fox names {f[k][0]}, source names {o[k]['func']}: {k[0]}:{k[1]}")
+        for s in r["sites"]:
+            if s["kind"] == "other":
+                out.append(f"  other {s['path']}:{s['line']} {s['func']} | {s['msg'][:100]}")
+        for x in r["dropped"]:
+            out.append(f"  dropped {x}")
+    out += ["", f"Definitions fox's outline lacks ({nmiss}):"] + [f"  {x}" for x in missed]
+    return "\n".join(out) + "\n"
 
 
 # ---------- tasks ----------
@@ -621,7 +674,7 @@ def q(s: str) -> str:
     return json.dumps(s, ensure_ascii=False)
 
 
-def tasks_toml(results, repo: str, config: str, lang: str) -> str:
+def tasks_toml(results, repo: str, config: str) -> str:
     where = f"Only code compiled in this build counts ({config}); ignore code the build does not compile."
     out = [f"# Compiler-oracle tasks generated by bench/oracle/oracle.py. {where}", f"repo = {q(repo)}", ""]
     for r in results:
@@ -674,7 +727,7 @@ def main():
     ap.add_argument("--out", type=Path, required=True)
     ap.add_argument("--config", default="", help="the build configuration, stated in every prompt")
     ap.add_argument("--task-repo", help="repo path written into tasks.toml (default --repo)")
-    ap.add_argument("--targets", help="comma-separated names instead of automatic picks")
+    ap.add_argument("--targets", help="comma-separated names (as the source scan names them) instead of picks")
     ap.add_argument("-n", type=int, default=20)
     ap.add_argument("--seed", type=int, default=1)
     ap.add_argument("--min-callers", type=int, default=3)
@@ -682,6 +735,8 @@ def main():
     ap.add_argument("--jobs", type=int, default=os.cpu_count() or 4)
     ap.add_argument("--no-index", action="store_true", help="skip `fox index` (store already current)")
     a = ap.parse_args()
+    for s in (signal.SIGTERM, signal.SIGHUP):
+        signal.signal(s, restore_on_signal)
     root = a.repo.resolve()
     a.out.mkdir(parents=True, exist_ok=True)
     logf = (a.out / "log.txt").open("a")
@@ -691,31 +746,39 @@ def main():
         logf.write(s + "\n")
         logf.flush()
 
-    be = {"c": lambda: C(root, a.compdb, a.jobs), "rust": lambda: Rust(root, a.jobs), "go": lambda: Go(root, a.jobs)}[a.lang]()
+    be = {"c": lambda: C(root, a.compdb, a.jobs), "rust": lambda: Rust(root, a.jobs),
+          "go": lambda: Go(root, a.jobs, a.out.resolve())}[a.lang]()
     left = leftovers(root, be.exts)
     if left:
         raise SystemExit(f"{MARK} already in {left[:5]}: restore these files first")
-    config = a.config or {"c": "compile commands in --compdb", "rust": "cargo check --all-targets", "go": "go vet ./..."}[a.lang]
+    config = a.config or {"c": "compile commands in --compdb", "rust": "cargo check --workspace --all-targets",
+                          "go": "go build and go test -c of every package"}[a.lang]
     fox = foxcli.Fox(a.fox, a.fox_home, str(root))
     if not a.no_index:
         log(fox.index(str(root)).strip())
-    namer = Namer(fox, root, a.lang)
+    t0 = time.time()
+    base_diags = be.compile()  # also refreshes Rust dep-info
+    base = {d.key() for d in base_diags}
+    log(f"baseline: {len(base_diags)} diagnostics in {time.time() - t0:.0f}s")
+    files, off = be.inactive()
+    log(f"build: {len(files)} files, {sum(len(v) for v in off.values())} lines left out by #if/cfg")
+    defs = all_defs(be)
     if a.targets:
-        targets = []
-        for nm in a.targets.split(","):
-            g = fox.graph(nm, "callers")
-            path, line = g.target.rsplit(":", 1)
-            targets.append({"name": nm, "path": path, "line": int(line), "fox_callers": len({(s.path, s.who) for s in g.sites})})
+        index = {d.name: (f, d) for f, ds in defs.items() for d in ds}
+        picks = ([{"name": nm, "path": index[nm][0], "line": index[nm][1].line, "bare": index[nm][1].bare}
+                  for nm in a.targets.split(",")], [])
     else:
-        targets = pick_targets(be, fox, a.n, a.seed, a.min_callers, a.max_callers, log)
-    results = run_oracle(be, targets, namer, log)
+        picks = candidates(be, defs, a.min_callers, a.max_callers, a.seed)
+        log(f"candidates: {len(picks[0])} named as values too, {len(picks[1])} only called")
+    results = run_oracle(be, picks, a.n, a.min_callers, a.max_callers, base, log)
     left = leftovers(root, be.exts)
     if left:
         log(f"WARNING: {MARK} left in {left}")
     meta = {"lang": a.lang, "config": config, "commit": head_commit(root), "fox": fox.run("--version").strip()}
     (a.out / "oracle.json").write_text(json.dumps({"meta": meta, "targets": results}, indent=1))
-    (a.out / "tasks.toml").write_text(tasks_toml(results, a.task_repo or str(a.repo), config, a.lang))
-    text, _ = compare(results, fox, namer, f"{config}; commit {meta['commit'][:12]}; {meta['fox']}")
+    (a.out / "tasks.toml").write_text(tasks_toml(results, a.task_repo or str(a.repo), config))
+    defstat = def_misses(be, fox, defs)
+    text = compare(results, fox, be, files, off, f"{config}; commit {meta['commit'][:12]}; {meta['fox']}", defstat)
     (a.out / "comparison.txt").write_text(text)
     print(text)
 

@@ -1,38 +1,43 @@
 """Parse compiler diagnostics and classify each error site against a mutated target.
 
-Kinds: `call` (a call now has too few arguments), `store` (the function is used as a value:
-stored, initialized, returned or passed as a function pointer), `other` (anything else new),
-`decl` (a declaration that conflicts with the mutated one; the mutator fixes these).
+Kinds: `call` (a call to the target now has too few arguments), `store` (the target used as a
+value: stored, initialized, returned or passed as a function pointer), `other` (anything else
+new), `decl` (a declaration that conflicts with the mutated one; the mutator fixes these).
 """
 
 import json
 import re
 from dataclasses import dataclass, field
 
-GCC_LINE = re.compile(r"^(?P<file>[^:\s][^:]*):(?P<line>\d+):(?P<col>\d+): (?P<sev>fatal error|error|warning|note): (?P<msg>.*)$")
+GCC_LINE = re.compile(r"^(?:(?P<file>[^:\s][^:]*):)?(?P<line>\d+):(?P<col>\d+): (?P<sev>fatal error|error|warning|note): (?P<msg>.*)$")
 GCC_CTX = re.compile(r"^(?P<file>[^:\s][^:]*): (?:In function [‘'](?P<fn>[^’']+)[’']|At top level):$")
+GCC_FILE = re.compile(r"^(?P<file>[^\s:]+)$")  # gcc 16 groups rows of one file under its name
 Q = "[‘’'`\"]"
 
 
 @dataclass
 class Diag:
-    file: str
+    file: str  # spelling location: where the code the compiler complains about is written
     line: int
     col: int
     sev: str
     msg: str
-    func: str | None = None  # enclosing function the compiler named, None at top level or unknown
     notes: list = field(default_factory=list)  # (file, line, col, msg)
+    exp: list = field(default_factory=list)  # macro expansion sites, innermost first
     code: str = ""  # rustc error code
     span_text: str = ""  # rustc: the source the primary span highlights
-    ctx: tuple | None = None  # gcc: the last "file: In function 'f':" line before it
+    ctx: tuple | None = None  # gcc: (file, function) of the last "In function" line before it
 
-    def site(self) -> tuple[str, int]:
-        """Where the code that breaks is written: the outermost macro expansion, else the primary."""
-        exp = [n for n in self.notes if n[3].startswith("in expansion of macro")]
-        if exp:
-            return exp[-1][0], exp[-1][1]
+    def site(self, in_macro_def=None) -> tuple[str, int]:
+        """The spelling location, or the outermost expansion when the spelling is inside a macro
+        definition (`in_macro_def(file, line)`); a call in a macro argument keeps its own line."""
+        if self.exp and in_macro_def is not None and in_macro_def(self.file, self.line):
+            return self.exp[-1]
         return self.file, self.line
+
+    def func_at(self, file: str) -> str | None:
+        """The function gcc said the diagnostic is in, when that context is in `file`."""
+        return self.ctx[1] if self.ctx and self.ctx[0] == file else None
 
     def key(self) -> tuple:
         return (self.file, self.line, self.col, self.sev, self.msg)
@@ -41,7 +46,7 @@ class Diag:
 def parse_gcc(text: str) -> list[Diag]:
     """gcc/clang text output (`-fdiagnostics-plain-output`): primaries with their notes."""
     out: list[Diag] = []
-    ctx: tuple[str, str | None] | None = None
+    ctx, cur = None, None
     for raw in text.splitlines():
         m = GCC_CTX.match(raw)
         if m:
@@ -49,26 +54,39 @@ def parse_gcc(text: str) -> list[Diag]:
             continue
         m = GCC_LINE.match(raw)
         if not m:
+            fm = GCC_FILE.match(raw)
+            if fm:
+                cur = fm["file"]
             continue
-        f, ln, col, sev, msg = m["file"], int(m["line"]), int(m["col"]), m["sev"], m["msg"]
+        f = m["file"] or cur
+        if f is None:
+            continue
+        cur = f
+        ln, col, sev, msg = int(m["line"]), int(m["col"]), m["sev"], m["msg"]
         if sev == "note":
             if out:
                 out[-1].notes.append((f, ln, col, msg))
+                if msg.startswith("in expansion of macro"):
+                    out[-1].exp.append((f, ln))
             continue
         out.append(Diag(f, ln, col, sev, msg, ctx=ctx))
-    for d in out:
-        sf, _ = d.site()
-        d.func = d.ctx[1] if d.ctx and d.ctx[0] == sf else None
     return out
 
 
+def _named(text: str, name: str) -> bool:
+    return re.search(rf"{Q}{re.escape(name)}{Q}", text) is not None
+
+
 def classify_c(d: Diag, name: str) -> str:
-    msg = d.msg
-    if re.search(rf"conflicting types for {Q}{re.escape(name)}{Q}", msg):
+    msg, n = d.msg, re.escape(name)
+    if re.search(rf"conflicting types for {Q}{n}{Q}", msg):
         return "decl"
-    if re.search(rf"too few arguments to function(?: call)?(?: {Q}{re.escape(name)}{Q})?", msg):
+    if re.search(rf"too few arguments to function {Q}{n}{Q}", msg):
         return "call"
-    if "incompatible pointer type" in msg or "incompatible function pointer type" in msg or "incompatible return type" in msg:
+    names_target = any(_named(nm[3], name) and "declared here" in nm[3] for nm in d.notes) or _named(msg, name)
+    if re.search(r"too few arguments to function call", msg) and names_target:
+        return "call"  # clang does not name the callee in the message
+    if names_target and re.search(r"incompatible (?:function )?pointer type|incompatible return type", msg):
         return "store"
     return "other"
 
@@ -99,23 +117,25 @@ def parse_rustc_json(text: str) -> list[Diag]:
         spans = [s for s in m.get("spans", []) if s.get("is_primary")]
         if not spans:
             continue
-        s = spans[0]
+        s, exp = spans[0], []
         while s.get("expansion") and s["expansion"].get("span"):
-            s = s["expansion"]["span"]  # macro use site
+            s = s["expansion"]["span"]
+            exp.append((s["file_name"], s["line_start"]))
+        p = spans[0]
+        piece = "\n".join(t.get("text", "")[t.get("highlight_start", 1) - 1 : t.get("highlight_end", 1) - 1]
+                          for t in p.get("text", []))
         code = (m.get("code") or {}).get("code") or ""
-        sn = (spans[0].get("text") or [{}])[0]
-        piece = sn.get("text", "")[sn.get("highlight_start", 1) - 1 : sn.get("highlight_end", 1) - 1]
-        out.append(Diag(s["file_name"], s["line_start"], s["column_start"], m["level"], m["message"], code=code,
-                        span_text=piece))
+        out.append(Diag(p["file_name"], p["line_start"], p["column_start"], m["level"], m["message"], exp=exp,
+                        code=code, span_text=piece))
     return out
 
 
 def classify_rust(d: Diag, name: str) -> str:
-    if d.code == "E0061":
+    named = re.search(rf"\b{re.escape(name)}\b", d.span_text) is not None
+    if d.code == "E0061" and named:
         return "call"
-    if d.code in ("E0308", "E0593", "E0631", "E0277", "E0618"):
-        if re.search(rf"(^|::|\b){re.escape(name)}\s*$", d.span_text.strip()):
-            return "store"
+    if d.code in ("E0308", "E0593", "E0631", "E0277", "E0618") and named:
+        return "store"
     return "other"
 
 
@@ -142,8 +162,9 @@ def parse_go(text: str) -> list[Diag]:
 
 
 def classify_go(d: Diag, name: str) -> str:
-    if d.msg.startswith("not enough arguments in call to"):
-        return "call"
-    if re.match(rf"cannot use {re.escape(name)}\b|cannot use [\w.]*\.{re.escape(name)}\b", d.msg) and "func(" in d.msg:
+    m = re.match(r"not enough arguments in call to (\S+)", d.msg)
+    if m:
+        return "call" if m[1].split(".")[-1] == name else "other"
+    if re.match(rf"cannot use (?:[\w.()*]*\.)?{re.escape(name)}\b", d.msg) and "func(" in d.msg:
         return "store"
     return "other"
