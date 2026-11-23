@@ -648,6 +648,8 @@ def main(argv: list | None = None) -> int:
         out.write(json.dumps(row) + "\n")
         out.flush()
         print(json.dumps(row))
+        for d in (cwd, work / f"{name}.home", work / f"{name}.agent"):
+            shutil.rmtree(d, ignore_errors=True)
     return 0
 
 
