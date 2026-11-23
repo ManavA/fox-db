@@ -334,3 +334,33 @@ fn c_alias_macro_edits_match_a_full_index() {
         ],
     );
 }
+
+/// Rust: calls through module paths, `Self`, `self` and macro arguments follow edits of the
+/// modules they name.
+#[test]
+fn rust_edits_match_a_full_index() {
+    let _g = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    let main = "mod db;\nmod util;\nfn main() {\n    db::open();\n    crate::util::help();\n    assert!(util::help());\n}\n";
+    check(
+        &[
+            ("src/main.rs", main),
+            (
+                "src/db.rs",
+                "pub fn open() {}\npub struct S;\nimpl S {\n    fn a(&self) {\n        self.b();\n        Self::c();\n    }\n    fn b(&self) {}\n    fn c() {}\n}\n",
+            ),
+            ("src/util.rs", "pub fn help() -> bool {\n    super::db::open();\n    true\n}\n"),
+        ],
+        &[
+            ("a second open elsewhere", &[("src/other.rs", Some("pub fn open() {}\npub fn help() -> bool {\n    false\n}\n"))]),
+            (
+                "move open",
+                &[(
+                    "src/db.rs",
+                    Some("pub struct S;\nimpl S {\n    fn a(&self) {\n        self.b();\n        Self::c();\n    }\n    fn c() {}\n}\n"),
+                )],
+            ),
+            ("b on another type", &[("src/other.rs", Some("pub fn open() {}\npub struct T;\nimpl T {\n    fn b(&self) {}\n}\n"))]),
+            ("rename the module", &[("src/util.rs", None), ("src/helpers.rs", Some("pub fn help() -> bool {\n    true\n}\n"))]),
+        ],
+    );
+}

@@ -78,6 +78,9 @@ pub struct Ref {
     /// (`T:inode|i_mapping|a_ops|bmap`); for a function stored in a member (`.bmap = ext4_bmap`),
     /// that member's path (`T:address_space_operations|bmap`). See [`c_chain`].
     pub rtype: Option<String>,
+    /// Rust: called through a path (`db::open_ro()`, `Self::new()`); `via` holds the path as
+    /// [`rust_qualifier`] reads it.
+    pub qual: bool,
     pos: usize,
 }
 
@@ -970,12 +973,14 @@ struct Walk<'t> {
     /// C++: the names template parameter lists of the file declare (`template <class T>`): no
     /// class a receiver's type may name.
     tparams: HashSet<String>,
+    /// Rust: the file's `use` declarations and `mod` items, in tree order.
+    rust_items: Vec<tree_sitter::Node<'t>>,
 }
 
 /// One top-down pass over the tree (see [`Walk`]). Linear in the tree size: ancestors are kept
 /// on a stack, never looked up with `parent()`, which walks down from the root on every call
 /// and made deeply nested functions (a long `else if` chain) quadratic.
-fn walk_tree<'t>(root: tree_sitter::Node<'t>, src: &[u8], c_lang: bool, cpp: bool) -> Walk<'t> {
+fn walk_tree<'t>(root: tree_sitter::Node<'t>, src: &[u8], c_lang: bool, cpp: bool, rust: bool) -> Walk<'t> {
     let cfam = c_lang || cpp;
     let mut parents: HashMap<usize, tree_sitter::Node<'t>> = HashMap::new();
     // Scope 0 is the file. (parent scope, declared names)
@@ -988,6 +993,7 @@ fn walk_tree<'t>(root: tree_sitter::Node<'t>, src: &[u8], c_lang: bool, cpp: boo
     let mut classes: Vec<(usize, String)> = vec![];
     let mut recv_class: HashMap<usize, String> = HashMap::new();
     let mut tparams: HashSet<String> = HashSet::new();
+    let mut rust_items: Vec<tree_sitter::Node<'t>> = vec![];
     // (start byte, innermost scope, name) of identifiers in value slots and receiver positions.
     let mut uses: Vec<(usize, usize, String)> = vec![];
     let mut anc: Vec<tree_sitter::Node> = vec![];
@@ -1016,6 +1022,9 @@ fn walk_tree<'t>(root: tree_sitter::Node<'t>, src: &[u8], c_lang: bool, cpp: boo
             && let Ok(t) = n.utf8_text(src)
         {
             tparams.insert(t.to_string());
+        }
+        if rust && matches!(n.kind(), "use_declaration" | "mod_item") {
+            rust_items.push(n);
         }
         if is_scope(n.kind(), cfam) {
             let parent = open.last().map_or(0, |o| o.1);
@@ -1108,7 +1117,7 @@ fn walk_tree<'t>(root: tree_sitter::Node<'t>, src: &[u8], c_lang: bool, cpp: boo
     if cpp {
         recv_types.retain(|_, t| !cpp_tparam(t, &tparams));
     }
-    Walk { locals, file_locals, parents, recv_types, recv_class, tparams }
+    Walk { locals, file_locals, parents, recv_types, recv_class, tparams, rust_items }
 }
 
 /// Is identifier `x` in a declaring position (a parameter or variable name, not a use)?
@@ -1215,7 +1224,9 @@ pub fn extract(l: &Lang, src: &[u8]) -> Parsed {
     let text = |n: tree_sitter::Node| n.utf8_text(src).unwrap_or("").to_string();
     let c_lang = l.name == "c";
     let cpp = l.name == "cpp";
-    let walk = walk_tree(tree.root_node(), src, c_lang, cpp);
+    let rust = l.name == "rust";
+    let walk = walk_tree(tree.root_node(), src, c_lang, cpp, rust);
+    let rust_scopes = if rust { rust_scopes(&walk.rust_items, src) } else { RustScopes::default() };
     let c_family = l.family == "c";
     // Python `@overload` stubs and property setters/deleters, by start byte: (name, scope node).
     let mut stubs: HashMap<usize, (String, usize)> = HashMap::new();
@@ -1326,6 +1337,7 @@ pub fn extract(l: &Lang, src: &[u8]) -> Parsed {
                     via: None,
                     recv_local: false,
                     rtype: None,
+                    qual: false,
                     pos: body.start_byte() + off,
                 });
                 stat = true;
@@ -1368,7 +1380,14 @@ pub fn extract(l: &Lang, src: &[u8]) -> Parsed {
             let recv = kind != "import" && has_receiver(nn, parent);
             let rv = if recv { receiver_name(nn, parent, src) } else { None };
             let recv_local = rv.as_ref().is_some_and(|(_, at)| walk.locals.contains(at));
-            let via = if kind == "import" { import_source(nn, &walk.parents, src) } else { rv.map(|x| x.0) };
+            let mut via = if kind == "import" { import_source(nn, &walk.parents, src) } else { rv.map(|x| x.0) };
+            // Rust: a call through a path (`db::open_ro()`) keeps the path, read from where it is.
+            let qual = rust && kind == "call" && recv && parent.is_some_and(|p| p.kind() == "scoped_identifier");
+            if qual {
+                let segs = parent.and_then(|p| p.child_by_field_name("path")).and_then(|q| rust_segments(q.utf8_text(src).ok()?));
+                let (mods, ty) = rust_place(nn, src);
+                via = segs.and_then(|s| rust_qualifier(&s, &mods, ty.as_deref(), &rust_scopes, 0));
+            }
             let rtype = match (c_lang, kind, parent) {
                 (true, "call", Some(p)) if recv && p.kind() == "field_expression" => c_chain(p, &walk, src, 0),
                 (true, "ref", Some(p)) => c_slot(nn, p, &walk, src),
@@ -1386,6 +1405,7 @@ pub fn extract(l: &Lang, src: &[u8]) -> Parsed {
                 via,
                 recv_local,
                 rtype,
+                qual,
                 pos: nn.start_byte(),
             });
         }
@@ -1460,6 +1480,187 @@ fn import_source(n: tree_sitter::Node, parents: &HashMap<usize, tree_sitter::Nod
         }
     }
     None
+}
+
+/// Rust: what a file's modules declare, for reading the paths of its calls. Each is keyed by the
+/// inline module it is in (`a::b` for `mod a { mod b { .. } }`, empty for the file's own module).
+#[derive(Default)]
+struct RustScopes {
+    /// The names `use` brings in, with the path each stands for (`use crate::db;` -> `db`:
+    /// `crate::db`), as written in that module.
+    uses: HashMap<(String, String), Vec<String>>,
+    /// Child modules (`mod db;`, `mod tests { .. }`).
+    mods: HashSet<(String, String)>,
+    /// Modules that take their parent's names (`use super::*;`).
+    glob_super: HashSet<String>,
+}
+
+/// Rust: the inline modules around `n`, outermost first, and the type of the impl or trait it is
+/// in (what `Self` names).
+fn rust_place(n: tree_sitter::Node, src: &[u8]) -> (Vec<String>, Option<String>) {
+    let (mut mods, mut ty) = (vec![], None);
+    let mut cur = n.parent();
+    while let Some(p) = cur {
+        match p.kind() {
+            "mod_item" => mods.extend(p.child_by_field_name("name").and_then(|x| x.utf8_text(src).ok()).map(str::to_string)),
+            "impl_item" if ty.is_none() => ty = p.child_by_field_name("type").and_then(|t| rust_type_name(t, src)),
+            "trait_item" if ty.is_none() => ty = p.child_by_field_name("name").and_then(|t| rust_type_name(t, src)),
+            _ => {}
+        }
+        cur = p.parent();
+    }
+    mods.reverse();
+    (mods, ty)
+}
+
+/// Rust: the last name of a type (`Vec<u8>` -> `Vec`, `a::Engine` -> `Engine`).
+fn rust_type_name(t: tree_sitter::Node, src: &[u8]) -> Option<String> {
+    match t.kind() {
+        "type_identifier" => t.utf8_text(src).ok().map(str::to_string),
+        "generic_type" => rust_type_name(t.child_by_field_name("type")?, src),
+        "scoped_type_identifier" => rust_type_name(t.child_by_field_name("name")?, src),
+        _ => None,
+    }
+}
+
+/// Rust: a path's names, generic arguments left out (`crate::a::Vec::<u8>` -> `crate`, `a`,
+/// `Vec`). None for a path through a qualified type (`<T as Tr>::f`) or a raw identifier.
+fn rust_segments(text: &str) -> Option<Vec<String>> {
+    if text.starts_with('<') {
+        return None;
+    }
+    let mut flat = String::new();
+    let mut depth = 0usize;
+    for ch in text.chars() {
+        match ch {
+            '<' => depth += 1,
+            '>' => depth = depth.saturating_sub(1),
+            c if depth == 0 && !c.is_whitespace() => flat.push(c),
+            _ => {}
+        }
+    }
+    let segs: Vec<String> = flat.split("::").filter(|s| !s.is_empty()).map(str::to_string).collect();
+    (!segs.is_empty() && segs.iter().all(|s| s.chars().all(|c| c.is_alphanumeric() || c == '_'))).then_some(segs)
+}
+
+/// Rust: the `use` declarations and `mod` items of a file (see [`RustScopes`]).
+fn rust_scopes(items: &[tree_sitter::Node], src: &[u8]) -> RustScopes {
+    let mut sc = RustScopes::default();
+    for n in items {
+        match n.kind() {
+            "mod_item" => {
+                if let Some(name) = n.child_by_field_name("name").and_then(|x| x.utf8_text(src).ok()) {
+                    sc.mods.insert((rust_place(*n, src).0.join("::"), name.to_string()));
+                }
+            }
+            "use_declaration" => {
+                if let Some(a) = n.child_by_field_name("argument") {
+                    let key = rust_place(*n, src).0.join("::");
+                    rust_use(a, &[], &key, src, &mut sc, 0);
+                }
+            }
+            _ => {}
+        }
+    }
+    sc
+}
+
+/// Rust: the names one `use` tree brings into module `key`, under path `prefix`.
+fn rust_use(n: tree_sitter::Node, prefix: &[String], key: &str, src: &[u8], sc: &mut RustScopes, depth: usize) {
+    if depth > 8 {
+        return;
+    }
+    let path = |x: Option<tree_sitter::Node>| -> Option<Vec<String>> {
+        let mut p = prefix.to_vec();
+        if let Some(x) = x {
+            p.extend(rust_segments(x.utf8_text(src).ok()?)?);
+        }
+        Some(p)
+    };
+    match n.kind() {
+        "use_as_clause" => {
+            if let (Some(p), Some(alias)) =
+                (path(n.child_by_field_name("path")), n.child_by_field_name("alias").and_then(|a| a.utf8_text(src).ok()))
+            {
+                sc.uses.insert((key.to_string(), alias.to_string()), p);
+            }
+        }
+        "scoped_use_list" => {
+            if let (Some(p), Some(list)) = (path(n.child_by_field_name("path")), n.child_by_field_name("list")) {
+                rust_use(list, &p, key, src, sc, depth + 1);
+            }
+        }
+        "use_list" => {
+            let mut w = n.walk();
+            for c in n.named_children(&mut w) {
+                rust_use(c, prefix, key, src, sc, depth + 1);
+            }
+        }
+        "use_wildcard" => {
+            if path(n.named_child(0)).is_some_and(|p| p == ["super"]) {
+                sc.glob_super.insert(key.to_string());
+            }
+        }
+        // `use a::{self}`: `a` itself.
+        "self" if !prefix.is_empty() => {
+            sc.uses.insert((key.to_string(), prefix[prefix.len() - 1].clone()), prefix.to_vec());
+        }
+        _ => {
+            if let Some(p) = path(Some(n))
+                && let Some(last) = p.last().filter(|l| !matches!(l.as_str(), "self" | "super" | "crate"))
+            {
+                sc.uses.insert((key.to_string(), last.clone()), p);
+            }
+        }
+    }
+}
+
+/// Rust: a call's path (its names before the called one) read from where it is written (inside
+/// inline modules `mods`, in an impl of `ty`), as a path from the file's own module:
+/// `crate::a` (from the crate root), `self::a` (from the file's module), `super::a` (one module up
+/// per `super`), `Self::T` (the impl's type), or as written when its first name comes from
+/// nothing the file declares (another crate, a glob import, a type of another module).
+fn rust_qualifier(segs: &[String], mods: &[String], ty: Option<&str>, sc: &RustScopes, depth: usize) -> Option<String> {
+    let join = |head: &str, a: &[String], b: &[String]| {
+        std::iter::once(head).chain(a.iter().map(String::as_str)).chain(b.iter().map(String::as_str)).collect::<Vec<_>>().join("::")
+    };
+    let first = segs.first()?;
+    match first.as_str() {
+        "crate" => Some(join("crate", &[], &segs[1..])),
+        "Self" => ty.map(|t| join("Self", &[t.to_string()], &segs[1..])),
+        "self" => Some(join("self", mods, &segs[1..])),
+        "super" => {
+            let ups = segs.iter().take_while(|s| *s == "super").count();
+            if ups <= mods.len() {
+                Some(join("self", &mods[..mods.len() - ups], &segs[ups..]))
+            } else {
+                let supers = vec!["super".to_string(); ups - mods.len() - 1];
+                Some(join("super", &supers, &segs[ups..]))
+            }
+        }
+        name => {
+            let mut m = mods.len();
+            loop {
+                let key = mods[..m].join("::");
+                if let Some(u) = sc.uses.get(&(key.clone(), name.to_string()))
+                    && depth < 4
+                    && u.first().is_some_and(|f| f != name)
+                {
+                    let mut full = u.clone();
+                    full.extend(segs[1..].iter().cloned());
+                    return rust_qualifier(&full, &mods[..m], ty, sc, depth + 1);
+                }
+                if sc.mods.contains(&(key.clone(), name.to_string())) {
+                    return Some(join("self", &mods[..m], segs));
+                }
+                if m > 0 && sc.glob_super.contains(&key) {
+                    m -= 1;
+                    continue;
+                }
+                return Some(segs.join("::"));
+            }
+        }
+    }
 }
 
 /// Dedupe definitions, link each to its innermost enclosing definition, and refs to theirs.
@@ -2157,8 +2358,14 @@ fn store_file(
     )?;
     for x in &p.refs {
         let src = x.caller.map(|i| ids[i]).unwrap_or(0);
-        // `recv` 2: through a receiver that is a parameter or local.
-        let recv = if x.recv_local { 2 } else { x.recv as i64 };
+        // `recv` 2: through a receiver that is a parameter or local; 3: through a Rust path.
+        let recv = if x.recv_local {
+            2
+        } else if x.qual {
+            3
+        } else {
+            x.recv as i64
+        };
         r.execute(params![pid, path, src, x.name, x.line, x.kind, recv, x.via, x.rtype])?;
     }
     Ok(())
@@ -2259,6 +2466,8 @@ struct RefRow {
     recv: bool,
     /// Through a receiver that is a parameter or local.
     recv_local: bool,
+    /// See [`Ref::qual`].
+    qual: bool,
     amb: i64,
     /// Container of the calling definition (-1 when unknown).
     caller_parent: i64,
@@ -2852,9 +3061,84 @@ fn stem_of(p: &str) -> &str {
 /// the number of same-name candidates a name-only guess chose between, 0 when the target is
 /// certain (same file, the only candidate, or the single best by scope).
 fn score(r: &RefRow, cands: &[Cand], imp: Option<&FileImports>) -> (i64, i64) {
+    let rust = r.kind == "call" && lang::for_path(&r.path).is_some_and(|l| l.family == "rust");
+    if rust && r.qual {
+        return rust_path_score(r, cands);
+    }
     let (d, a) = score_name(r, cands, imp);
     // C++: a receiver type in doubt never makes the name-based pick certain.
     if r.recv_doubt && d != 0 && a == 0 { (d, 2) } else { (d, a) }
+}
+
+/// Rust: a file's module as a path (`src/util/deep.rs` -> `src`, `util`, `deep`); `mod.rs`,
+/// `lib.rs` and `main.rs` are their directory's module.
+fn rust_mod_path(p: &str) -> Vec<&str> {
+    let mut v: Vec<&str> = p.strip_suffix(".rs").unwrap_or(p).split('/').collect();
+    if v.len() > 1 && matches!(v.last(), Some(&("mod" | "lib" | "main"))) {
+        v.pop();
+    }
+    v
+}
+
+/// Rust: a call through a path (see [`rust_qualifier`]) reaches the callables that path names:
+/// with certainty when the path pins one (from the crate root, the file's module, a type the
+/// file holds or `Self`); as a guess when only the path's ending matches (a module or type of
+/// that name elsewhere, which another crate may hold too); nothing when none matches (the
+/// standard library, another crate).
+fn rust_path_score(r: &RefRow, cands: &[Cand]) -> (i64, i64) {
+    let Some(via) = r.via.as_deref() else { return (0, 0) };
+    let segs: Vec<&str> = via.split("::").collect();
+    let here = rust_mod_path(&r.path);
+    // (form, the module path the qualifier names, the type it ends in)
+    let (form, mut path, ty): (&str, Vec<&str>, Option<&str>) = match segs[0] {
+        "crate" => ("crate", segs[1..].to_vec(), None),
+        "self" => ("rel", here.iter().copied().chain(segs[1..].iter().copied()).collect(), None),
+        "super" => {
+            let ups = segs.iter().take_while(|s| **s == "super").count();
+            if ups >= here.len() {
+                return (0, 0);
+            }
+            ("rel", here[..here.len() - ups].iter().copied().chain(segs[ups..].iter().copied()).collect(), None)
+        }
+        "Self" => ("self_ty", vec![], segs.get(1).copied()),
+        _ => ("bare", segs.clone(), None),
+    };
+    let ty = ty.or_else(|| path.last().copied().filter(|l| l.starts_with(|c: char| c.is_ascii_uppercase())));
+    if ty.is_some() && form != "self_ty" {
+        path.pop();
+    }
+    let (mut exact, mut loose) = (vec![], vec![]);
+    for s in cands.iter().filter(|s| s.family == "rust" && is_callable_kind(&s.kind)) {
+        let cm = rust_mod_path(&s.path);
+        let same = s.path == r.path;
+        let hit = match (form, ty) {
+            (_, Some(t)) if s.parent != t => None,
+            ("self_ty", _) => Some(same),
+            ("rel", Some(_)) => Some(cm == path || same && path.starts_with(&cm)),
+            ("rel", None) => Some(cm.iter().copied().chain(s.parent_full.split('.').filter(|x| !x.is_empty())).eq(path.iter().copied())),
+            ("crate", Some(_)) => Some(cm.ends_with(&path) && here.starts_with(&cm[..cm.len() - path.len()])),
+            ("crate", None) => {
+                let full: Vec<&str> = cm.iter().copied().chain(s.parent_full.split('.').filter(|x| !x.is_empty())).collect();
+                Some(full.len() >= path.len() && full.ends_with(&path) && here.starts_with(&full[..full.len() - path.len()]))
+            }
+            (_, Some(_)) => Some(path.is_empty() && same).filter(|x| *x).or_else(|| cm.ends_with(&path).then_some(false)),
+            _ => {
+                let full: Vec<&str> = cm.iter().copied().chain(s.parent_full.split('.').filter(|x| !x.is_empty())).collect();
+                full.ends_with(&path).then_some(false)
+            }
+        };
+        match hit {
+            Some(true) => exact.push(s.id),
+            Some(false) if form != "rel" && form != "crate" => loose.push(s.id),
+            _ => {}
+        }
+    }
+    match (exact.len(), loose.len()) {
+        (1, _) => (exact[0], 0),
+        (0, 0) => (0, 0),
+        (0, n) => (loose[0], n as i64),
+        (n, _) => (exact[0], n as i64),
+    }
 }
 
 fn score_name(r: &RefRow, cands: &[Cand], imp: Option<&FileImports>) -> (i64, i64) {
@@ -3107,6 +3391,7 @@ fn map_ref(r: &rusqlite::Row) -> rusqlite::Result<RefRow> {
         dst: r.get(5)?,
         recv: r.get::<_, i64>(6)? != 0,
         recv_local: r.get::<_, i64>(6)? == 2,
+        qual: r.get::<_, i64>(6)? == 3,
         amb: r.get(7)?,
         caller_parent: -1,
         caller_type: String::new(),
@@ -4202,6 +4487,7 @@ mod via_tests {
             dst: 0,
             recv: true,
             recv_local: false,
+            qual: false,
             amb: 0,
             caller_parent: -1,
             caller_type: String::new(),

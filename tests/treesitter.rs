@@ -3247,3 +3247,56 @@ fn c_calls_through_an_alias_macro_reach_its_target() {
     let out = fox_code(&p, "abbrev_branch", "callers", 6000);
     assert!(rows(&out).contains(":4 show c:"), "{out}");
 }
+
+/// `func`'s call is credited to the target with certainty.
+fn sure(out: &str, func: &str) {
+    assert!(row_of(out, func).is_some_and(|r| !r.contains("guess")), "{func} must be certain: {out}");
+}
+
+const RUST_MODS: &[(&str, &str)] = &[
+    ("Cargo.toml", "[package]\nname = \"x\"\n"),
+    (
+        "src/main.rs",
+        "mod db;\nmod util;\nfn main() {\n    db::open_ro();\n    crate::util::helper();\n    self::local();\n    std::fs::read(\"x\");\n}\nfn local() {}\n",
+    ),
+    (
+        "src/db.rs",
+        "pub fn open_ro() {}\npub fn open_rw() {\n    super::local();\n}\npub struct Store;\nimpl Store {\n    pub fn new() -> Store {\n        Self::make()\n    }\n    fn make() -> Store {\n        Store\n    }\n}\n",
+    ),
+    ("src/util/mod.rs", "pub mod deep;\npub fn helper() {}\n"),
+    (
+        "src/util/deep.rs",
+        "use crate::db;\nuse crate::db::Store;\npub fn go() {\n    db::open_ro();\n    super::helper();\n    super::super::local();\n    Store::new();\n}\n#[cfg(test)]\nmod tests {\n    #[test]\n    fn t() {\n        super::go();\n    }\n}\n",
+    ),
+    (
+        "src/other.rs",
+        "pub fn open_ro() {}\npub fn helper() {}\npub fn go() {}\npub fn local() {}\npub fn new() {}\npub fn make() {}\npub fn read() {}\n",
+    ),
+];
+
+/// Rust: a path-qualified call (`db::open_ro()`, `crate::util::helper()`, `super::f()`,
+/// `self::f()`, `Self::make()`, `Store::new()`) reaches the item its module path names, with
+/// certainty when the path pins it; a path into the standard library reaches nothing.
+#[test]
+fn rust_path_qualified_calls_follow_the_module_tree() {
+    let _g = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    let (_h, _r, p) = inline_project(RUST_MODS);
+    let callers = |path: &str, name: &str| fox_code(&p, &c_sym(&p, path, name), "callers", 6000);
+    let out = callers("src/db.rs", "open_ro");
+    sure(&out, "main");
+    sure(&out, "go");
+    let out = callers("src/util/mod.rs", "helper");
+    sure(&out, "main");
+    sure(&out, "go");
+    let out = callers("src/main.rs", "local");
+    sure(&out, "main");
+    sure(&out, "open_rw");
+    sure(&out, "go");
+    sure(&callers("src/util/deep.rs", "go"), "tests.t");
+    sure(&callers("src/db.rs", "new"), "go");
+    sure(&callers("src/db.rs", "make"), "Store.new");
+    for name in ["open_ro", "helper", "go", "local", "new", "make", "read"] {
+        let out = callers("src/other.rs", name);
+        assert!(rows(&out).is_empty(), "{name}: {out}");
+    }
+}

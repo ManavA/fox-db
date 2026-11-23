@@ -53,6 +53,16 @@
     function: (field_expression
         field: (field_identifier) @name)) @reference.call
 
+; A call through a path (`db::open_ro()`, `Self::new()`), also with generic arguments
+; (`f::<T>()`, `x.collect::<T>()`).
+(call_expression
+    function: (scoped_identifier
+        name: (identifier) @name)) @reference.call
+
+(call_expression
+    function: (generic_function
+        function: [(identifier) @name (scoped_identifier name: (identifier) @name) (field_expression field: (field_identifier) @name)])) @reference.call
+
 (macro_invocation
     macro: (identifier) @name) @reference.call
 
