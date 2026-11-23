@@ -256,16 +256,13 @@ fn ends_complete(out: &str) -> bool {
 }
 
 /// A line naming the target inside another same-name definition with no reference row (a Rust
-/// macro argument) is unresolved, not part of that definition.
+/// function named as a value) is unresolved, not part of that definition.
 #[test]
 fn lines_without_a_reference_inside_same_name_definitions_are_unresolved() {
     let _g = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
     let (_h, _r, p) = inline_project(&[
         ("Cargo.toml", "[package]\nname=\"rs4\"\nversion=\"0.1.0\"\n"),
-        (
-            "src/main.rs",
-            "mod inner;\n\nfn plan() -> i32 {\n    println!(\"{}\", inner::plan());\n    2\n}\n\nfn main() {\n    let _ = plan();\n}\n",
-        ),
+        ("src/main.rs", "mod inner;\n\nfn plan() -> i32 {\n    let _f = inner::plan;\n    2\n}\n\nfn main() {\n    let _ = plan();\n}\n"),
         ("src/inner.rs", "pub fn plan() -> i32 {\n    1\n}\n"),
     ]);
     let out = fox_code(&p, "inner.plan", "callers", 2000);
@@ -285,7 +282,7 @@ fn multi_line_strings_do_not_open_comments() {
         ),
     ]);
     let out = fox_code(&p, "plan", "callers", 2000);
-    assert!(!out.contains("comment") && out.contains("src/main.rs:9 "), "{out}");
+    assert!(!out.contains("comment") && out.contains("  :9 main c:"), "{out}");
     let (_h, _r, p) = inline_project(&[
         (
             "Outer.kt",

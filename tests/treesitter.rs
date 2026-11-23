@@ -3329,3 +3329,18 @@ fn rust_receiver_calls_of_unknown_type_are_guesses() {
     sure(&fox_code(&p, "A.go", "callers", 6000), "A.run");
     not_certain(&fox_code(&p, "B.go", "callers", 6000), "A.run");
 }
+
+/// Rust: calls inside macro arguments (`debug_assert!(self.multi_line())`, `assert_eq!(f(1), 1)`)
+/// are calls; a `macro_rules!` body is no caller.
+#[test]
+fn rust_calls_inside_macro_arguments_are_calls() {
+    let _g = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    let (_h, _r, p) = inline_project(&[(
+        "src/p.rs",
+        "pub struct P;\nimpl P {\n    fn multi_line(&self) -> bool {\n        true\n    }\n    fn sink(&self) {\n        debug_assert!(self.multi_line());\n        assert_eq!(helper(1), 1, \"{}\", self.multi_line());\n        let v = vec![crate::p::helper(2)];\n    }\n}\nfn helper(x: u8) -> u8 {\n    x\n}\nmacro_rules! m {\n    ($e:expr) => {\n        helper($e)\n    };\n}\n",
+    )]);
+    let out = fox_code(&p, "P.multi_line", "callers", 6000);
+    assert!(rows(&out).contains(":7,8 P.sink") && !rows(&out).contains("guess"), "{out}");
+    let out = fox_code(&p, "helper", "callers", 6000);
+    assert!(rows(&out).contains(":8,9 P.sink") && !rows(&out).contains(":17"), "{out}");
+}

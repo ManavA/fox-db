@@ -973,7 +973,7 @@ struct Walk<'t> {
     /// C++: the names template parameter lists of the file declare (`template <class T>`): no
     /// class a receiver's type may name.
     tparams: HashSet<String>,
-    /// Rust: the file's `use` declarations and `mod` items, in tree order.
+    /// Rust: the file's `use` declarations, `mod` items and macro invocations, in tree order.
     rust_items: Vec<tree_sitter::Node<'t>>,
 }
 
@@ -1023,7 +1023,7 @@ fn walk_tree<'t>(root: tree_sitter::Node<'t>, src: &[u8], c_lang: bool, cpp: boo
         {
             tparams.insert(t.to_string());
         }
-        if rust && matches!(n.kind(), "use_declaration" | "mod_item") {
+        if rust && matches!(n.kind(), "use_declaration" | "mod_item" | "macro_invocation") {
             rust_items.push(n);
         }
         if is_scope(n.kind(), cfam) {
@@ -1062,7 +1062,9 @@ fn walk_tree<'t>(root: tree_sitter::Node<'t>, src: &[u8], c_lang: bool, cpp: boo
                         && matches!(p.kind(), "pointer_expression" | "subscript_expression")
                         && p.child_by_field_name("argument").is_some_and(|f| f.id() == n.id())
                     || matches!(p.kind(), "call" | "call_expression")
-                        && p.child_by_field_name("function").is_some_and(|f| f.id() == n.id()))
+                        && p.child_by_field_name("function").is_some_and(|f| f.id() == n.id())
+                    // Rust: a name in a macro's arguments (a call or receiver there).
+                    || rust && p.kind() == "token_tree")
             {
                 uses.push((n.start_byte(), scope, name.to_string()));
             }
@@ -1410,6 +1412,9 @@ pub fn extract(l: &Lang, src: &[u8]) -> Parsed {
             });
         }
     }
+    if rust {
+        rust_macro_refs(&walk, &rust_scopes, src, &mut out.refs);
+    }
     // A file-level local hides an argument only when the file defines nothing of that name
     // (`main = click.command(main)` rebinds a definition).
     if !walk.file_locals.is_empty() {
@@ -1660,6 +1665,93 @@ fn rust_qualifier(segs: &[String], mods: &[String], ty: Option<&str>, sc: &RustS
                 return Some(segs.join("::"));
             }
         }
+    }
+}
+
+/// Rust words that may stand before a parenthesized group in a macro's arguments without
+/// calling anything.
+const RUST_NOT_CALLS: &[&str] = &["Some", "Ok", "Err"];
+
+/// Rust: the calls written in macro arguments (`debug_assert!(self.multi_line())`,
+/// `vec![db::open()]`), which the grammar keeps as tokens: a name followed by a parenthesized
+/// group, bare, through a receiver (`x.f(..)`) or through a path (`a::f(..)`).
+fn rust_macro_refs(walk: &Walk, sc: &RustScopes, src: &[u8], refs: &mut Vec<Ref>) {
+    for m in &walk.rust_items {
+        if m.kind() != "macro_invocation" {
+            continue;
+        }
+        let mut w = m.walk();
+        let Some(tt) = m.children(&mut w).find(|c| c.kind() == "token_tree") else { continue };
+        let mut place = None;
+        rust_token_calls(tt, walk, sc, src, &mut place, refs, 0);
+    }
+}
+
+fn rust_token_calls<'t>(
+    tt: tree_sitter::Node<'t>,
+    walk: &Walk,
+    sc: &RustScopes,
+    src: &[u8],
+    place: &mut Option<(Vec<String>, Option<String>)>,
+    refs: &mut Vec<Ref>,
+    depth: usize,
+) {
+    if depth > 32 {
+        return;
+    }
+    let kids: Vec<tree_sitter::Node> = (0..tt.child_count()).filter_map(|i| tt.child(i)).collect();
+    let text = |n: &tree_sitter::Node| n.utf8_text(src).unwrap_or("");
+    for (i, k) in kids.iter().enumerate() {
+        if k.kind() == "token_tree" {
+            rust_token_calls(*k, walk, sc, src, place, refs, depth + 1);
+            continue;
+        }
+        let group = kids.get(i + 1).is_some_and(|g| g.kind() == "token_tree" && g.child(0).is_some_and(|o| o.kind() == "("));
+        let name = text(k);
+        if k.kind() != "identifier" || !group || RUST_NOT_CALLS.contains(&name) || walk.locals.contains(&k.start_byte()) {
+            continue;
+        }
+        let prev = i.checked_sub(1).map(|j| text(&kids[j])).unwrap_or("");
+        let (mut recv, mut via, mut qual) = (false, None, false);
+        if prev.ends_with('.') && !prev.ends_with("..") {
+            recv = true;
+            via = (prev == ".")
+                .then(|| i.checked_sub(2).map(|j| kids[j]))
+                .flatten()
+                .filter(|r| matches!(r.kind(), "identifier" | "self"))
+                .map(|r| text(&r).to_string());
+        } else if prev == "::" {
+            let mut segs = vec![];
+            let mut j = i - 1;
+            while j >= 1 && text(&kids[j]) == "::" && matches!(kids[j - 1].kind(), "identifier" | "self" | "super" | "crate") {
+                segs.push(text(&kids[j - 1]).to_string());
+                if j < 2 {
+                    j = 0;
+                    break;
+                }
+                j -= 2;
+            }
+            // A path the tokens cut (`<T>::f`, `::f`) is left out.
+            if segs.is_empty() || j > 0 && text(&kids[j]).ends_with([':', '>']) {
+                continue;
+            }
+            segs.reverse();
+            let (mods, ty) = place.get_or_insert_with(|| rust_place(tt, src));
+            (recv, qual) = (true, true);
+            via = rust_qualifier(&segs, mods, ty.as_deref(), sc, 0);
+        }
+        refs.push(Ref {
+            kind: "call",
+            name: name.to_string(),
+            line: k.start_position().row as u32 + 1,
+            caller: None,
+            recv,
+            via,
+            recv_local: false,
+            rtype: None,
+            qual,
+            pos: k.start_byte(),
+        });
     }
 }
 
