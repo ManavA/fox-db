@@ -1,0 +1,219 @@
+"""Unit tests for bench/ab.py. No model calls: run with `python3 -m unittest discover -s bench -p 'test_*.py'`."""
+
+import contextlib
+import io
+import json
+import sys
+import tempfile
+import unittest
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import ab  # noqa: E402
+
+TASK = {
+    "id": "callers",
+    "prompt": "p",
+    "expect": ["cmd_find", {"name": "db::open_ro", "kind": "call"}, {"name": "tiers.rs", "kind": "doc"}],
+}
+
+
+class Tokens(unittest.TestCase):
+    def test_paths_lose_line_numbers_and_prose_is_ignored(self):
+        toks = ab.named_tokens("The caller is cmd_find in src/cli.rs:120, see `open_ro()` and Foo.")
+        self.assertEqual(toks, {"cmd_find", "src/cli.rs", "open_ro"})
+
+    def test_backticked_plain_words_count(self):
+        self.assertIn("open", ab.named_tokens("it calls `open` twice"))
+
+    def test_match_accepts_qualified_and_pathed_forms(self):
+        self.assertTrue(ab.matches("db::open_ro", "open_ro"))
+        self.assertTrue(ab.matches("src/tiers.rs", "tiers.rs"))
+        self.assertFalse(ab.matches("open_ro_inner", "open_ro"))
+        self.assertFalse(ab.matches("mytiers.rs", "tiers.rs"))
+
+
+class Grade(unittest.TestCase):
+    def test_items_accept_strings_and_tables(self):
+        self.assertEqual(ab.expect_items(TASK), [("cmd_find", "any"), ("db::open_ro", "call"), ("tiers.rs", "doc")])
+
+    def test_oracle_scores_one_everywhere(self):
+        g = ab.grade(ab.oracle_answer(ab.expect_items(TASK)), TASK)
+        self.assertEqual((g["precision"], g["recall"], g["f1"]), (1.0, 1.0, 1.0))
+        self.assertEqual(set(g["by_kind"]), {"any", "call", "doc"})
+        self.assertTrue(all(k["f1"] == 1.0 for k in g["by_kind"].values()))
+        self.assertTrue(g["pass"])
+
+    def test_empty_scores_zero(self):
+        g = ab.grade("", TASK)
+        self.assertEqual((g["precision"], g["recall"], g["f1"]), (0.0, 0.0, 0.0))
+        self.assertFalse(g["pass"])
+
+    def test_wrong_items_cost_precision_only_in_their_shape(self):
+        g = ab.grade("`cmd_find`, `db::open_ro`, `tiers.rs`, `open_rw`, src/other.rs:3", TASK)
+        self.assertEqual(g["recall"], 1.0)
+        self.assertAlmostEqual(g["precision"], 3 / 5)
+        self.assertAlmostEqual(g["by_kind"]["doc"]["precision"], 1 / 2)
+        self.assertAlmostEqual(g["by_kind"]["call"]["precision"], 1 / 2)
+
+    def test_partial_recall(self):
+        g = ab.grade("Only `cmd_find`.", TASK)
+        self.assertAlmostEqual(g["recall"], 1 / 3)
+        self.assertEqual(g["precision"], 1.0)
+        self.assertEqual(g["by_kind"]["doc"]["recall"], 0.0)
+
+    def test_check_only_task_keeps_substring_rule(self):
+        t = {"id": "x", "prompt": "p", "check": "tiers.rs"}
+        self.assertEqual(ab.grade("see src/tiers.rs", t), {"pass": True})
+        self.assertEqual(ab.grade("no idea", t), {"pass": False})
+
+    def test_task_without_check_or_expect_has_no_verdict(self):
+        self.assertEqual(ab.grade("anything", {"id": "x", "prompt": "p"}), {"pass": None})
+
+
+class SelfTest(unittest.TestCase):
+    def test_decoys_are_unique_wrong_and_same_shape(self):
+        items = ab.expect_items(TASK)
+        ds = ab.decoys(items, 50, seed=1)
+        self.assertEqual(len(set(ds)), 50)
+        for d in ds:
+            self.assertFalse(any(ab.matches(d, n) for n, _ in items), d)
+            self.assertIn(ab.shape(d), {"ident", "path"})
+        self.assertTrue(any(ab.shape(d) == "path" for d in ds))
+
+    def test_selftest_passes_on_a_sound_task(self):
+        ok, lines = ab.grader_selftest({"task": [TASK, {"id": "old", "prompt": "p", "check": "x"}]})
+        self.assertTrue(ok, lines)
+        self.assertTrue(any("old" in ln and "skip" in ln for ln in lines))
+
+    def test_selftest_fails_when_an_item_cannot_be_named(self):
+        ok, lines = ab.grader_selftest({"task": [{"id": "bad", "prompt": "p", "expect": ["two words"]}]})
+        self.assertFalse(ok)
+        self.assertTrue(any("bad" in ln and "FAIL" in ln for ln in lines))
+
+
+class Schedule(unittest.TestCase):
+    def test_pairs_are_adjacent_and_seeded(self):
+        runs = ab.schedule(["a", "b", "c"], ["claude", "codex"], 3, seed=7)
+        self.assertEqual(len(runs), 3 * 3 * 2 * 2)
+        for first, second in zip(runs[::2], runs[1::2]):
+            self.assertEqual((first["rep"], first["task"], first["harness"]),
+                             (second["rep"], second["task"], second["harness"]))
+            self.assertEqual({first["arm"], second["arm"]}, {"on", "off"})
+        self.assertEqual(runs, ab.schedule(["a", "b", "c"], ["claude", "codex"], 3, seed=7))
+        self.assertEqual({r["arm"] for r in runs[::2]}, {"on", "off"})
+
+    def test_default_repeat_is_three(self):
+        self.assertEqual(ab.run_parser().parse_args(["t.toml"]).repeat, 3)
+        self.assertEqual(ab.run_parser().parse_args(["t.toml"]).store, "scratch")
+
+
+class Store(unittest.TestCase):
+    def test_scratch_store_indexes_only_the_clone(self):
+        with tempfile.TemporaryDirectory() as d:
+            work = Path(d)
+            plan = ab.store_plan("scratch", "/x/fox", work / "clone", work / "run-home")
+            self.assertEqual(plan["index"], ["/x/fox", "index", str(work / "clone"), "--quiet", "--no-global"])
+            self.assertEqual(plan["env"]["FOXDB_HOME"], str(work / "run-home"))
+            self.assertTrue(plan["env"]["FOXDB_CLAUDE_PROJECTS"].startswith(str(work / "run-home")))
+
+    def test_live_store_changes_nothing(self):
+        self.assertEqual(ab.store_plan("live", "/x/fox", Path("/c"), Path("/h")), {"index": None, "env": {}})
+
+    def test_scratch_home_inside_live_store_is_refused(self):
+        with self.assertRaises(SystemExit):
+            ab.store_plan("scratch", "fox", Path("/c"), Path.home() / ".foxdb" / "ab" / "h")
+
+    def test_mcp_servers_get_the_store_env(self):
+        env = {"FOXDB_HOME": "/s/h", "FOXDB_CLAUDE_PROJECTS": "/s/h/cp"}
+        cfg = ab.mcp_config_json("/x/fox", True, env)
+        self.assertEqual(cfg["mcpServers"]["foxdb"]["env"], env)
+        self.assertEqual(ab.mcp_config_json("/x/fox", False, env), {"mcpServers": {}})
+        cmd = ab.codex_cmd("q", Path("/c"), "/x/fox", True, Path("/l"), env, None)
+        self.assertIn('env={FOXDB_HOME="/s/h",FOXDB_CLAUDE_PROJECTS="/s/h/cp"}', " ".join(cmd))
+
+
+class Provenance(unittest.TestCase):
+    def test_sha256_of_file_and_missing_file(self):
+        with tempfile.NamedTemporaryFile() as f:
+            f.write(b"abc")
+            f.flush()
+            self.assertEqual(ab.sha256_file(f.name),
+                             "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad")
+        self.assertIsNone(ab.sha256_file("/nonexistent/fox"))
+
+    def test_claude_model_comes_from_model_usage(self):
+        out = json.dumps({"total_cost_usd": 0.1, "num_turns": 2, "result": "a",
+                          "modelUsage": {"claude-x": {}, "claude-y": {}}})
+        self.assertEqual(ab.usage_from_claude(out)["model"], "claude-x,claude-y")
+
+
+class Stats(unittest.TestCase):
+    def test_pass_hat_k(self):
+        self.assertEqual(ab.pass_hat_k(3, 3, 3), 1.0)
+        self.assertEqual(ab.pass_hat_k(3, 2, 3), 0.0)
+        self.assertAlmostEqual(ab.pass_hat_k(4, 2, 2), 1 / 6)
+        self.assertAlmostEqual(ab.pass_hat_k(4, 2, 1), 0.5)
+
+    def test_percentile_interpolates(self):
+        self.assertAlmostEqual(ab.percentile([1, 2, 3, 4, 5, 6, 7, 8, 9, 10], 90), 9.1)
+        self.assertEqual(ab.percentile([4.0], 90), 4.0)
+
+    def test_bootstrap_is_seeded_and_brackets_the_mean(self):
+        xs = [0.1, -0.2, 0.3, 0.05, 0.0]
+        lo, hi = ab.bootstrap_ci(xs, seed=3, draws=2000)
+        self.assertEqual((lo, hi), ab.bootstrap_ci(xs, seed=3, draws=2000))
+        self.assertLessEqual(lo, sum(xs) / len(xs))
+        self.assertGreaterEqual(hi, sum(xs) / len(xs))
+        self.assertEqual(ab.bootstrap_ci([2.0], seed=0, draws=100), (2.0, 2.0))
+
+    def rows(self):
+        out = []
+        for task, d in (("a", 0.1), ("b", 0.3)):
+            for rep in range(3):
+                for arm, cost, f1, ok in (("on", 1.0, 1.0, True), ("off", 1.0 + d, 0.5, rep != 0)):
+                    out.append({"task": task, "harness": "claude", "foxdb": arm, "rep": rep, "headroom": "headroom-off",
+                                "store": "scratch", "cost_usd": cost, "turns": 4 if arm == "on" else 6,
+                                "f1": f1, "pass": ok})
+        return out
+
+    def test_report_pairs_on_off_per_task_and_overall(self):
+        text = ab.report(self.rows(), seed=0, draws=1000)
+        self.assertIn("claude · headroom-off · store scratch", text)
+        lines = {ln.split()[0]: ln for ln in text.splitlines() if ln.split() and ln.split()[0] in ("a", "b", "ALL")}
+        self.assertIn("cost -0.1000", lines["a"])
+        self.assertIn("cost -0.2000", lines["ALL"])
+        self.assertIn("turns -2.00", lines["ALL"])
+        self.assertIn("f1 +0.500", lines["ALL"])
+        self.assertIn("pass^3 on 1.00 off 0.00", lines["ALL"])
+        self.assertIn("p90 cost on 1.0000", text)
+
+    def test_report_handles_old_rows(self):
+        rows = [{"task": "a", "harness": "codex", "foxdb": arm, "rep": 0, "headroom": "headroom-off",
+                 "turns": 3, "pass": None} for arm in ("on", "off")]
+        text = ab.report(rows, seed=0, draws=100)
+        self.assertIn("store unknown", text)
+        self.assertIn("turns +0.00", text)
+
+
+class DryRun(unittest.TestCase):
+    def test_dry_run_prints_plan_and_writes_nothing(self):
+        with tempfile.TemporaryDirectory() as d:
+            tasks = Path(d) / "t.toml"
+            tasks.write_text('repo = "/r"\n[[task]]\nid = "a"\nprompt = "q"\nexpect = ["x_y"]\n')
+            out = Path(d) / "res.jsonl"
+            buf = io.StringIO()
+            with contextlib.redirect_stdout(buf):
+                rc = ab.main([str(tasks), "--harness", "claude", "--seed", "5", "--work", str(Path(d) / "w"),
+                              "--out", str(out), "--fox", "/nonexistent/fox"])
+            self.assertEqual(rc, 0)
+            text = buf.getvalue()
+            self.assertIn("DRY RUN", text)
+            self.assertIn("seed 5", text)
+            self.assertIn("index", text)
+            self.assertIn("--no-global", text)
+            self.assertFalse(out.exists())
+
+
+if __name__ == "__main__":
+    unittest.main()
