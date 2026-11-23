@@ -3,6 +3,7 @@
 import contextlib
 import io
 import json
+import sqlite3
 import sys
 import tempfile
 import unittest
@@ -15,22 +16,20 @@ TASK = {
     "id": "callers",
     "prompt": "p",
     "expect": ["cmd_find", {"name": "db::open_ro", "kind": "call"}, {"name": "tiers.rs", "kind": "doc"}],
+    "universe": ["cli::cmd_find", "db::open_ro", "db::open_rw", "outbox::open", "indexstore::open",
+                 "config::Config", "src/tiers.rs", "src/cli.rs", "src/db.rs"],
 }
 
 
+def task(expect, universe=TASK["universe"]):
+    return {"id": "t", "prompt": "p", "expect": expect, "universe": universe}
+
+
 class Tokens(unittest.TestCase):
-    def test_paths_lose_line_numbers_and_prose_is_ignored(self):
+    def test_paths_lose_line_numbers_and_calls_lose_parens(self):
         toks = ab.named_tokens("The caller is cmd_find in src/cli.rs:120, see `open_ro()` and Foo.")
-        self.assertEqual(toks, {"cmd_find", "src/cli.rs", "open_ro"})
-
-    def test_backticked_plain_words_count(self):
-        self.assertIn("open", ab.named_tokens("it calls `open` twice"))
-
-    def test_match_accepts_qualified_and_pathed_forms(self):
-        self.assertTrue(ab.matches("db::open_ro", "open_ro"))
-        self.assertTrue(ab.matches("src/tiers.rs", "tiers.rs"))
-        self.assertFalse(ab.matches("open_ro_inner", "open_ro"))
-        self.assertFalse(ab.matches("mytiers.rs", "tiers.rs"))
+        self.assertTrue({"cmd_find", "src/cli.rs", "open_ro", "Foo"} <= toks)
+        self.assertNotIn("src/cli.rs:120", toks)
 
 
 class Grade(unittest.TestCase):
@@ -49,18 +48,45 @@ class Grade(unittest.TestCase):
         self.assertEqual((g["precision"], g["recall"], g["f1"]), (0.0, 0.0, 0.0))
         self.assertFalse(g["pass"])
 
-    def test_wrong_items_cost_precision_only_in_their_shape(self):
-        g = ab.grade("`cmd_find`, `db::open_ro`, `tiers.rs`, `open_rw`, src/other.rs:3", TASK)
+    def test_only_unexpected_repo_names_cost_precision(self):
+        ans = ("cmd_find, db::open_ro and tiers.rs; also open_rw and `Config`. GitHub, read/write, and/or, "
+               "https://github.com/x, macOS, src/cli.rs:120")
+        g = ab.grade(ans, TASK)
         self.assertEqual(g["recall"], 1.0)
         self.assertAlmostEqual(g["precision"], 3 / 5)
-        self.assertAlmostEqual(g["by_kind"]["doc"]["precision"], 1 / 2)
-        self.assertAlmostEqual(g["by_kind"]["call"]["precision"], 1 / 2)
+        self.assertEqual(g["by_kind"]["doc"]["precision"], 1.0)
+        self.assertAlmostEqual(g["by_kind"]["call"]["precision"], 1 / 3)
 
-    def test_partial_recall(self):
-        g = ab.grade("Only `cmd_find`.", TASK)
-        self.assertAlmostEqual(g["recall"], 1 / 3)
+    def test_file_items_make_repo_path_citations_count(self):
+        t = task([{"name": "src/tiers.rs", "kind": "file"}])
+        g = ab.grade("See src/tiers.rs:3, src/cli.rs:120 and docs/x.md.", t)
+        self.assertEqual(g["recall"], 1.0)
+        self.assertAlmostEqual(g["precision"], 1 / 2)
+
+    def test_qualified_item_matches_its_last_segment(self):
+        self.assertEqual(ab.grade("It is open_ro.", task(["db::open_ro"]))["recall"], 1.0)
+        self.assertEqual(ab.grade("crate::db::open_ro", task(["db::open_ro"]))["recall"], 1.0)
+
+    def test_qualified_token_needs_a_unique_last_segment(self):
+        self.assertEqual(ab.grade("std::fs::File::open", task(["open"]))["recall"], 0.0)
+        self.assertEqual(ab.grade("open", task(["open"]))["recall"], 1.0)
+        self.assertEqual(ab.grade("outbox::open", task(["open"], ["outbox::open"]))["recall"], 1.0)
+
+    def test_variants_of_one_item_count_once(self):
+        g = ab.grade("open_ro, db::open_ro and crate::db::open_ro", task(["db::open_ro"]))
+        self.assertEqual((g["precision"], g["recall"]), (1.0, 1.0))
+
+    def test_bare_words_are_found(self):
+        self.assertEqual(ab.grade("It returns a Config value.", task(["Config"]))["recall"], 1.0)
+
+    def test_plain_words_count_against_precision_only_when_marked_as_code(self):
+        t = task(["cmd_find"], TASK["universe"] + ["search::run", "db::store", "cli::status"])
+        self.assertEqual(ab.grade("cmd_find opens the store to run a search; see status.", t)["precision"], 1.0)
+        self.assertAlmostEqual(ab.grade("cmd_find calls `run` and status()", t)["precision"], 1 / 3)
+
+    def test_names_outside_the_universe_are_ignored(self):
+        g = ab.grade("cmd_find and some_helper and Foo::bar", task(["cmd_find"]))
         self.assertEqual(g["precision"], 1.0)
-        self.assertEqual(g["by_kind"]["doc"]["recall"], 0.0)
 
     def test_check_only_task_keeps_substring_rule(self):
         t = {"id": "x", "prompt": "p", "check": "tiers.rs"}
@@ -70,16 +96,33 @@ class Grade(unittest.TestCase):
     def test_task_without_check_or_expect_has_no_verdict(self):
         self.assertEqual(ab.grade("anything", {"id": "x", "prompt": "p"}), {"pass": None})
 
+    def test_universe_from_store(self):
+        with tempfile.TemporaryDirectory() as d:
+            db = Path(d) / "fox.db"
+            c = sqlite3.connect(db)
+            c.execute("create table node(kind text, name text, path text)")
+            c.executemany("insert into node values (?, ?, ?)",
+                          [("symbol", "open_ro", "src/db.rs"), ("file", "db.rs", "src/db.rs"),
+                           ("doc_section", "Intro", "README.md")])
+            c.commit()
+            c.close()
+            self.assertEqual(ab.store_universe(db), {"db::open_ro", "src/db.rs"})
+
 
 class SelfTest(unittest.TestCase):
-    def test_decoys_are_unique_wrong_and_same_shape(self):
+    def test_decoys_are_unique_and_wrong(self):
         items = ab.expect_items(TASK)
         ds = ab.decoys(items, 50, seed=1)
         self.assertEqual(len(set(ds)), 50)
-        for d in ds:
-            self.assertFalse(any(ab.matches(d, n) for n, _ in items), d)
-            self.assertIn(ab.shape(d), {"ident", "path"})
-        self.assertTrue(any(ab.shape(d) == "path" for d in ds))
+        g = ab.grade("\n".join(ds), {**TASK, "universe": TASK["universe"] + ds})
+        self.assertEqual(g["recall"], 0.0)
+
+    def test_oracles_are_plain_prose(self):
+        items = ab.expect_items(TASK)
+        for ans in ab.oracle_answers(items, TASK["universe"]):
+            self.assertNotIn("`", ans)
+        self.assertEqual(len(ab.oracle_answers(items, TASK["universe"])), 2)
+        self.assertNotEqual(*ab.oracle_answers(items, TASK["universe"]))
 
     def test_selftest_passes_on_a_sound_task(self):
         ok, lines = ab.grader_selftest({"task": [TASK, {"id": "old", "prompt": "p", "check": "x"}]})
@@ -123,6 +166,16 @@ class Store(unittest.TestCase):
     def test_scratch_home_inside_live_store_is_refused(self):
         with self.assertRaises(SystemExit):
             ab.store_plan("scratch", "fox", Path("/c"), Path.home() / ".foxdb" / "ab" / "h")
+
+    def test_fresh_home_wipes_a_reused_store(self):
+        with tempfile.TemporaryDirectory() as d:
+            home = Path(d) / "run.home"
+            (home / "claude-projects").mkdir(parents=True)
+            (home / "fox.db").write_text("old")
+            ab.fresh_home(home)
+            self.assertEqual([p.name for p in home.iterdir()], ["claude-projects"])
+        with self.assertRaises(SystemExit):
+            ab.fresh_home(Path.home() / ".foxdb")
 
     def test_mcp_servers_get_the_store_env(self):
         env = {"FOXDB_HOME": "/s/h", "FOXDB_CLAUDE_PROJECTS": "/s/h/cp"}
@@ -188,6 +241,19 @@ class Stats(unittest.TestCase):
         self.assertIn("pass^3 on 1.00 off 0.00", lines["ALL"])
         self.assertIn("p90 cost on 1.0000", text)
 
+    def test_report_keeps_runs_apart(self):
+        rows = []
+        for seed, cost in ((1, 1.0), (2, 5.0)):
+            for arm in ("on", "off"):
+                rows.append({"task": "a", "harness": "claude", "foxdb": arm, "rep": 0, "headroom": "headroom-off",
+                             "store": "scratch", "seed": seed, "model_requested": "default",
+                             "harness_version": "2.0", "cost_usd": cost + (0 if arm == "on" else 1), "pass": True})
+        text = ab.report(rows, seed=0, draws=100)
+        self.assertEqual(text.count("store scratch"), 2)
+        self.assertIn("seed 1", text)
+        self.assertIn("seed 2", text)
+        self.assertEqual(text.count("cost -1.0000"), 4)
+
     def test_report_handles_old_rows(self):
         rows = [{"task": "a", "harness": "codex", "foxdb": arm, "rep": 0, "headroom": "headroom-off",
                  "turns": 3, "pass": None} for arm in ("on", "off")]
@@ -212,6 +278,7 @@ class DryRun(unittest.TestCase):
             self.assertIn("seed 5", text)
             self.assertIn("index", text)
             self.assertIn("--no-global", text)
+            self.assertIn("grader.home", text)
             self.assertFalse(out.exists())
 
 

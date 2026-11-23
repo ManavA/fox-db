@@ -29,19 +29,27 @@ Task file (TOML):
     id = "callers-open-ro"
     prompt = "List every function that calls open_ro and say what each uses it for."
     check = "open_rw"        # optional substring the final answer must contain
-    expect = ["cmd_find", {name = "db::open_ro", kind = "call"}, {name = "tiers.rs", kind = "doc"}]
+    expect = ["cmd_find", {name = "db::open_ro", kind = "call"}, {name = "src/tiers.rs", kind = "file"}]
+    universe = ["db::open_rw"]  # optional extra repo names; the scratch index supplies the rest
     pass_f1 = 0.8            # optional, default 0.8
 
-Grading with `expect`: the grader collects the code-like names in the final answer (backticked
-text, identifiers with `_`, `::` or camelCase, paths and file names; `:line` suffixes dropped). A
-name matches an item when it equals it or ends in `::item`, `.item` or `/item`. Precision counts
-only names shaped like the items (identifier or path), per kind (call, store, doc; "any" when
-unlabelled). A task passes when its F1 reaches pass_f1 and its `check`, if any, holds.
---grader-selftest grades each task's oracle answer (must score 1), an empty answer (must score 0)
-and the oracle padded with 50 decoys (precision must fall below 0.5), and runs nothing else.
+Grading with `expect` (kinds: call, store, doc, file; "any" when unlabelled): the universe is every
+symbol (as `<file stem>::<name>`) and file in a scratch index of the repo that the agents never
+see, plus the task's `universe` and `expect`. The answer's words are matched against it, with
+or without backticks, `:line` and `()` dropped. A word names an item when it equals it, when the
+item is qualified and the word is its last segment or ends in `::item`, or when the word is
+qualified, its last segment is the (unqualified) item and no other universe name shares that
+segment. Each item counts once. A false positive is a word naming some other universe symbol
+(a plain word such as `run` or `Config` only when backticked or written `run()`, since prose uses
+them too);
+paths count as false positives only in tasks with `file` items; words outside the universe are
+ignored. A task passes when F1 reaches pass_f1 and its `check`, if any, holds.
+--grader-selftest grades two prose oracles per task (the items as written, then with qualified and
+unqualified forms swapped on alternate items; both must score 1), an empty answer (must score 0)
+and an oracle padded with 50 decoys (precision must fall below 0.5), and runs nothing else.
 
     ab.py report RESULTS.jsonl     paired on-off differences per task and overall, bootstrap CIs,
-                                   pass^k and p90 cost
+                                   pass^k and p90 cost, one block per run (seed, model, harness version)
 """
 
 import argparse
@@ -52,6 +60,8 @@ import os
 import random
 import re
 import shlex
+import shutil
+import sqlite3
 import subprocess
 import sys
 import tempfile
@@ -83,7 +93,6 @@ def expect_items(task: dict) -> list:
 def _clean(tok: str) -> str:
     tok = tok.strip(".,;:-")
     tok = re.sub(r":\d+(?:[-:]\d+)?$", "", tok)
-    tok = tok.removesuffix("()")
     return tok.removeprefix("./")
 
 
@@ -92,101 +101,162 @@ def shape(tok: str) -> str:
     return "path" if "/" in tok or ext in SOURCE_EXTS else "ident"
 
 
-def _code_like(tok: str) -> bool:
-    return ("_" in tok or "::" in tok or "/" in tok or shape(tok) == "path"
-            or re.search(r"[a-z][A-Z]", tok) is not None)
+def last(name: str) -> str:
+    return name.rsplit("/", 1)[-1] if shape(name) == "path" else re.split(r"::|\.", name)[-1]
+
+
+def qualified(name: str) -> bool:
+    return last(name) != name
 
 
 def named_tokens(answer: str) -> set:
-    names = set()
-    for span in re.findall(r"`([^`\n]+)`", answer):
-        for raw in re.findall(r"[\w./:\-]+(?:\(\))?", span):
-            tok = _clean(raw)
-            if re.match(r"[A-Za-z_./]", tok):
-                names.add(tok)
+    out = set()
     for raw in re.findall(r"[\w./:\-]+", answer):
         tok = _clean(raw)
-        if tok and re.match(r"[A-Za-z_./]", tok) and _code_like(tok):
-            names.add(tok)
-    return names
+        for part in [tok] if shape(tok) == "path" else tok.split("-"):
+            part = _clean(part)
+            if re.match(r"[A-Za-z_./]", part):
+                out.add(part)
+    return out
 
 
-def matches(tok: str, item: str) -> bool:
-    return tok == item or any(tok.endswith(sep + item) for sep in ("::", ".", "/"))
+def marked_tokens(answer: str) -> set:
+    spans = re.findall(r"`([^`\n]+)`", answer) + re.findall(r"([\w.:]+)\(\)", answer)
+    return set().union(*(named_tokens(sp) for sp in spans)) if spans else set()
 
 
-def _prf(tokens: set, items: list, others: list) -> dict:
-    shapes = {shape(i) for i in items}
-    pool = [t for t in tokens if shape(t) in shapes and not any(matches(t, o) for o in others)]
-    tp = sum(1 for t in pool if any(matches(t, i) for i in items))
-    found = sum(1 for i in items if any(matches(t, i) for t in tokens))
-    p = tp / len(pool) if pool else 0.0
-    r = found / len(items) if items else 0.0
+def store_universe(db: Path) -> set:
+    c = sqlite3.connect(f"file:{db}?mode=ro", uri=True)
+    try:
+        rows = c.execute("select kind, name, path from node where kind in ('symbol', 'file')").fetchall()
+    finally:
+        c.close()
+    return {f"{Path(p).stem}::{n}" if k == "symbol" else p for k, n, p in rows if p}
+
+
+def hits(tok: str, item: str, universe: set) -> bool:
+    if tok == item:
+        return True
+    if qualified(item):
+        return tok == last(item) or any(tok.endswith(sep + item) for sep in ("::", ".", "/"))
+    return (qualified(tok) and last(tok) == item
+            and sum(1 for u in universe if u != item and last(u) == item) <= 1)
+
+
+def _prf(found: set, items: list, fps: set) -> dict:
+    tp = len(found & set(items))
+    p = tp / (tp + len(fps)) if tp + len(fps) else 0.0
+    r = tp / len(items) if items else 0.0
     f1 = 2 * p * r / (p + r) if p + r else 0.0
     return {"precision": p, "recall": r, "f1": f1}
 
 
-def grade(answer: str, task: dict) -> dict:
+def grade(answer: str, task: dict, universe: set = frozenset()) -> dict:
     check = task.get("check")
     items = expect_items(task)
     if not items:
         return {"pass": (check in answer) if check else None}
-    tokens = named_tokens(answer)
     names = [n for n, _ in items]
-    g = _prf(tokens, names, [])
+    uni = set(universe) | set(task.get("universe", [])) | set(names)
+    files = any(k == "file" for _, k in items)
+    ident_lasts = {last(u) for u in uni if shape(u) == "ident"}
+    paths = [u for u in uni if shape(u) == "path"]
+    taken = {last(n) for n in names}
+    marked = marked_tokens(answer)
+    found, fps = set(), set()
+    for tok in named_tokens(answer):
+        hit = {n for n in names if hits(tok, n, uni)}
+        found |= hit
+        if hit or last(tok) in taken:
+            continue
+        if shape(tok) == "path":
+            if files and (tok in uni or any(u.endswith("/" + tok) for u in paths)):
+                fps.add(("path", last(tok)))
+        elif (tok in uni or (not qualified(tok) and tok in ident_lasts)) and (
+                tok in marked or not re.fullmatch(r"[A-Za-z][a-z0-9]*", tok)):
+            fps.add(("ident", last(tok)))
+    g = _prf(found, names, fps)
     g["by_kind"] = {}
     for kind in sorted({k for _, k in items}):
         mine = [n for n, k in items if k == kind]
-        g["by_kind"][kind] = _prf(tokens, mine, [n for n in names if n not in mine])
+        shapes = {shape(n) for n in mine}
+        g["by_kind"][kind] = _prf(found, mine, {f for f in fps if f[0] in shapes})
     g["pass"] = g["f1"] >= task.get("pass_f1", 0.8) and (check in answer if check else True)
     return g
 
 
+def _prose(names: list) -> str:
+    joined = names[0] if len(names) == 1 else ", ".join(names[:-1]) + " and " + names[-1]
+    return f"The items are {joined}."
+
+
 def oracle_answer(items: list) -> str:
-    return "Answer:\n" + "\n".join(f"- `{n}`" for n, _ in items)
+    return _prose([n for n, _ in items])
+
+
+def _flip(name: str, universe: set) -> str:
+    if qualified(name):
+        return last(name)
+    owners = [u for u in universe if u != name and last(u) == name]
+    if len(owners) == 1:
+        return owners[0]
+    return ("src/" if shape(name) == "path" else "crate::") + name
+
+
+def oracle_answers(items: list, universe) -> list:
+    names = [n for n, _ in items]
+    uni = set(universe) | set(names)
+    return [_prose(names), _prose([_flip(n, uni) if i % 2 == 0 else n for i, n in enumerate(names)])]
 
 
 def _mutate(base: str, word: str, before: bool) -> str:
     cut = max(base.rfind("::") + 2 if "::" in base else 0, base.rfind("/") + 1)
-    head, last = base[:cut], base[cut:]
-    stem, dot, ext = last.rpartition(".") if shape(base) == "path" and "." in last else (last, "", "")
+    head, tail = base[:cut], base[cut:]
+    stem, dot, ext = tail.rpartition(".") if shape(base) == "path" and "." in tail else (tail, "", "")
     return head + (f"{word}_{stem}" if before else f"{stem}_{word}") + dot + ext
 
 
-def decoys(items: list, n: int = 50, seed: int = 0) -> list:
+def decoys(items: list, n: int = 50, seed: int = 0, universe=frozenset()) -> list:
     rng = random.Random(seed)
     names = [x for x, _ in items]
+    files = any(k == "file" for _, k in items)
+    bases = [x for x in names if files or shape(x) == "ident"] or ["helper"]
+    uni = set(universe) | set(names)
+    taken = {last(x) for x in names}
     out = []
     for _ in range(n * 100):
         if len(out) == n:
             break
-        d = _mutate(rng.choice(names), rng.choice(DECOY_WORDS) + rng.choice(["", "2", "_all", "_of"]),
+        d = _mutate(rng.choice(bases), rng.choice(DECOY_WORDS) + rng.choice(["", "2", "_all", "_of"]),
                     rng.random() < 0.5)
-        if d not in out and not any(matches(d, x) for x in names):
+        if d not in out and last(d) not in taken and not any(hits(d, x, uni) for x in names):
             out.append(d)
     return out
 
 
-def grader_selftest(spec: dict) -> tuple:
+def grader_selftest(spec: dict, universe=frozenset()) -> tuple:
     ok, lines = True, []
     for t in spec["task"]:
         items = expect_items(t)
         if not items:
             lines.append(f"{t['id']}: skip (no expect)")
             continue
-        oracle = grade(oracle_answer(items), t)
-        empty = grade("", t)
-        dump = grade(oracle_answer(items) + "\n" + "\n".join(f"- `{d}`" for d in decoys(items)), t)
+        uni = set(universe) | set(t.get("universe", []))
         bad = []
-        if oracle["f1"] != 1.0 or any(k["f1"] != 1.0 for k in oracle["by_kind"].values()):
-            bad.append(f"oracle f1 {oracle['f1']:.3f}")
+        for label, ans in zip(("prose", "mixed"), oracle_answers(items, uni)):
+            g = grade(ans, t, uni)
+            if g["f1"] != 1.0 or any(k["f1"] != 1.0 for k in g["by_kind"].values()):
+                bad.append(f"{label} oracle f1 {g['f1']:.3f}")
+        empty = grade("", t, uni)
         if empty["f1"] != 0.0:
             bad.append(f"empty f1 {empty['f1']:.3f}")
+        ds = decoys(items, universe=uni)
+        dump = grade(oracle_answer(items) + "\n" + "\n".join(ds), t, uni | set(ds))
         if dump["precision"] >= 0.5:
             bad.append(f"dump precision {dump['precision']:.3f}")
         ok = ok and not bad
         lines.append(f"{t['id']}: " + ("FAIL " + "; ".join(bad) if bad else
-                                       f"ok (oracle 1, empty 0, dump precision {dump['precision']:.3f})"))
+                                       f"ok (oracles 1, empty 0, dump precision {dump['precision']:.3f})"))
     return ok, lines
 
 
@@ -211,6 +281,13 @@ def store_plan(store: str, fox: str, clone: Path, home: Path) -> dict:
         sys.exit(f"refusing a scratch store inside the live store {LIVE_HOME}: pick another --work")
     return {"index": [fox, "index", str(clone), "--quiet", "--no-global"],
             "env": {"FOXDB_HOME": str(home), "FOXDB_CLAUDE_PROJECTS": str(home / "claude-projects")}}
+
+
+def fresh_home(home: Path) -> None:
+    if home.resolve().is_relative_to(LIVE_HOME.resolve()):
+        sys.exit(f"refusing to wipe {home}: it is inside the live store {LIVE_HOME}")
+    shutil.rmtree(home, ignore_errors=True)
+    (home / "claude-projects").mkdir(parents=True)
 
 
 def env_for(headroom: str, store_env: dict) -> dict:
@@ -355,11 +432,12 @@ def _p90_text(by_arm: dict) -> str:
 def report(rows: list, seed: int = 0, draws: int = 10000) -> str:
     groups = defaultdict(lambda: defaultdict(lambda: {"on": {}, "off": {}}))
     for r in rows:
-        key = (r["harness"], r.get("headroom", "unknown"), r.get("store", "unknown"))
+        key = (r["harness"], r.get("headroom", "unknown"), r.get("store", "unknown"), str(r.get("seed", "unknown")),
+               r.get("model_requested", r.get("model")) or "unknown", r.get("harness_version") or "unknown")
         groups[key][r["task"]][r["foxdb"]][r.get("rep", 0)] = r
     lines = ["differences are on minus off; brackets are bootstrap 95% CIs (per task over reps, overall over tasks)"]
-    for (h, hr, store), tasks in sorted(groups.items()):
-        lines.append(f"\n{h} · {hr} · store {store}")
+    for (h, hr, store, seed_, model, ver), tasks in sorted(groups.items()):
+        lines.append(f"\n{h} · {hr} · store {store} · seed {seed_} · model {model} · {ver}")
         task_means = defaultdict(list)
         judged = []
         for tid, arms in sorted(tasks.items()):
@@ -439,9 +517,21 @@ def main(argv: list | None = None) -> int:
     print(f"# {len(tasks)} tasks x {harnesses} x [on, off] x {a.repeat} · {mode} · store {a.store} · seed {seed}"
           f" · fox {fox_sha or 'missing'} · work {work}" + ("" if a.run else " · DRY RUN"))
 
-    prov = {"seed": seed, "store": a.store, "fox_sha256": fox_sha}
-    versions = {}
-    if a.run:
+    prov = {"seed": seed, "store": a.store, "fox_sha256": fox_sha, "model_requested": a.model or "default"}
+    gclone, ghome = work / "grader-clone", work / "grader.home"
+    gplan = store_plan("scratch", a.fox, gclone, ghome)
+    gsteps = [["git", "clone", "--quiet", "--shared", str(repo), str(gclone)], gplan["index"]]
+    versions, universe = {}, set()
+    if not a.run:
+        print("# grader universe: a scratch index of the repo the agents never see")
+        print(shlex.join(gsteps[0]))
+        print(" ".join(f"{k}={shlex.quote(v)}" for k, v in gplan["env"].items()), shlex.join(gsteps[1]))
+    else:
+        if not gclone.exists():
+            subprocess.run(gsteps[0], check=True)
+        fresh_home(ghome)
+        subprocess.run(gsteps[1], env=env_for(a.headroom, gplan["env"]), check=True)
+        universe = store_universe(ghome / "fox.db")
         prov["repo_commit"] = _out(["git", "-C", str(repo), "rev-parse", "HEAD"])
         prov["bench_commit"] = _out(["git", "-C", str(Path(__file__).resolve().parent), "rev-parse", "HEAD"])
         versions = {h: _out([h, "--version"]) for h in harnesses}
@@ -472,7 +562,7 @@ def main(argv: list | None = None) -> int:
             subprocess.run(clone, check=True)
         env = env_for(a.headroom, plan["env"])
         if index:
-            (work / f"{name}.home" / "claude-projects").mkdir(parents=True, exist_ok=True)
+            fresh_home(work / f"{name}.home")
             subprocess.run(index, env=env, check=True)
         t0 = time.monotonic()
         p = subprocess.run(cmd, cwd=cwd, env=env, capture_output=True, text=True, timeout=1800)
@@ -481,7 +571,7 @@ def main(argv: list | None = None) -> int:
         ans = u.pop("answer", "") or ""
         model = u.pop("model", None) or a.model or "default"
         row = {"task": t["id"], "harness": h, "foxdb": arm, "rep": rep, "slot": slot, "headroom": mode,
-               "exit": p.returncode, "secs": round(secs, 1), **u, **grade(ans, t), "model": model,
+               "exit": p.returncode, "secs": round(secs, 1), **u, **grade(ans, t, universe), "model": model,
                "harness_version": versions.get(h), **prov}
         out.write(json.dumps(row) + "\n")
         out.flush()
