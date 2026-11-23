@@ -48,6 +48,15 @@ turns, cache reads and writes, scores, the headroom and store modes, seed, model
 fox binary sha256 and git commits. `bench/ab.py report RESULTS.jsonl` prints paired on-off
 differences per task and overall with bootstrap 95% CIs, pass^k and p90 cost, one block per run.
 
+`--harness local` asks whether fox-db helps a small local model, where frontier models already find
+every caller with grep. It drives `bench/local_agent.py`, a one-command-per-turn bash loop, against
+an OpenAI-compatible server such as llama.cpp's `llama-server` (`--local-url`, temperature 0), with
+three arms: `grep` (bash only), `fox-cli` (bash plus the `fox` CLI on the scratch store) and
+`packet` (bash plus a fox callers/impact packet for the names in the question, about 800 tokens).
+Command output is cut at 2000 characters; a run ends on a `FINAL:` answer or a step, token or
+context cap, with one last turn to answer after a cap. Rows add steps, tokens in and out, wall
+time, the cap hit and repeated-command loops; `report` compares `fox-cli` and `packet` with `grep`.
+
 Milestone 1 results. Both builds were measured on the same day on the same corpus (a snapshot of
 the Kotlin app's tracked files and of this repo, one store holding both plus the memory fixture),
 5 runs per query, on a shared machine at load 7-11, with headroom off in the bench's environment.

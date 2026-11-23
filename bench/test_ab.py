@@ -146,6 +146,14 @@ class Schedule(unittest.TestCase):
         self.assertEqual(runs, ab.schedule(["a", "b", "c"], ["claude", "codex"], 3, seed=7))
         self.assertEqual({r["arm"] for r in runs[::2]}, {"on", "off"})
 
+    def test_local_runs_three_arms_back_to_back(self):
+        runs = ab.schedule(["a", "b"], ["local"], 2, seed=1)
+        self.assertEqual(len(runs), 2 * 2 * 3)
+        for i in range(0, len(runs), 3):
+            group = runs[i:i + 3]
+            self.assertEqual(len({(r["rep"], r["task"]) for r in group}), 1)
+            self.assertEqual({r["arm"] for r in group}, {"grep", "fox-cli", "packet"})
+
     def test_default_repeat_is_three(self):
         self.assertEqual(ab.run_parser().parse_args(["t.toml"]).repeat, 3)
         self.assertEqual(ab.run_parser().parse_args(["t.toml"]).store, "scratch")
@@ -254,6 +262,27 @@ class Stats(unittest.TestCase):
         self.assertIn("seed 2", text)
         self.assertEqual(text.count("cost -1.0000"), 4)
 
+    def test_report_compares_local_arms_with_grep(self):
+        rows = [{"task": "a", "harness": "local", "foxdb": arm, "rep": rep, "turns": turns, "pass": ok, "loop": False}
+                for rep in range(2)
+                for arm, turns, ok in (("grep", 10, False), ("fox-cli", 6, True), ("packet", 4, True))]
+        text = ab.report(rows, seed=0, draws=100)
+        self.assertIn("· fox-cli minus grep", text)
+        self.assertIn("· packet minus grep", text)
+        self.assertNotIn("minus packet", text)
+        self.assertIn("turns -4.00", text)
+        self.assertIn("turns -6.00", text)
+        self.assertIn("pass^2 packet 1.00 grep 0.00", text)
+
+    def test_local_usage_comes_from_the_last_json_line(self):
+        out = "noise\n" + json.dumps({"answer": "x", "steps": 5, "input": 900, "output": 80, "cap": "steps",
+                                      "loop": True, "max_repeat": 3, "secs": 12.0,
+                                      "server": {"model": "m.gguf", "ctx": 16384}})
+        u = ab.usage_from_local(out)
+        self.assertEqual((u["turns"], u["input"], u["cap"], u["loop"], u["model"], u["ctx"], u["answer"]),
+                         (5, 900, "steps", True, "m.gguf", 16384, "x"))
+        self.assertEqual(ab.usage_from_local(""), {"parse_error": True})
+
     def test_report_handles_old_rows(self):
         rows = [{"task": "a", "harness": "codex", "foxdb": arm, "rep": 0, "headroom": "headroom-off",
                  "turns": 3, "pass": None} for arm in ("on", "off")]
@@ -280,6 +309,22 @@ class DryRun(unittest.TestCase):
             self.assertIn("--no-global", text)
             self.assertIn("grader.home", text)
             self.assertFalse(out.exists())
+
+    def test_local_dry_run_indexes_only_fox_arms(self):
+        with tempfile.TemporaryDirectory() as d:
+            tasks = Path(d) / "t.toml"
+            tasks.write_text('repo = "/r"\n[[task]]\nid = "a"\nprompt = "q"\n')
+            buf = io.StringIO()
+            with contextlib.redirect_stdout(buf):
+                ab.main([str(tasks), "--harness", "local", "--seed", "5", "--repeat", "1", "--work",
+                         str(Path(d) / "w"), "--fox", "/nonexistent/fox"])
+            slots = buf.getvalue().split("# slot ")[1:]
+            self.assertEqual(len(slots), 3)
+            for s in slots:
+                arm = s.split()[1].split("-", 2)[2].rsplit("-", 1)[0]
+                self.assertIn(f"--arm {arm}", s)
+                self.assertIn("local_agent.py", s)
+                self.assertEqual("--no-global" in s, arm != "grep")
 
 
 if __name__ == "__main__":

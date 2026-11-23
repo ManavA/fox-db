@@ -50,6 +50,12 @@ and an oracle padded with 50 decoys (precision must fall below 0.5), and runs no
 
     ab.py report RESULTS.jsonl     paired on-off differences per task and overall, bootstrap CIs,
                                    pass^k and p90 cost, one block per run (seed, model, harness version)
+
+--harness local runs bench/local_agent.py against an OpenAI-compatible server (--local-url, e.g.
+llama.cpp llama-server) with three arms instead of on/off: grep (bash only), fox-cli (bash plus the
+`fox` CLI on the scratch store) and packet (bash plus a fox callers/impact packet up front). The
+arm goes in the row's `foxdb` field; report compares fox-cli and packet with grep. Rows add steps,
+cap, forced_final, loop and max_repeat; transcripts go to --work as NAME.transcript.jsonl.
 """
 
 import argparse
@@ -70,10 +76,15 @@ import tomllib
 from collections import defaultdict
 from pathlib import Path
 
+import local_agent
+
 HEADROOM_URL = "http://127.0.0.1:8787"
 LIVE_HOME = Path.home() / ".foxdb"
 SOURCE_EXTS = {"rs", "py", "md", "toml", "json", "ts", "tsx", "js", "go", "c", "h", "cc", "cpp", "hpp", "kt",
                "swift", "java", "rb", "sh", "yml", "yaml", "txt", "sql", "proto"}
+ARMS = {"claude": ["on", "off"], "codex": ["on", "off"], "local": local_agent.ARMS}
+INDEXED_ARMS = {"on", "fox-cli", "packet"}
+BASELINES = ("off", "grep")
 DECOY_WORDS = ["inner", "impl", "v2", "old", "cached", "raw", "unchecked", "try", "with", "legacy", "async",
                "batch", "ext", "util", "helper", "core", "local", "tmp", "fast", "safe"]
 
@@ -268,7 +279,7 @@ def schedule(task_ids: list, harnesses: list, repeat: int, seed: int) -> list:
     for rep in range(repeat):
         for tid in rng.sample(task_ids, len(task_ids)):
             for h in harnesses:
-                arms = ["on", "off"]
+                arms = list(ARMS[h])
                 rng.shuffle(arms)
                 runs += [{"rep": rep, "task": tid, "harness": h, "arm": arm} for arm in arms]
     return runs
@@ -328,6 +339,14 @@ def codex_cmd(prompt: str, cwd: Path, fox: str, on: bool, last: Path, store_env:
     return cmd + (["-m", model] if model else []) + [prompt]
 
 
+def local_cmd(prompt: str, arm: str, cwd: Path, fox: str, scratch: Path, transcript: Path, a) -> list:
+    cmd = [sys.executable, str(Path(__file__).resolve().parent / "local_agent.py"), "--prompt", prompt, "--arm", arm,
+           "--cwd", str(cwd), "--scratch", str(scratch), "--fox", fox, "--url", a.local_url,
+           "--steps", str(a.local_steps), "--token-cap", str(a.local_token_cap),
+           "--reasoning-effort", a.local_effort, "--transcript", str(transcript)]
+    return cmd + (["--model", a.model] if a.model else [])
+
+
 # ---- provenance and usage
 
 def sha256_file(path) -> str | None:
@@ -374,6 +393,23 @@ def usage_from_codex(stdout: str, last: Path) -> dict:
     return tot
 
 
+def usage_from_local(stdout: str) -> dict:
+    try:
+        j = json.loads(stdout.strip().splitlines()[-1])
+    except (json.JSONDecodeError, IndexError):
+        return {"parse_error": True}
+    keep = ("steps", "input", "output", "cap", "forced_final", "commands", "format_errors", "loop", "loop_commands",
+            "max_repeat", "packet_chars", "answer")
+    server = j.get("server") or {}
+    return {"turns": j.get("steps"), "agent_secs": j.get("secs"), "ctx": server.get("ctx"),
+            "model": server.get("model"), **{k: j.get(k) for k in keep}}
+
+
+def local_version(url: str) -> str | None:
+    info = local_agent.server_info(url)
+    return f"llama.cpp {info['build']} ctx {info['ctx']}" if info else None
+
+
 # ---- report
 
 def pass_hat_k(n: int, c: int, k: int) -> float:
@@ -395,7 +431,7 @@ def bootstrap_ci(xs: list, seed: int = 0, draws: int = 10000) -> tuple:
 
 
 METRICS = [("cost", "cost_usd", "{:+.4f}"), ("turns", "turns", "{:+.2f}"), ("f1", "f1", "{:+.3f}"),
-           ("pass", "pass", "{:+.2f}")]
+           ("pass", "pass", "{:+.2f}"), ("secs", "secs", "{:+.1f}"), ("loop", "loop", "{:+.2f}")]
 
 
 def _num(row: dict, key: str):
@@ -410,57 +446,64 @@ def _diff_text(name: str, fmt: str, xs: list, seed: int, draws: int) -> str:
     return f"{name} {fmt.format(sum(xs) / len(xs))} [{fmt.format(lo)}, {fmt.format(hi)}]"
 
 
-def _pass_text(judged: list) -> str:
+def _pass_text(judged: list, x: str, b: str) -> str:
     if not judged:
         return ""
-    k = min(min(len(p["on"]), len(p["off"])) for p in judged)
+    k = min(min(len(p[x]), len(p[b])) for p in judged)
     out = []
     for kk in sorted({1, k}):
-        hat = {arm: sum(pass_hat_k(len(p[arm]), sum(p[arm]), kk) for p in judged) / len(judged)
-               for arm in ("on", "off")}
-        out.append(f"pass^{kk} on {hat['on']:.2f} off {hat['off']:.2f}")
+        hat = {arm: sum(pass_hat_k(len(p[arm]), sum(p[arm]), kk) for p in judged) / len(judged) for arm in (x, b)}
+        out.append(f"pass^{kk} {x} {hat[x]:.2f} {b} {hat[b]:.2f}")
     return "  ".join(out)
 
 
-def _p90_text(by_arm: dict) -> str:
+def _p90_text(by_arm: dict, x: str, b: str) -> str:
     costs = {arm: [c for r in rows if (c := _num(r, "cost_usd")) is not None] for arm, rows in by_arm.items()}
-    if not (costs["on"] and costs["off"]):
+    if not (costs[x] and costs[b]):
         return ""
-    return f"p90 cost on {percentile(costs['on'], 90):.4f} off {percentile(costs['off'], 90):.4f}"
+    return f"p90 cost {x} {percentile(costs[x], 90):.4f} {b} {percentile(costs[b], 90):.4f}"
+
+
+def comparisons(arms: set) -> list:
+    base = next((b for b in BASELINES if b in arms), min(arms))
+    return [(x, base) for x in sorted(arms) if x != base]
 
 
 def report(rows: list, seed: int = 0, draws: int = 10000) -> str:
-    groups = defaultdict(lambda: defaultdict(lambda: {"on": {}, "off": {}}))
+    groups = defaultdict(lambda: defaultdict(lambda: defaultdict(dict)))
     for r in rows:
         key = (r["harness"], r.get("headroom", "unknown"), r.get("store", "unknown"), str(r.get("seed", "unknown")),
                r.get("model_requested", r.get("model")) or "unknown", r.get("harness_version") or "unknown")
         groups[key][r["task"]][r["foxdb"]][r.get("rep", 0)] = r
-    lines = ["differences are on minus off; brackets are bootstrap 95% CIs (per task over reps, overall over tasks)"]
+    lines = ["differences are on minus off (local harness: each arm minus grep); brackets are bootstrap 95% CIs"
+             " (per task over reps, overall over tasks)"]
     for (h, hr, store, seed_, model, ver), tasks in sorted(groups.items()):
-        lines.append(f"\n{h} · {hr} · store {store} · seed {seed_} · model {model} · {ver}")
-        task_means = defaultdict(list)
-        judged = []
-        for tid, arms in sorted(tasks.items()):
-            reps = sorted(set(arms["on"]) & set(arms["off"]))
-            parts = [f"{tid:<24} n {len(reps)}"]
-            for name, key, fmt in METRICS:
-                xs = [_num(arms["on"][i], key) - _num(arms["off"][i], key) for i in reps
-                      if _num(arms["on"][i], key) is not None and _num(arms["off"][i], key) is not None]
-                if xs:
-                    task_means[name].append(sum(xs) / len(xs))
-                parts.append(_diff_text(name, fmt, xs, seed, draws))
-            passes = {arm: [r["pass"] for r in arms[arm].values() if isinstance(r.get("pass"), bool)]
-                      for arm in ("on", "off")}
-            if passes["on"] and passes["off"]:
-                judged.append(passes)
-                parts.append(_pass_text([passes]))
-            parts.append(_p90_text({arm: list(arms[arm].values()) for arm in ("on", "off")}))
+        for x, b in comparisons({arm for t in tasks.values() for arm in t}):
+            label = "" if (x, b) == ("on", "off") else f" · {x} minus {b}"
+            lines.append(f"\n{h} · {hr} · store {store} · seed {seed_} · model {model} · {ver}{label}")
+            task_means = defaultdict(list)
+            judged = []
+            for tid, arms in sorted(tasks.items()):
+                reps = sorted(set(arms[x]) & set(arms[b]))
+                parts = [f"{tid:<24} n {len(reps)}"]
+                for name, key, fmt in METRICS:
+                    xs = [_num(arms[x][i], key) - _num(arms[b][i], key) for i in reps
+                          if _num(arms[x][i], key) is not None and _num(arms[b][i], key) is not None]
+                    if xs:
+                        task_means[name].append(sum(xs) / len(xs))
+                    parts.append(_diff_text(name, fmt, xs, seed, draws))
+                passes = {arm: [r["pass"] for r in arms[arm].values() if isinstance(r.get("pass"), bool)]
+                          for arm in (x, b)}
+                if passes[x] and passes[b]:
+                    judged.append(passes)
+                    parts.append(_pass_text([passes], x, b))
+                parts.append(_p90_text({arm: list(arms[arm].values()) for arm in (x, b)}, x, b))
+                lines.append("  ".join(p for p in parts if p))
+            parts = [f"{'ALL':<24} tasks {len(tasks)}"]
+            parts += [_diff_text(name, fmt, task_means[name], seed, draws) for name, _, fmt in METRICS]
+            parts.append(_pass_text(judged, x, b))
+            parts.append(_p90_text({arm: [r for t in tasks.values() for r in t[arm].values()] for arm in (x, b)}, x, b))
             lines.append("  ".join(p for p in parts if p))
-        parts = [f"{'ALL':<24} tasks {len(tasks)}"]
-        parts += [_diff_text(name, fmt, task_means[name], seed, draws) for name, _, fmt in METRICS]
-        parts.append(_pass_text(judged))
-        parts.append(_p90_text({arm: [r for t in tasks.values() for r in t[arm].values()] for arm in ("on", "off")}))
-        lines.append("  ".join(p for p in parts if p))
     return "\n".join(lines)
 
 
@@ -469,7 +512,8 @@ def report(rows: list, seed: int = 0, draws: int = 10000) -> str:
 def run_parser() -> argparse.ArgumentParser:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("tasks", type=Path)
-    ap.add_argument("--harness", choices=["claude", "codex", "both"], default="both")
+    ap.add_argument("--harness", choices=["claude", "codex", "both", "local"], default="both",
+                    help="both = claude and codex; local = bench/local_agent.py on --local-url")
     ap.add_argument("--fox", default=str(LIVE_HOME / "bin/fox"))
     ap.add_argument("--work", type=Path, default=None, help="scratch dir for repo copies (default: a new temp dir)")
     ap.add_argument("--headroom", choices=["on", "off"], default="off")
@@ -478,6 +522,10 @@ def run_parser() -> argparse.ArgumentParser:
     ap.add_argument("--seed", type=int, default=None, help="order seed (default: random, recorded)")
     ap.add_argument("--model", default=None, help="model passed to both harnesses (default: theirs)")
     ap.add_argument("--max-usd", type=float, default=1.0, help="per-run cap for claude")
+    ap.add_argument("--local-url", default="http://127.0.0.1:18431", help="OpenAI-compatible server for local")
+    ap.add_argument("--local-steps", type=int, default=20, help="turn cap for local (one last answer turn after)")
+    ap.add_argument("--local-token-cap", type=int, default=200_000, help="prompt plus completion tokens, all turns")
+    ap.add_argument("--local-effort", default="low", help="reasoning_effort chat template kwarg; '' for default")
     ap.add_argument("--out", type=Path, default=Path("ab-results.jsonl"))
     ap.add_argument("--grader-selftest", action="store_true", help="check the grader on each task and exit")
     ap.add_argument("--run", action="store_true", help="actually run (default: dry-run, print commands)")
@@ -509,12 +557,15 @@ def main(argv: list | None = None) -> int:
     repo = Path(os.path.expanduser(spec["repo"]))
     tasks = {t["id"]: t for t in spec["task"]}
     harnesses = ["claude", "codex"] if a.harness == "both" else [a.harness]
+    if a.harness == "local" and a.model is None:
+        a.model = (local_agent.server_info(a.local_url).get("model") if a.run else None)
     seed = a.seed if a.seed is not None else random.SystemRandom().randrange(2**31)
     work = (a.work or Path(tempfile.mkdtemp(prefix="fox-ab-"))).resolve()
     work.mkdir(parents=True, exist_ok=True)
     mode = f"headroom-{a.headroom}"
     fox_sha = sha256_file(a.fox)
-    print(f"# {len(tasks)} tasks x {harnesses} x [on, off] x {a.repeat} · {mode} · store {a.store} · seed {seed}"
+    arms = sorted({arm for h in harnesses for arm in ARMS[h]})
+    print(f"# {len(tasks)} tasks x {harnesses} x {arms} x {a.repeat} · {mode} · store {a.store} · seed {seed}"
           f" · fox {fox_sha or 'missing'} · work {work}" + ("" if a.run else " · DRY RUN"))
 
     prov = {"seed": seed, "store": a.store, "fox_sha256": fox_sha, "model_requested": a.model or "default"}
@@ -534,7 +585,7 @@ def main(argv: list | None = None) -> int:
         universe = store_universe(ghome / "fox.db")
         prov["repo_commit"] = _out(["git", "-C", str(repo), "rev-parse", "HEAD"])
         prov["bench_commit"] = _out(["git", "-C", str(Path(__file__).resolve().parent), "rev-parse", "HEAD"])
-        versions = {h: _out([h, "--version"]) for h in harnesses}
+        versions = {h: local_version(a.local_url) if h == "local" else _out([h, "--version"]) for h in harnesses}
     out = a.out.open("a") if a.run else None
     for slot, s in enumerate(schedule(list(tasks), harnesses, a.repeat, seed)):
         t, h, arm, rep = tasks[s["task"]], s["harness"], s["arm"], s["rep"]
@@ -546,9 +597,11 @@ def main(argv: list | None = None) -> int:
         cfg = work / f"{name}.mcp.json"
         if h == "claude":
             cmd = claude_cmd(t["prompt"], cfg, a.max_usd, a.model)
-        else:
+        elif h == "codex":
             cmd = codex_cmd(t["prompt"], cwd, a.fox, arm == "on", last, plan["env"], a.model)
-        index = plan["index"] if arm == "on" else None
+        else:
+            cmd = local_cmd(t["prompt"], arm, cwd, a.fox, work / f"{name}.agent", work / f"{name}.transcript.jsonl", a)
+        index = plan["index"] if arm in INDEXED_ARMS else None
         if not a.run:
             print(f"# slot {slot}: {name}")
             print(shlex.join(clone))
@@ -557,7 +610,8 @@ def main(argv: list | None = None) -> int:
                 print(f"{envs} {shlex.join(index)}")
             print(f"(cd {shlex.quote(str(cwd))} && {shlex.join(cmd)})")
             continue
-        cfg.write_text(json.dumps(mcp_config_json(a.fox, arm == "on", plan["env"])))
+        if h != "local":
+            cfg.write_text(json.dumps(mcp_config_json(a.fox, arm == "on", plan["env"])))
         if not cwd.exists():
             subprocess.run(clone, check=True)
         env = env_for(a.headroom, plan["env"])
@@ -565,9 +619,15 @@ def main(argv: list | None = None) -> int:
             fresh_home(work / f"{name}.home")
             subprocess.run(index, env=env, check=True)
         t0 = time.monotonic()
-        p = subprocess.run(cmd, cwd=cwd, env=env, capture_output=True, text=True, timeout=1800)
+        p = subprocess.run(cmd, cwd=cwd, env=env, capture_output=True, text=True,
+                           timeout=7200 if h == "local" else 1800)
         secs = time.monotonic() - t0
-        u = usage_from_claude(p.stdout) if h == "claude" else usage_from_codex(p.stdout, last)
+        if h == "claude":
+            u = usage_from_claude(p.stdout)
+        elif h == "codex":
+            u = usage_from_codex(p.stdout, last)
+        else:
+            u = usage_from_local(p.stdout)
         ans = u.pop("answer", "") or ""
         model = u.pop("model", None) or a.model or "default"
         row = {"task": t["id"], "harness": h, "foxdb": arm, "rep": rep, "slot": slot, "headroom": mode,
