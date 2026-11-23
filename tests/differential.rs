@@ -303,3 +303,34 @@ fn python_descendant_names_follow_base_changes() {
     // n14.
     check(&[("a.py", a_nested), ("c.py", c_plain), ("d.py", d)], &[("C gains A", &[("c.py", Some(c_sub))])]);
 }
+
+/// C: a macro standing for a function, and calls through it, follow edits of either.
+#[test]
+fn c_alias_macro_edits_match_a_full_index() {
+    let _g = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    check(
+        &[
+            ("r.h", "int abbrev_ref(const char *n, int k);\n#define abbrev_branch(n) abbrev_ref((n), 1)\n"),
+            ("r.c", "#include \"r.h\"\nint abbrev_ref(const char *n, int k) { return k; }\n"),
+            ("s.c", "#include \"r.h\"\nint show(const char *n) { return abbrev_branch(n); }\n"),
+        ],
+        &[
+            (
+                "retarget the macro",
+                &[("r.h", Some("int abbrev_ref(const char *n, int k);\n#define abbrev_branch(n) (abbrev_ref((n), 2) + 1)\n"))],
+            ),
+            ("restore it", &[("r.h", Some("int abbrev_ref(const char *n, int k);\n#define abbrev_branch(n) abbrev_ref((n), 1)\n"))]),
+            (
+                "move the function",
+                &[("r.c", None), ("r2.c", Some("#include \"r.h\"\nint abbrev_ref(const char *n, int k) { return k; }\n"))],
+            ),
+            (
+                "a file-local macro of the name",
+                &[(
+                    "s.c",
+                    Some("#include \"r.h\"\n#define abbrev_branch(n) other(n)\nint show(const char *n) { return abbrev_branch(n); }\n"),
+                )],
+            ),
+        ],
+    );
+}

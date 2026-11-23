@@ -458,14 +458,17 @@ fn non_call_mentions_do_not_read_as_incomplete() {
     let (_h, _r, p) = inline_project(&[
         ("src/plan.c", "int plan_query(int q) { return q; }\nint run(void) { return plan_query(1); }\n"),
         ("include/proto.h", "#include \"plan_query.h\"\n"),
-        ("mm/b.c", "#define USE_B() plan_query(2)\n"),
+        ("mm/b.c", "#define USE_B() (plan_query(2) + 1)\n"),
     ]);
     let out = fox_code(&p, "plan_query", "callers", 800);
     assert!(
         out.starts_with("4 lines name `plan_query`: 1 call, 1 definition, 1 in strings (may be dynamic uses), 1 unresolved; may be incomplete: 1 unresolved line may use it\n"),
         "{out}"
     );
-    assert!(out.contains("unresolved mentions:\n  mm/b.c:1 | #define USE_B() plan_query(2)") && !out.contains("include/proto.h"), "{out}");
+    assert!(
+        out.contains("unresolved mentions:\n  mm/b.c:1 | #define USE_B() (plan_query(2) + 1)") && !out.contains("include/proto.h"),
+        "{out}"
+    );
 }
 
 /// A first-level impact row shows the line that uses the target, not only the dependent's
@@ -531,18 +534,15 @@ fn completeness_counts_one_word_names_and_uses_outside_symbols() {
     ]);
     // The argument in src/arg.c, the member assignment in src/field.c and the initializer in
     // src/fp.c are resolved references: listed by `refs` and `impact`, still unknown to `callers`
-    // (what is called through them is not followed).
+    // (what is called through them is not followed). The macro whose body is one call calls it.
     for (rel, head) in [
-        (
-            "callers",
-            "6 lines name `helper`: 1 call, 1 definition, 3 references, not calls, 1 unresolved; may be incomplete: 1 unresolved line",
-        ),
-        ("refs", "6 lines name `helper`: 4 refs, 1 definition, 1 unresolved; may be incomplete: 1 unresolved line"),
-        ("impact", "6 lines name `helper`: 4 uses (d1), 1 definition, 1 unresolved; partial at d1: 1 unresolved line"),
+        ("callers", "6 lines name `helper`: 2 calls, 1 definition, 3 references, not calls; may be incomplete: 3 lines pass it as a value"),
+        ("refs", "6 lines name `helper`: 5 refs, 1 definition; all accounted for"),
+        ("impact", "6 lines name `helper`: 5 uses (d1), 1 definition; all accounted for"),
     ] {
         let out = fox_code(&p, "helper", rel, 800);
         assert!(out.starts_with(head), "{rel}: {out}");
-        assert!(out.contains("unresolved mentions:\n  src/macro.c:1 | #define CALL(x) helper(x)\n"), "{rel}: {out}");
+        assert!(!out.contains("unresolved mentions"), "{rel}: {out}");
     }
     let out = fox_code(&p, "simple_open", "refs", 800);
     assert!(out.starts_with("2 lines name `simple_open`: 0 refs, 1 definition, 1 unresolved; may be incomplete"), "{out}");
@@ -3223,4 +3223,27 @@ fn c_functions_stored_in_locals_are_references() {
     let c = db::open_ro().unwrap();
     let n: i64 = c.query_row("SELECT COUNT(*) FROM ts_ref WHERE name = 'y'", [], |r| r.get(0)).unwrap();
     assert_eq!(n, 0);
+}
+
+/// C: a call through a function-like macro whose body is one call (`#define abbrev_branch(n)
+/// abbrev_ref(n, "refs/heads/")`) is listed among the callers of that call's target, labelled
+/// as through the macro; a macro with another body is not.
+#[test]
+fn c_calls_through_an_alias_macro_reach_its_target() {
+    let _g = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    let (_h, _r, p) = inline_project(&[
+        (
+            "remote.h",
+            "const char *abbrev_ref(const char *name, const char *prefix);\n#define abbrev_branch(name) abbrev_ref((name), \"refs/heads/\")\n#define twice(x) (abbrev_ref(x, 0), abbrev_ref(x, 0))\n",
+        ),
+        ("remote.c", "#include \"remote.h\"\nconst char *abbrev_ref(const char *name, const char *prefix)\n{\n\treturn name;\n}\n"),
+        ("show.c", "#include \"remote.h\"\nstatic void show(const char *n)\n{\n\tabbrev_branch(n);\n\ttwice(n);\n\tabbrev_ref(n, 0);\n}\n"),
+    ]);
+    let out = fox_code(&p, "abbrev_ref", "callers", 6000);
+    let r = rows(&out);
+    assert!(r.lines().any(|l| l.contains(":4 show c:") && l.contains("via macro abbrev_branch") && !l.contains("guess")), "{out}");
+    assert!(r.lines().any(|l| l.contains(":6 show c:") && !l.contains("via macro")), "{out}");
+    assert!(!r.contains(":5 "), "{out}");
+    let out = fox_code(&p, "abbrev_branch", "callers", 6000);
+    assert!(rows(&out).contains(":4 show c:"), "{out}");
 }

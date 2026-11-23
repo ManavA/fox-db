@@ -6,6 +6,9 @@
 ; pointer variable (`int **p;`) names none.
 (function_definition declarator: (_)) @definition.function
 (declaration declarator: [(function_declarator) (pointer_declarator) (parenthesized_declarator) (attributed_declarator)]) @definition.function
+; A function-like macro: kept only when its body is one call (`#define abbrev_branch(n)
+; abbrev_ref(n, "refs/heads/")`), which becomes its call (found at extraction).
+(preproc_function_def name: (identifier) @name) @definition.macro
 (type_definition declarator: (type_identifier) @name) @definition.type
 ; A typedef of a function pointer or a function (`typedef int (*op_fn)(int);`, `typedef int op_t(int);`):
 ; a member of that type is a function-pointer member.

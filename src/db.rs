@@ -497,8 +497,9 @@ pub(crate) fn migrate(c: &Connection) -> Result<()> {
     if v < 28 {
         // C functions declared behind nested declarators (`**f(void)`, `(*f(int))(int)`) are
         // definitions, a function stored in a C variable or a positional Go literal is a
-        // reference, and Go methods of generic types are methods. C and Go files parse again
-        // once, and their projects re-score.
+        // reference, a C macro whose body is one call is a definition calling it, and Go methods
+        // of generic types are methods. C and Go files parse again once, and their projects
+        // re-score.
         c.execute_batch(
             "UPDATE ts_file SET hash = '', size = -1 WHERE lang IN ('c', 'go');
              INSERT OR REPLACE INTO meta(k, v)

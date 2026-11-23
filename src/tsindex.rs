@@ -243,6 +243,63 @@ fn c_fn_name(decl: tree_sitter::Node) -> Option<tree_sitter::Node> {
     None
 }
 
+/// C: the function a function-like macro stands for, when its body is one call
+/// (`abbrev_ref((name), "refs/heads/")`, also in parentheses): the called name and its byte
+/// offset in `body`. None for any other body (an expression, several calls, a cast, a keyword).
+fn c_macro_target(body: &str) -> Option<(usize, String)> {
+    // A line continuation is blank space.
+    let b = body.replace("\\\n", "  ").replace("\\\r\n", "   ");
+    let bytes = b.as_bytes();
+    // The index of the parenthesis closing the one at `open`, skipping string and char literals.
+    let close = |open: usize| -> Option<usize> {
+        let (mut depth, mut i, mut quote) = (0usize, open, None::<u8>);
+        while i < bytes.len() {
+            let c = bytes[i];
+            match quote {
+                Some(_) if c == b'\\' => i += 1,
+                Some(q) if c == q => quote = None,
+                Some(_) => {}
+                None => match c {
+                    b'"' | b'\'' => quote = Some(c),
+                    b'(' => depth += 1,
+                    b')' => {
+                        depth -= 1;
+                        if depth == 0 {
+                            return Some(i);
+                        }
+                    }
+                    _ => {}
+                },
+            }
+            i += 1;
+        }
+        None
+    };
+    let (mut lo, mut hi) = (0, bytes.len());
+    loop {
+        while lo < hi && bytes[lo].is_ascii_whitespace() {
+            lo += 1;
+        }
+        while hi > lo && bytes[hi - 1].is_ascii_whitespace() {
+            hi -= 1;
+        }
+        if lo < hi && bytes[lo] == b'(' && close(lo) == Some(hi - 1) {
+            (lo, hi) = (lo + 1, hi - 1);
+        } else {
+            break;
+        }
+    }
+    let end = lo + bytes[lo..hi].iter().take_while(|c| c.is_ascii_alphanumeric() || **c == b'_').count();
+    if end == lo || bytes[lo].is_ascii_digit() {
+        return None;
+    }
+    let name = &b[lo..end];
+    const NOT_CALLS: &[&str] =
+        &["sizeof", "typeof", "__typeof__", "_Alignof", "__alignof__", "_Generic", "defined", "if", "while", "for", "switch", "return"];
+    let open = end + bytes[end..hi].iter().take_while(|c| c.is_ascii_whitespace()).count();
+    (open < hi && bytes[open] == b'(' && close(open) == Some(hi - 1) && !NOT_CALLS.contains(&name)).then(|| (lo, name.to_string()))
+}
+
 /// C/C++: what a typedef or a field declares besides its type name, from its declarators:
 /// `(td, tk)` (see [`Def`]). A typedef whose declarator is a function (`(*op_fn)(int)`, `op_t(int)`)
 /// has `td`, its pointers below the function; a typedef or a field of a typedef'd type
@@ -1253,7 +1310,26 @@ pub fn extract(l: &Lang, src: &[u8]) -> Parsed {
                 stubs.insert(node.start_byte(), (name.clone(), scope));
             }
             let mut w = node.walk();
-            let stat = node.children(&mut w).any(|ch| ch.kind() == "storage_class_specifier" && text(ch) == "static");
+            let mut stat = node.children(&mut w).any(|ch| ch.kind() == "storage_class_specifier" && text(ch) == "static");
+            // C: a function-like macro is kept only when its body is one call, which becomes its
+            // call; like a `static` function, one in a `.c` file is that file's own.
+            if c_lang && node.kind() == "preproc_function_def" {
+                let Some(body) = node.child_by_field_name("value") else { continue };
+                let Some((off, target)) = c_macro_target(&text(body)).filter(|t| t.1 != name) else { continue };
+                let before = &src[body.start_byte()..body.start_byte() + off];
+                out.refs.push(Ref {
+                    kind: "call",
+                    name: target,
+                    line: body.start_position().row as u32 + 1 + before.iter().filter(|b| **b == b'\n').count() as u32,
+                    caller: None,
+                    recv: false,
+                    via: None,
+                    recv_local: false,
+                    rtype: None,
+                    pos: body.start_byte() + off,
+                });
+                stat = true;
+            }
             out.defs.push(Def {
                 kind,
                 name,
