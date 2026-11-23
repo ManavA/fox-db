@@ -221,6 +221,28 @@ fn c_fn_pointer(nn: tree_sitter::Node, decl: tree_sitter::Node) -> bool {
     false
 }
 
+/// C: the name a function definition or prototype declares: the identifier a function declarator
+/// names directly, under any pointers and parentheses (`**f(void)`, `(*f(int))(int)`). None for
+/// a variable (`int **p;`, `int (*fp)(int);`).
+fn c_fn_name(decl: tree_sitter::Node) -> Option<tree_sitter::Node> {
+    let mut d = decl.child_by_field_name("declarator")?;
+    for _ in 0..16 {
+        let next = match d.kind() {
+            "pointer_declarator" | "function_declarator" => d.child_by_field_name("declarator"),
+            "parenthesized_declarator" | "attributed_declarator" => {
+                let mut w = d.walk();
+                d.named_children(&mut w).find(|c| c.kind() == "identifier" || c.kind().ends_with("declarator"))
+            }
+            _ => None,
+        }?;
+        if next.kind() == "identifier" {
+            return (d.kind() == "function_declarator").then_some(next);
+        }
+        d = next;
+    }
+    None
+}
+
 /// C/C++: what a typedef or a field declares besides its type name, from its declarators:
 /// `(td, tk)` (see [`Def`]). A typedef whose declarator is a function (`(*op_fn)(int)`, `op_t(int)`)
 /// has `td`, its pointers below the function; a typedef or a field of a typedef'd type
@@ -1147,6 +1169,9 @@ pub fn extract(l: &Lang, src: &[u8]) -> Parsed {
             }
         }
         let Some((node, cn)) = outer else { continue };
+        if name_node.is_none() && c_lang && matches!(node.kind(), "function_definition" | "declaration") {
+            name_node = c_fn_name(node);
+        }
         let name = match name_node {
             Some(n) => text(n),
             None if l.name == "kotlin" && node.kind() == "companion_object" => "Companion".to_string(),

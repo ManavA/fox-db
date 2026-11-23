@@ -3155,3 +3155,29 @@ fn cpp_global_only_partial_qualifier_is_a_guess_when_shadowable() {
         );
     }
 }
+
+fn extract_text(path: &str, src: &str) -> Parsed {
+    tsindex::extract(lang::for_path(path).unwrap(), src.as_bytes())
+}
+
+/// C: a function returning a pointer to a pointer, or a function pointer, is a definition (and
+/// a prototype one), so the calls in its body belong to it; a pointer variable is none.
+#[test]
+fn c_functions_behind_nested_declarators_are_definitions() {
+    let p = extract_text(
+        "x.c",
+        "struct node **append(struct node **tail, int v)\n{\n\treturn link(tail, v);\n}\nint ***deep(void) { return grow(); }\nvoid (*pick(int k))(int)\n{\n\treturn choose(k);\n}\nstatic char *(*maker(void))(int) { return build(); }\nint **proto(int);\nvoid (*sig(int, void (*)(int)))(int);\nint (*fp)(int);\nint **pp;\n",
+    );
+    let cs = calls(&p);
+    for (a, b) in [("append", "link"), ("deep", "grow"), ("pick", "choose"), ("maker", "build")] {
+        assert!(cs.iter().any(|(x, y)| x == a && y == b), "{a} -> {b}: {cs:?}");
+    }
+    let q = qnames(&p);
+    for d in ["proto", "sig"] {
+        assert!(q.iter().any(|x| x == d), "{d}: {q:?}");
+    }
+    for d in ["fp", "pp", "tail"] {
+        assert!(!q.iter().any(|x| x == d), "{d}: {q:?}");
+    }
+    assert!(p.defs.iter().find(|d| d.name == "maker").is_some_and(|d| d.stat), "{:?}", p.defs);
+}
