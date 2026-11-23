@@ -3065,9 +3065,14 @@ fn score(r: &RefRow, cands: &[Cand], imp: Option<&FileImports>) -> (i64, i64) {
     if rust && r.qual {
         return rust_path_score(r, cands);
     }
+    let rust_recv = rust && r.recv;
+    if rust_recv && let Some(x) = rust_self_score(r, cands) {
+        return x;
+    }
     let (d, a) = score_name(r, cands, imp);
-    // C++: a receiver type in doubt never makes the name-based pick certain.
-    if r.recv_doubt && d != 0 && a == 0 { (d, 2) } else { (d, a) }
+    // C++: a receiver type in doubt never makes the name-based pick certain. Rust: nor does a
+    // receiver whose type is unknown (`ft.is_symlink()` may be a library type's method).
+    if (r.recv_doubt || rust_recv) && d != 0 && a == 0 { (d, if rust_recv { 1 } else { 2 }) } else { (d, a) }
 }
 
 /// Rust: a file's module as a path (`src/util/deep.rs` -> `src`, `util`, `deep`); `mod.rs`,
@@ -3078,6 +3083,23 @@ fn rust_mod_path(p: &str) -> Vec<&str> {
         v.pop();
     }
     v
+}
+
+/// Rust: `self.f()` in an impl of a type reaches that type's method `f`: certain when one is in
+/// the caller's file, or the only one is in its directory; a guess among several elsewhere. None
+/// when the type has no method of the name (a trait's, which an impl may override).
+fn rust_self_score(r: &RefRow, cands: &[Cand]) -> Option<(i64, i64)> {
+    if r.via.as_deref() != Some("self") || r.caller_type.is_empty() {
+        return None;
+    }
+    let own: Vec<&Cand> = cands.iter().filter(|s| s.family == "rust" && is_callable_kind(&s.kind) && s.parent == r.caller_type).collect();
+    let here: Vec<&&Cand> = own.iter().filter(|s| s.path == r.path).collect();
+    match (own.len(), here.len()) {
+        (0, _) => None,
+        (_, 1) => Some((here[0].id, 0)),
+        (1, _) if dir_of(&own[0].path) == dir_of(&r.path) => Some((own[0].id, 0)),
+        (n, _) => Some((own[0].id, n as i64)),
+    }
 }
 
 /// Rust: a call through a path (see [`rust_qualifier`]) reaches the callables that path names:
@@ -4169,9 +4191,16 @@ pub(crate) fn resolve_scoped_c(
     //    the container of every definition involved.
     let mut cands: HashMap<String, Vec<Cand>> = HashMap::new();
     let mut parent_of: HashMap<i64, (i64, bool)> = HashMap::new(); // id -> (container id, callable)
-    // Go calling definitions: id -> its receiver's type (methods are not nested in their type).
-    let go_srcs: HashSet<i64> =
-        refs.iter().filter(|r| r.recv_local && lang::for_path(&r.path).is_some_and(|l| l.family == "go")).map(|r| r.src).collect();
+    // Go and Rust calling definitions: id -> its receiver's or impl's type (methods are not
+    // nested in their type).
+    let go_srcs: HashSet<i64> = refs
+        .iter()
+        .filter(|r| {
+            let fam = lang::for_path(&r.path).map_or("", |l| l.family);
+            r.recv_local && fam == "go" || fam == "rust" && r.via.as_deref() == Some("self") && !r.qual
+        })
+        .map(|r| r.src)
+        .collect();
     let mut type_of: HashMap<i64, String> = HashMap::new();
     // C references whose target follows from a type path (member calls, functions stored in members).
     let c_refs: Vec<usize> = refs

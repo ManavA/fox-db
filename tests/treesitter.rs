@@ -3300,3 +3300,32 @@ fn rust_path_qualified_calls_follow_the_module_tree() {
         assert!(rows(&out).is_empty(), "{name}: {out}");
     }
 }
+
+/// Rust: a method call through a receiver of unknown type (`ft.is_symlink()` on a library type,
+/// `self.seq.literals()`, `w.is_symlink()`) is never certain; `self.f()` in an impl of the
+/// method's own type is.
+#[test]
+fn rust_receiver_calls_of_unknown_type_are_guesses() {
+    let _g = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    let (_h, _r, p) = inline_project(&[
+        (
+            "src/walk.rs",
+            "pub struct Work { dent: Dent }\nimpl Work {\n    pub fn is_symlink(&self) -> bool {\n        self.dent.file_type().map_or(false, |ft| ft.is_symlink())\n    }\n    pub fn check(&self) -> bool {\n        self.is_symlink()\n    }\n}\npub fn other(w: &Work) -> bool {\n    w.is_symlink()\n}\n",
+        ),
+        (
+            "src/lit.rs",
+            "pub struct TSeq;\nimpl TSeq {\n    pub fn literals(&self) -> Option<u8> {\n        None\n    }\n}\npub struct Inner {\n    seq: Seq,\n}\nimpl Inner {\n    pub fn one(&self) {\n        let _ = self.seq.literals();\n    }\n}\n",
+        ),
+        (
+            "src/two.rs",
+            "struct A;\nimpl A {\n    fn run(&self) {\n        self.go()\n    }\n    fn go(&self) {}\n}\nstruct B;\nimpl B {\n    fn go(&self) {}\n}\n",
+        ),
+    ]);
+    let out = fox_code(&p, "Work.is_symlink", "callers", 6000);
+    not_certain(&out, "Work.is_symlink");
+    not_certain(&out, "other");
+    sure(&out, "Work.check");
+    not_certain(&fox_code(&p, "TSeq.literals", "callers", 6000), "Inner.one");
+    sure(&fox_code(&p, "A.go", "callers", 6000), "A.run");
+    not_certain(&fox_code(&p, "B.go", "callers", 6000), "A.run");
+}
