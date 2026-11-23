@@ -418,6 +418,8 @@ fn py_rescope(tx: &Connection, pid: i64, refs: &[RefRow], scored: &[(i64, i64, i
     // The changed classes and their bases, old and new: the names they and their ancestors
     // define are the only ones whose resolution order may have changed.
     let mut names_of: Vec<i64> = vec![];
+    // The classes whose own bases changed.
+    let mut changed: Vec<i64> = vec![];
     let keys: HashSet<&(String, String)> = c.py_old.keys().chain(new.keys()).collect();
     for key in keys {
         let olds = c.py_old.get(key).map(Vec::as_slice).unwrap_or(&[]);
@@ -434,6 +436,7 @@ fn py_rescope(tx: &Connection, pid: i64, refs: &[RefRow], scored: &[(i64, i64, i
             for n in news {
                 seeds.push(n.0);
                 seeds.extend(n.1.iter().map(|b| b.0));
+                changed.push(n.0);
                 names_of.push(n.0);
                 names_of.extend(n.1.iter().map(|b| b.0));
             }
@@ -445,6 +448,7 @@ fn py_rescope(tx: &Connection, pid: i64, refs: &[RefRow], scored: &[(i64, i64, i
         if r.kind == "impl" && !c.py_paths.contains(&r.path) && is_py(&r.path) && (norm(old), r.amb) != (s.0, s.1) {
             seeds.extend([r.src, norm(old), s.0]);
             names_of.extend([r.src, norm(old), s.0]);
+            changed.push(r.src);
         }
     }
     seeds.retain(|&x| x > 0);
@@ -468,15 +472,74 @@ fn py_rescope(tx: &Connection, pid: i64, refs: &[RefRow], scored: &[(i64, i64, i
             }
         }
     }
-    let mut names: HashSet<String> = HashSet::new();
+    // Names defined by the symbols directly in `ids`, and those symbols plus theirs (methods
+    // and the functions nested in them), in batches.
+    let names_in = |ids: &[i64]| -> Result<HashSet<String>> {
+        let mut out = HashSet::new();
+        for chunk in ids.chunks(500) {
+            let list = chunk.iter().map(i64::to_string).collect::<Vec<_>>().join(",");
+            let mut q = tx.prepare(&format!("SELECT name FROM node WHERE json_extract(meta,'$.pid') IN ({list}) AND kind = 'symbol'"))?;
+            out.extend(q.query_map([], |r| r.get::<_, String>(0))?.flatten());
+        }
+        Ok(out)
+    };
+    let members_of = |ids: &[i64]| -> Result<Vec<i64>> {
+        let mut srcs: Vec<i64> = vec![];
+        let mut level: Vec<i64> = ids.to_vec();
+        for _ in 0..2 {
+            let mut next: Vec<i64> = vec![];
+            for chunk in level.chunks(500) {
+                let list = chunk.iter().map(i64::to_string).collect::<Vec<_>>().join(",");
+                let mut q = tx.prepare(&format!("SELECT id FROM node WHERE json_extract(meta,'$.pid') IN ({list}) AND kind = 'symbol'"))?;
+                next.extend(q.query_map([], |r| r.get::<_, i64>(0))?.flatten());
+            }
+            srcs.extend(&next);
+            level = next;
+        }
+        Ok(srcs)
+    };
+    let done: HashSet<i64> = refs.iter().map(|r| r.rowid).collect();
+    // The `self.`/`cls.`/`super()` calls of `srcs` whose name is in `names`.
+    let calls_of = |srcs: &[i64], names: &HashSet<String>, out: &mut Vec<i64>| -> Result<()> {
+        for chunk in srcs.chunks(500) {
+            let list = chunk.iter().map(i64::to_string).collect::<Vec<_>>().join(",");
+            let mut q = tx.prepare(&format!(
+                "SELECT rowid, name FROM ts_ref WHERE src IN ({list}) AND src != 0 AND kind = 'call' AND via IN ('self', 'cls', 'super')"
+            ))?;
+            out.extend(
+                q.query_map([], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?)))?
+                    .flatten()
+                    .filter(|(x, n)| !done.contains(x) && names.contains(n))
+                    .map(|x| x.0),
+            );
+        }
+        Ok(())
+    };
     let anc: Vec<i64> = anc.into_iter().collect();
-    for chunk in anc.chunks(500) {
-        let ids = chunk.iter().map(i64::to_string).collect::<Vec<_>>().join(",");
-        let mut q = tx.prepare(&format!("SELECT name FROM node WHERE json_extract(meta,'$.pid') IN ({ids}) AND kind = 'symbol'"))?;
-        names.extend(q.query_map([], |r| r.get::<_, String>(0))?.flatten());
+    let names = names_in(&anc)?;
+    let mut out: Vec<i64> = vec![];
+    // The changed classes and their ancestors call names their subclasses define: a subclass
+    // reached or lost may make such a call's answer differ.
+    {
+        let mut desc: HashSet<i64> = changed.iter().copied().filter(|&x| x > 0).collect();
+        let mut dtodo: Vec<i64> = desc.iter().copied().collect();
+        while let Some(k) = dtodo.pop() {
+            for d in down.query_map([k], |r| r.get::<_, i64>(0))?.flatten() {
+                if d > 0 && desc.insert(d) {
+                    dtodo.push(d);
+                }
+            }
+        }
+        let desc: Vec<i64> = desc.into_iter().collect();
+        let dnames = names_in(&desc)?;
+        if !dnames.is_empty() {
+            calls_of(&members_of(&anc)?, &dnames, &mut out)?;
+        }
     }
     if names.is_empty() {
-        return Ok(vec![]);
+        out.sort_unstable();
+        out.dedup();
+        return Ok(out);
     }
     while let Some(k) = todo.pop() {
         classes.push(k);
@@ -487,35 +550,9 @@ fn py_rescope(tx: &Connection, pid: i64, refs: &[RefRow], scored: &[(i64, i64, i
             }
         }
     }
-    // Their calls through `self`, `cls` or `super()` (in methods, and functions nested in them),
-    // in batches: the members of the classes, theirs, then the calls of all of them.
+    // Their calls through `self`, `cls` or `super()` (in methods, and functions nested in them).
     classes.sort_unstable();
-    let done: HashSet<i64> = refs.iter().map(|r| r.rowid).collect();
-    let mut srcs: Vec<i64> = vec![];
-    let mut level = classes;
-    for _ in 0..2 {
-        let mut next: Vec<i64> = vec![];
-        for chunk in level.chunks(500) {
-            let ids = chunk.iter().map(i64::to_string).collect::<Vec<_>>().join(",");
-            let mut q = tx.prepare(&format!("SELECT id FROM node WHERE json_extract(meta,'$.pid') IN ({ids}) AND kind = 'symbol'"))?;
-            next.extend(q.query_map([], |r| r.get::<_, i64>(0))?.flatten());
-        }
-        srcs.extend(&next);
-        level = next;
-    }
-    let mut out: Vec<i64> = vec![];
-    for chunk in srcs.chunks(500) {
-        let ids = chunk.iter().map(i64::to_string).collect::<Vec<_>>().join(",");
-        let mut q = tx.prepare(&format!(
-            "SELECT rowid, name FROM ts_ref WHERE src IN ({ids}) AND src != 0 AND kind = 'call' AND via IN ('self', 'cls', 'super')"
-        ))?;
-        out.extend(
-            q.query_map([], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?)))?
-                .flatten()
-                .filter(|(x, n)| !done.contains(x) && names.contains(n))
-                .map(|x| x.0),
-        );
-    }
+    calls_of(&members_of(&classes)?, &names, &mut out)?;
     out.sort_unstable();
     out.dedup();
     Ok(out)
@@ -543,6 +580,37 @@ fn cpp_virtual(n: tree_sitter::Node) -> bool {
             let mut w = d.walk();
             d.children(&mut w).any(|c| c.kind() == "virtual_specifier")
         })
+}
+
+/// C++: a type path whose base is a qualified type (`S:detail::Engine`) gets the namespaces
+/// around `at` appended (`S:detail::Engine@a.b`, inline namespaces left out): a partly qualified
+/// name is looked up from there.
+fn cpp_with_ns(t: String, at: tree_sitter::Node, src: &[u8]) -> String {
+    let (base, rest) = t.split_once('|').map_or((t.as_str(), None), |(b, r)| (b, Some(r)));
+    if !(base.starts_with("S:") || base.starts_with("W:")) || !base.contains("::") || base[2..].starts_with("::") {
+        return t;
+    }
+    let mut names: Vec<String> = vec![];
+    let mut up = at.parent();
+    while let Some(n) = up {
+        if n.kind() == "namespace_definition" {
+            let mut w = n.walk();
+            let inline = n.children(&mut w).any(|c| c.kind() == "inline");
+            if !inline && let Some(nm) = n.child_by_field_name("name").and_then(|x| x.utf8_text(src).ok()) {
+                names.push(nm.replace("::", "."));
+            }
+        }
+        up = n.parent();
+    }
+    if names.is_empty() {
+        return t;
+    }
+    names.reverse();
+    let base = format!("{base}@{}", names.join("."));
+    match rest {
+        Some(r) => format!("{base}|{r}"),
+        None => base,
+    }
 }
 
 /// C++: does type path base `t` (`S:T`, `W:T`, `S:T::inner`) name a template parameter?
@@ -1122,7 +1190,11 @@ pub fn extract(l: &Lang, src: &[u8]) -> Parsed {
             let (node, last) = if kind == FIELD && !value_fn { (nn, nn) } else { (node, last) };
             let mut ty = if c_family && matches!(kind.as_str(), "field" | "function" | "type") {
                 let d = outer.map_or(node, |o| o.0);
-                if cpp { d.child_by_field_name("type").and_then(|t| cpp_type(t, src)) } else { c_type_name(d, src) }
+                if cpp {
+                    d.child_by_field_name("type").and_then(|t| cpp_type(t, src)).map(|t| cpp_with_ns(t, d, src))
+                } else {
+                    c_type_name(d, src)
+                }
             } else {
                 None
             };
@@ -1191,7 +1263,9 @@ pub fn extract(l: &Lang, src: &[u8]) -> Parsed {
             let rtype = match (c_lang, kind, parent) {
                 (true, "call", Some(p)) if recv && p.kind() == "field_expression" => c_chain(p, &walk, src, 0),
                 (true, "ref", Some(p)) => c_slot(nn, p, &walk, src),
-                (false, "call", Some(p)) if cpp && recv && p.kind() == "field_expression" => cpp_chain(p, &walk, src, 0),
+                (false, "call", Some(p)) if cpp && recv && p.kind() == "field_expression" => {
+                    cpp_chain(p, &walk, src, 0).map(|t| cpp_with_ns(t, p, src))
+                }
                 _ => None,
             };
             out.refs.push(Ref {
@@ -2251,6 +2325,8 @@ impl CTypes {
     /// matches is outside the project (`std::string`).
     fn cpp_class(&mut self, t: &str, fetch: &mut dyn FnMut(&str) -> Vec<CSym>) -> CppRecv {
         let Some(q) = t.strip_prefix("S:") else { return CppRecv::Unknown };
+        // The namespaces around the use (see [`cpp_with_ns`]).
+        let (q, around) = q.split_once('@').unwrap_or((q, ""));
         let q = q.trim_start_matches("::").replace("::", ".");
         if q.is_empty() || q.contains('<') {
             return CppRecv::Unknown;
@@ -2262,10 +2338,19 @@ impl CTypes {
         let unique = fulls.len() == 1 && types == 0;
         if q.contains('.') {
             // The qualifier names the class as written from outside (past inline namespaces,
-            // see [`Parsed::outside_name`]), or a tail of that (from inside an enclosing
-            // namespace). Skipping any other namespace is no match: `a::Engine` is not
-            // `a::detail::Engine`.
-            let hits: Vec<&(String, String)> = fulls.iter().filter(|(_, o)| *o == q || o.ends_with(&format!(".{q}"))).collect();
+            // see [`Parsed::outside_name`]), from one of the namespaces around the use.
+            // Skipping any other namespace is no match: `a::Engine` is not `a::detail::Engine`.
+            // Looked up from the innermost namespace around the use outward, as C++ does: the
+            // first scope where a class matches decides.
+            let around: Vec<&str> = if around.is_empty() { vec![] } else { around.split('.').collect() };
+            let mut hits: Vec<&(String, String)> = vec![];
+            for k in (0..=around.len()).rev() {
+                let want = if k == 0 { q.clone() } else { format!("{}.{q}", around[..k].join(".")) };
+                hits = fulls.iter().filter(|(_, o)| *o == want).collect();
+                if !hits.is_empty() {
+                    break;
+                }
+            }
             return match hits.as_slice() {
                 [one] => CppRecv::Class(one.0.clone(), unique),
                 [] if !fulls.is_empty() => CppRecv::Doubt,
@@ -3319,9 +3404,6 @@ fn python_mro(
                 scored[i] = (0, 0, scored[i].2);
                 continue;
             }
-            if hit == MroHit::None {
-                continue;
-            }
         }
         // In doubt: never the calling class's own method for `super()`, never certain.
         if is_super && own_pick {
@@ -3649,7 +3731,8 @@ pub(crate) fn resolve_scoped_c(
                         || !c.classes.is_empty() && field_step(t)
                         || t.split('|').any(|seg| {
                             let name = seg.split_once(':').map_or(seg, |x| x.1).trim_start_matches(['.', '>']);
-                            c.fields.contains(name) || c.classes.contains(name.rsplit("::").next().unwrap_or(name))
+                            let ty = name.split('@').next().unwrap_or(name);
+                            c.fields.contains(name) || c.classes.contains(ty.rsplit("::").next().unwrap_or(ty))
                         })
                 };
                 rowids.extend(

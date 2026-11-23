@@ -37,7 +37,8 @@ Each step keeps its operator: a smart pointer or `optional` (`W:Pump`) reaches i
 through `->` or `*`, and its own members (`p.reset()`) are no project method, nor are those of a
 qualified type in a library namespace (`std::`, `boost::`, ...) when the project has no class of
 its last name. A qualifier matches a class by the name it is written with from outside, past `inline`
-namespaces (`meta.cq`), or a tail of it; skipping any other namespace is no match; an unmatched qualifier leaves the name pick, as a guess when classes of that
+namespaces (`meta.cq`), looked up from the namespaces around the use outward (a qualified
+type path carries them: `S:detail::Engine@a.b`); skipping any other namespace is no match; an unmatched qualifier leaves the name pick, as a guess when classes of that
 name exist elsewhere (`std::string` beside `mylib::string`). Template parameters are no classes.
 Resolution follows the fields to the receiver's class, which must be the only class (or typedef)
 of its name, or for a qualified name the only class whose whole name ends in it; a method that
@@ -60,8 +61,10 @@ the enclosing class. Walks are memoized per class, name and start. An incrementa
 re-parsed or removed Python files before they go; after scoring, a class that appeared, went or
 whose bases resolve differently (an edit, a re-targeted import, a base class added elsewhere)
 re-scores, in a second pass, the `self`/`cls`/`super()` calls of every class connected to it
-through base links, of the names the changed classes and their old and new ancestors define
-(only those can resolve differently). A class named by a guessed base link anywhere may have a
+through base links, of the names the changed classes and their old and new ancestors define,
+and the calls in the changed classes and their ancestors of names their descendants define
+(only those can resolve differently). A call no class of the caller's order defines stays a
+guess. A class named by a guessed base link anywhere may have a
 subclass that cannot be told, so its calls stay guesses. Same-name candidates tie by path, then
 id, so a re-parse that renumbers a file breaks ties as a full run does. `tests/differential.rs` checks incremental runs against full ones over
 sequences of edits.

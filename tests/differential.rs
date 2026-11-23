@@ -284,3 +284,22 @@ fn c_edits_match_a_full_index() {
         ],
     );
 }
+
+/// A name defined only in a subclass becomes reachable from an ancestor's call when a class in
+/// between gains or loses that ancestor as a base (also for a call in a nested function).
+#[test]
+fn python_descendant_names_follow_base_changes() {
+    let _g = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    let a = "class A:\n    def run(self):\n        return self.x()\n";
+    let a_nested = "class A:\n    def run(self):\n        def inner():\n            return self.x()\n        return inner()\n";
+    let c_plain = "class C:\n    pass\n";
+    let c_sub = "from a import A\n\n\nclass C(A):\n    pass\n";
+    let d = "from c import C\n\n\nclass D(C):\n    def x(self):\n        return 1\n";
+    // n1, then n2 (its reverse).
+    check(
+        &[("a.py", a), ("c.py", c_plain), ("d.py", d)],
+        &[("C gains A", &[("c.py", Some(c_sub))]), ("C loses A", &[("c.py", Some(c_plain))])],
+    );
+    // n14.
+    check(&[("a.py", a_nested), ("c.py", c_plain), ("d.py", d)], &[("C gains A", &[("c.py", Some(c_sub))])]);
+}

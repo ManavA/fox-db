@@ -3040,3 +3040,38 @@ fn python_base_change_on_a_wide_hierarchy_is_fast() {
     tsindex::resolve(&c, p.id).unwrap();
     assert_eq!(ref_snapshot(&c), inc);
 }
+
+/// Python: a `self.` call no class of the caller's order defines is never certain, even when
+/// one unrelated class defines the name.
+#[test]
+fn python_self_call_outside_the_hierarchy_is_a_guess() {
+    let _g = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    let (_h, _r, p) = inline_project(&[(
+        "a.py",
+        "class A:\n    def run(self):\n        return self.x()\n\n\nclass Other:\n    def x(self):\n        return 1\n",
+    )]);
+    let out = fox_code(&p, "Other.x", "callers", 6000);
+    not_certain(&out, "A.run");
+    let (_h, _r, p) = inline_project(&[
+        ("o.py", "class Other:\n    def x(self):\n        return 1\n"),
+        ("a.py", "class Root:\n    pass\n\n\nclass A(Root):\n    def run(self):\n        return self.x()\n"),
+    ]);
+    let out = fox_code(&p, "Other.x", "callers", 6000);
+    not_certain(&out, "A.run");
+}
+
+/// C++: a partly qualified type matches a class only through the namespaces around its use:
+/// `detail::Engine` at global scope or in namespace `b` is no `a::detail::Engine`; inside `a`
+/// it is.
+#[test]
+fn cpp_partial_qualifier_resolves_through_enclosing_namespaces() {
+    let _g = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    let (_h, _r, p) = inline_project(&[(
+        "e.cpp",
+        "namespace a { namespace detail { class Engine { public: void start() {} }; } }\nnamespace b { void k(detail::Engine& e) { e.start(); } }\nvoid g(detail::Engine& e) { e.start(); }\nnamespace a { void h(detail::Engine& e) { e.start(); } }\n",
+    )]);
+    let out = fox_code(&p, "Engine.start", "callers", 6000);
+    assert!(row_of(&out, "b.k").is_some_and(|r| r.contains("guess")), "{out}");
+    assert!(row_of(&out, "g").is_some_and(|r| r.contains("guess")), "{out}");
+    assert!(row_of(&out, "a.h").is_some_and(|r| !r.contains("guess")), "{out}");
+}
