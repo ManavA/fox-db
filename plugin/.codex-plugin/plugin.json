@@ -6,8 +6,8 @@
     "name": "ManavA",
     "url": "https://github.com/ManavA"
   },
-  "homepage": "https://github.com/ManavA/foxdb",
-  "repository": "https://github.com/ManavA/foxdb",
+  "homepage": "https://github.com/ManavA/fox-db",
+  "repository": "https://github.com/ManavA/fox-db",
   "license": "AGPL-3.0-or-later",
   "keywords": ["code-search", "call-graph", "mcp", "multi-agent", "handoff"],
   "skills": "./skills/",

@@ -3,7 +3,7 @@ name: foxdb
 description: Navigate an indexed codebase by name - where X is defined, what calls X, what breaks if X changes, which doc or past session covers X. Use when asked to find, trace, change, rename or delete a function, type, field or file, or to recall a past decision or handoff, even when a grep looks quicker, because the fox_* tools return ranked path:line rows with the code at each call site and a call graph that follows qualified and aliased names.
 ---
 
-# foxdb
+# fox-db
 
 Every session starts with a `foxdb · <project> ...` brief. The index is local and refreshes itself. Four MCP tools; the same verbs exist as the `fox` CLI for a shell.
 
@@ -21,7 +21,7 @@ For past decisions, handoffs and long logs: `fox_memory op=recall q=<words>`; `o
 
 ## Swarm protocol
 
-When several agents work one task, the board is their shared log. Subagent briefs restate these rules only when `[hooks] swarm_board = true` is set in foxdb's `config.toml`; they hold either way.
+When several agents work one task, the board is their shared log. Subagent briefs restate these rules only when `[hooks] swarm_board = true` is set in fox-db's `config.toml`; they hold either way.
 
 1. **Read what is new before each new lead.** `fox_memory op=read since=me` (a subagent adds `agent=<its name>`: subagents share their parent's server), or `since=h:N` from the `parent packet h:N` line of your brief, then the `since=h:N` each read ends with.
 2. **Post what you learn, as you learn it.** `op=post kind=fact` for a finding, `kind=failed` for an approach that did not work and why, `kind=question` for an open question. One claim per entry, under 600 characters.
@@ -34,7 +34,7 @@ When several agents work one task, the board is their shared log. Subagent brief
 |---|---|
 | A grep is enough | Grep misses aliased imports and package-qualified calls (`podutil.GetContainerStatus`) and returns same-name functions of other packages; `rel=callers` resolves them. |
 | I'll just Read the file | `fox_read` returns the one symbol, or the file's declarations with ranges to read next. |
-| The answer was empty, so foxdb cannot help | Try the handle from `fox_find`, or `Type.member` / `pkg.Name`; then check the unresolved mentions it lists. |
+| The answer was empty, so fox-db cannot help | Try the handle from `fox_find`, or `Type.member` / `pkg.Name`; then check the unresolved mentions it lists. |
 
 ## Reference
 
@@ -50,4 +50,4 @@ When several agents work one task, the board is their shared log. Subagent brief
 - Handles: `s:`/`c:` symbol, `f:` file, `d:` doc, `m:` milestone, `a:` dir, `g:` memory, `x:` session, `h:` handoff.
 - Every tool takes `budget` (tokens, default 500). `+N more · cursor=K` means the answer is cut: pass `cursor=K` for the rest. `code left out to fit the budget; budget=N shows it` means call again with that budget for the code.
 - `~` = not compiler-resolved (tree-sitter, or Swift changed since the build); `guess 1 of N` marks a call resolved by name among N same-name definitions.
-- Secrets are never read or indexed. If a `fox` call errors, continue with your other tools. foxdb is read-only: edit with your editor tools.
+- Secrets are never read or indexed. If a `fox` call errors, continue with your other tools. fox-db is read-only: edit with your editor tools.

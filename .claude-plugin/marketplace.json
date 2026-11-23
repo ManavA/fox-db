@@ -1,6 +1,6 @@
 {
   "name": "foxdb",
-  "description": "foxdb: a local code graph, index and shared agent context for Claude Code.",
+  "description": "fox-db: a local code graph, index and shared agent context for Claude Code.",
   "owner": {
     "name": "ManavA",
     "url": "https://github.com/ManavA"

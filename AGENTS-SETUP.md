@@ -1,6 +1,6 @@
-# Setting up foxdb (for AI agents)
+# Setting up fox-db (for AI agents)
 
-This file is for an agent asked to "set up foxdb from <repo>". Follow it top to bottom. Every
+This file is for an agent asked to "set up fox-db from <repo>". Follow it top to bottom. Every
 command block marked `sh` below can be run as written; replace only what a comment tells you to
 replace. `scripts/docs-test.sh` runs these same blocks in a scratch home, so they are known to work.
 
@@ -13,7 +13,7 @@ replace. `scripts/docs-test.sh` runs these same blocks in a scratch home, so the
 - **Back up a settings file before you edit it** (the commands below do), and edit it only with
   the commands shown or the harness's own CLI (`claude mcp add`, `codex mcp add`).
 - **Never edit harness memory files**: `CLAUDE.md`, `~/.claude/projects/*/memory/`, Codex
-  memories or any other file an agent writes for itself. foxdb only reads them.
+  memories or any other file an agent writes for itself. fox-db only reads them.
 - Never use `sudo`; everything installs under the user's home.
 - Never delete `~/.foxdb` unless the user asked to uninstall: it holds their index and handoff board.
 - Do not start `foxd` as a system service without asking; it is optional.
@@ -36,19 +36,19 @@ a source build (install from https://rustup.rs if missing, after asking). `jq` i
 for the Claude Code hooks step. Note which harnesses were found: you will set up only those.
 
 This guide uses the default data directory `~/.foxdb`. If `FOXDB_HOME` is set to anything else,
-ask the user to unset it for foxdb (simplest). Otherwise replace `~/.foxdb` and `$HOME/.foxdb`
+ask the user to unset it for fox-db (simplest). Otherwise replace `~/.foxdb` and `$HOME/.foxdb`
 with that directory in every command and snippet below, and make sure each harness passes the same
 `FOXDB_HOME` to `fox`; the installer and `fox` follow `FOXDB_HOME`, the snippets below do not.
 
 ## 2. Build or install
 
-If the user named a local checkout (for example "set up foxdb from ~/foxdb"), `cd` into it and
+If the user named a local checkout (for example "set up fox-db from ~/fox-db"), `cd` into it and
 run `scripts/install.sh --source` instead of the block below, so that checkout is what gets built
 (without `--source` the installer prefers the v0.2.5 release asset where there is one).
 Otherwise clone the repository and run the installer from inside the clone:
 
 ```sh
-git clone https://github.com/ManavA/foxdb.git && cd foxdb
+git clone https://github.com/ManavA/fox-db.git && cd fox-db
 ```
 
 ```sh runnable
@@ -100,7 +100,7 @@ For Swift projects, `[module_tags]` maps Xcode module names to platform tags; se
 ## 4. Index the user's projects
 
 Ask the user which projects to index (any git repositories). Index each one once; after that
-foxdb refreshes in the background whenever an agent uses it there:
+fox-db refreshes in the background whenever an agent uses it there:
 
 ```sh runnable
 cd ~/src/my-app            # replace with each of the user's project directories
@@ -117,7 +117,7 @@ background and poll.
 
 ### Plugin (Claude Code and Codex)
 
-For Claude Code and Codex, the foxdb plugin in this repository does steps 5 to 7 in one go,
+For Claude Code and Codex, the fox-db plugin in this repository does steps 5 to 7 in one go,
 without editing any settings file: it brings the MCP server, the four hooks of step 6 and the
 skill of step 7, and in Claude Code it also puts `fox` on the agent's PATH. It runs the `fox`
 installed in step 2 (`~/.foxdb/bin/fox`, or `$FOXDB_HOME/bin/fox`); without one, the tools fail and
@@ -125,8 +125,8 @@ the session-start hook says how to install it. Ask the user whether they want th
 manual steps; for each harness use one or the other, never both, or every tool and hook runs twice.
 
 ```sh
-claude plugin marketplace add ManavA/foxdb && claude plugin install foxdb@foxdb
-codex plugin marketplace add ManavA/foxdb && codex plugin add foxdb@foxdb
+claude plugin marketplace add ManavA/fox-db && claude plugin install foxdb@foxdb
+codex plugin marketplace add ManavA/fox-db && codex plugin add foxdb@foxdb
 ```
 
 In Claude Code the tools are named `mcp__plugin_foxdb_foxdb__fox_find` and so on, and the skill
@@ -178,10 +178,10 @@ opencode puts MCP tools behind its Code Mode by default.
 
 ### T3 Code
 
-T3 Code runs Claude Code, Codex and opencode with their own settings, so registering foxdb with
+T3 Code runs Claude Code, Codex and opencode with their own settings, so registering fox-db with
 each harness as above is enough; each T3 thread then shares the same index and board. Read
 [docs/t3code.md](docs/t3code.md) for the identity caveat (all Codex threads under one T3
-app-server look like one foxdb agent unless `FOXDB_AGENT` is set per thread) and for
+app-server look like one fox-db agent unless `FOXDB_AGENT` is set per thread) and for
 `fox switch --for t3`.
 
 ### Other harnesses
@@ -202,14 +202,14 @@ Each is a command hook that prints nothing and exits 0 on any error or after 1.5
 | `SubagentStop` | Saves the helper's final message as a report on the board; prints nothing | Injects nothing |
 | `PreCompact` | Saves a handoff packet before compaction; for Claude Code, prints four lines asking the compaction summary to keep the working set's `path:line` anchors, the symbols being edited, ruled-out leads and the packet handle | Injects no context: Claude Code hands the lines to the summariser as instructions; the following session start adds one line |
 
-By default foxdb never injects from `PreToolUse`, `PostToolUse` or `UserPromptSubmit`, which
+By default fox-db never injects from `PreToolUse`, `PostToolUse` or `UserPromptSubmit`, which
 would rewrite the cached history or grow every turn; a test enforces this. The two search hooks
 below are the only exceptions, and they are off unless the user turns them on.
 
 ### Claude Code hooks
 
 This backs up `~/.claude/settings.json` (once: a second run keeps the first, pre-foxdb backup),
-then adds the four hooks, replacing any earlier foxdb entries and keeping everything else:
+then adds the four hooks, replacing any earlier fox-db entries and keeping everything else:
 
 ```sh runnable needs=jq
 mkdir -p ~/.claude && f=~/.claude/settings.json && { [ -f "$f" ] || echo '{}' > "$f"; }
@@ -239,7 +239,7 @@ reuse on that turn. Offer them only when the user wants them.
 
 | Hook | Setting | What it adds |
 |---|---|---|
-| `PostToolUse` on `Bash` | `grep_context = true` | After a `grep -n`, `rg -n` or `git grep -n` in an indexed project, the enclosing definition and its handle for each hit: at most 12 rows and 1,200 characters. Silent on compound commands, pipes into anything but `head`/`tail`/`sort`/`uniq`/`grep`, counts and file lists, files changed since indexing, and projects foxdb has not indexed |
+| `PostToolUse` on `Bash` | `grep_context = true` | After a `grep -n`, `rg -n` or `git grep -n` in an indexed project, the enclosing definition and its handle for each hit: at most 12 rows and 1,200 characters. Silent on compound commands, pipes into anything but `head`/`tail`/`sort`/`uniq`/`grep`, counts and file lists, files changed since indexing, and projects fox-db has not indexed |
 | `UserPromptSubmit` | `prompt_context = true` | When the prompt names a code-shaped identifier (`snake_case`, `camelCase`, `Type.member`, a backticked name) or a source path that resolves to exactly one indexed definition or file: its location, caller count and handle, at most 5 rows. Silent otherwise |
 
 The Claude Code entries (add them to `~/.claude/settings.json` next to the four above; the `if`
@@ -322,17 +322,17 @@ claude mcp list | grep foxdb
 codex mcp list | grep foxdb
 ```
 
-Expected: `foxdb: … fox mcp - ✔ Connected` for Claude Code and an `enabled` foxdb row for Codex.
+Expected: `foxdb: … fox mcp - ✔ Connected` for Claude Code and an `enabled` fox-db row for Codex.
 Finally ask the user to start a new session and run `fox_find` on a symbol they know.
 
 ## 9. Uninstall and rollback
 
 Each block undoes one setup step; run only those for harnesses you set up. The blocks remove
-only foxdb's entries and then delete the `*.foxdb-backup` files made during setup. Those backups
+only fox-db's entries and then delete the `*.foxdb-backup` files made during setup. Those backups
 hold the files as they were before setup; if the user would rather restore one (which also undoes
 every later change), copy it back instead of running that harness's block.
 
-Claude Code: removes the server, the skill and the foxdb hooks (any hook whose command contains
+Claude Code: removes the server, the skill and the fox-db hooks (any hook whose command contains
 `.foxdb/bin/fox`), keeps every other setting, then deletes the setup backup:
 
 ```sh runnable needs=claude
@@ -368,7 +368,7 @@ rm -rf ~/.foxdb            # deletes the index and the handoff board; ask first
 
 Remove the `PATH` line from the shell profile and any lines added to `AGENTS.md` by hand.
 
-## Cheat-sheet for agents using foxdb
+## Cheat-sheet for agents using fox-db
 
 **When to use which tool**
 

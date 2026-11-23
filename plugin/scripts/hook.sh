@@ -10,7 +10,7 @@ if [ -x "$fox" ]; then
     exit 0
 fi
 if [ "$1" = session-start ]; then
-    install="curl -fsSL https://raw.githubusercontent.com/ManavA/foxdb/main/scripts/install.sh | sh"
+    install="curl -fsSL https://raw.githubusercontent.com/ManavA/fox-db/main/scripts/install.sh | sh"
     context="The foxdb plugin is enabled but fox is not installed, so the fox_* tools and the fox command fail. If the user asks for foxdb, tell them to run: $install"
     if [ "$harness" = claude ]; then
         printf '{"systemMessage":"foxdb plugin: fox is not installed in ~/.foxdb. Install it with: %s (then restart the session)",' "$install"

@@ -2,6 +2,7 @@
 
 ## Unreleased
 
+- The project is now called fox-db and lives at github.com/ManavA/fox-db (the old URL redirects). The crate, the `fox` and `foxd` binaries, `~/.foxdb`, the `FOXDB_*` variables, the `foxdb` MCP server, the `fox_*` tools, the `foxdb@foxdb` plugin and the release tarball names are unchanged.
 - `callers` of a C function-pointer member lists the lines storing a function in it (`.irq_mask = foo_mask,`) as their own group after the call sites, `stores a function in it (not calls): N`, no longer among the references that are not calls, and they no longer make the answer read as incomplete. `callers` of a function counts the documentation lines naming it after the verdict (`plus N in docs (not code, not listed)`) and never lists them.
 - The SubagentStart brief no longer carries the swarm board protocol line by default: in A/B runs it gave parallel subagents nothing and cost more. `[hooks] swarm_board = true` in `config.toml` brings it back. The parent packet and parent read lines stay.
 

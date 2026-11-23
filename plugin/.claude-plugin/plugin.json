@@ -1,14 +1,14 @@
 {
   "name": "foxdb",
-  "displayName": "foxdb",
+  "displayName": "fox-db",
   "version": "0.2.5",
   "description": "Local code graph and index for coding agents: the fox_* MCP tools, the session and subagent brief hooks, the foxdb skill and the fox CLI. Needs fox installed in ~/.foxdb (scripts/install.sh).",
   "author": {
     "name": "ManavA",
     "url": "https://github.com/ManavA"
   },
-  "homepage": "https://github.com/ManavA/foxdb",
-  "repository": "https://github.com/ManavA/foxdb",
+  "homepage": "https://github.com/ManavA/fox-db",
+  "repository": "https://github.com/ManavA/fox-db",
   "license": "AGPL-3.0-or-later",
   "keywords": ["code-search", "call-graph", "mcp", "multi-agent", "handoff"]
 }

@@ -1,6 +1,6 @@
 # Architecture
 
-foxdb is one Rust crate with two binaries: `fox` (CLI, MCP server over stdio, hooks, dispatch supervisor) and `foxd` (an optional per-user daemon). Both read and write one SQLite store, `$FOXDB_HOME/fox.db`.
+fox-db is one Rust crate with two binaries: `fox` (CLI, MCP server over stdio, hooks, dispatch supervisor) and `foxd` (an optional per-user daemon). Both read and write one SQLite store, `$FOXDB_HOME/fox.db`.
 
 ## Indexing
 
@@ -72,7 +72,7 @@ Why not something bigger:
 - **Postgres** (pgvector, ParadeDB, AGE) adds a server, a network hop and operations work for one
   user on one machine, at tens of thousands of symbols. It would only pay off for a team-shared
   index across machines.
-- **turbopuffer** is hosted and object-storage backed: its warm p50 is already above foxdb's,
+- **turbopuffer** is hosted and object-storage backed: its warm p50 is already above fox-db's,
   cold queries take most of a second, and it would send private source off the machine.
 - **Meilisearch** (or another search server) is a second store to keep consistent with a second
   process to run, for ranking that BM25 plus code-aware heuristics already gives at this scale.
@@ -246,7 +246,7 @@ long) and fall back to opening the store directly when nothing answers. `FOXDB_N
 forces the direct path; `fox daemon status|stop` checks or stops it. The MCP server is already
 long-lived and keeps the same warm state in-process. Warm and cold paths run the same search
 arms, so `foxd` returns the same answer as the direct path, only faster. Start `foxd` from your login session or a
-user service; foxdb never starts it for you.
+user service; fox-db never starts it for you.
 
 ## Caching
 
@@ -256,7 +256,7 @@ user service; foxdb never starts it for you.
   answer is sent once; later calls get a one-line reference (`--fresh` resends), and the
   PreCompact hook clears the set. The MCP server keeps no such set: it serves a session and all
   its subagents and outlives compactions.
-- **Prompt-cache safety.** foxdb adds context only at SessionStart and SubagentStart, and every
+- **Prompt-cache safety.** fox-db adds context only at SessionStart and SubagentStart, and every
   byte it puts in a cached prefix (tool definitions, server instructions, brief caps, the dispatch
   brief, the report schema) is committed in `context-budget.json`, which a test enforces. Briefs
   are deterministic, so siblings share a cached prefix. See

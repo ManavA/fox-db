@@ -17,7 +17,7 @@ ran against a **mirror** of example-ios-app (see "Ignore behaviour"), never the 
 | codanna 0.17.1 | `codanna init` writes `.codanna/`, `.codannaignore`, `.fastembed_cache` symlink into the cwd. | Must not run inside the repo. |
 | Graphicle 0.1.2 | `graphicle-graph extract --exclude PATTERN`, `--out DIR`. `graphicle setup` edits AGENTS.md and installs git hooks. | Only `graphicle-graph extract` is safe. |
 
-**Resolution:** foxdb builds a filtered mirror at `~/.foxdb/mirrors/<project>-src`: `git ls-files` minus the foxdb
+**Resolution:** fox-db builds a filtered mirror at `~/.foxdb/mirrors/<project>-src`: `git ls-files` minus the fox-db
 deny list (secrets, `.agent-review`, `.DerivedData*`, `.build`, `.claude`, `exports`, `.server-work`, ...), code
 extensions only, copied with APFS clones (`cp -c`, copy-on-write, no extra disk). example-ios-app: 1,211 files / 870 swift,
 2.8 s, 33 MB logical. Prototype: `spike/mirror.py`. The 31G directory is never touched by any backend. Long-term (M2)
@@ -50,7 +50,7 @@ This is compiler-resolved Swift (USRs, overrides, extensions, protocol witnesses
 ### Prior-art refresh (gh search, Rust, by stars and recent pushes, 2026-10-20)
 
 - **Graphicle-AI/graphicle** (Apache-2.0, 333 stars, created 2026-10-14): code graph + agent memory + MCP in one Rust
-  binary, SQLite. Closest thing to foxdb. Not adopted as base now: setup writes into repos (AGENTS.md, git hooks),
+  binary, SQLite. Closest thing to fox-db. Not adopted as base now: setup writes into repos (AGENTS.md, git hooks),
   per-query JSON graph load, 1.36 GB RSS, weak Swift caller recall in the sample, 6 days old. Re-evaluate its memory
   engine in M4 (possible import/borrow) - watch item.
 - sdsrss/code-graph-mcp (84), LordCasser/atlas (39), greysquirr3l/coraline (15), telagod/abyss (10): tree-sitter graph
@@ -65,7 +65,7 @@ This is compiler-resolved Swift (USRs, overrides, extensions, protocol witnesses
 (ripgrep's walker), `notify` (FSEvents), tree-sitter crates only where needed. Target: `fox mem brief` and `fox find`
 < 20 ms cold. Python is dropped.
 
-**D1 = Rust foxdb core over off-the-shelf parts, wrap don't fork:**
+**D1 = Rust fox-db core over off-the-shelf parts, wrap don't fork:**
 1. **Swift:** read the index store directly from Rust via `libIndexStore.dylib` (dlopen from the active toolchain;
    the M0 C prototype is the reference). indexstore-db is not needed for bulk import. Tree-sitter Swift only for files
    edited since their unit was written.
@@ -77,7 +77,7 @@ This is compiler-resolved Swift (USRs, overrides, extensions, protocol witnesses
    `ui_enabled=false auto_watch=false watcher_enabled=false`, `CBM_CACHE_DIR=~/.foxdb/cbm`) as the M2 cross-check for
    Kotlin call-graph accuracy on example-android, where its `kotlin_lsp.c` may beat codanna. Drop it if it does not.
 4. **No fork** of anything at this point.
-5. foxdb's own SQLite (`~/.foxdb/fox.db`) is the single serving store; backends feed it, queries never shell out on
+5. fox-db's own SQLite (`~/.foxdb/fox.db`) is the single serving store; backends feed it, queries never shell out on
    the `find`/`brief` path.
 
 ## Installed (M0)

@@ -1,6 +1,6 @@
-# foxdb
+# fox-db
 
-foxdb is a local code graph and index for coding agents. One SQLite db 
+fox-db is a local code graph and index for coding agents. One SQLite db 
 holds every project you work in: files, directories, Markdown doc
 sections, milestone logs, Claude Code memory notes, code symbols and their call graph
 (Swift from Xcode's index store, 18 more languages through built-in tree-sitter). Agents
@@ -10,14 +10,14 @@ It also keeps a handoff board, so several agents in Claude Code, Codex, opencode
 can share findings, hand work over and run as a supervised swarm. Everything stays on your
 machine; nothing is written into your repositories.
 
-**AI agents:** to set foxdb up, read [AGENTS-SETUP.md](AGENTS-SETUP.md).
+**AI agents:** to set fox-db up, read [AGENTS-SETUP.md](AGENTS-SETUP.md).
 
 ## Install with your agent (recommended)
 
 Paste this into Claude Code, Codex, opencode or any coding agent:
 
-> Set up foxdb from https://github.com/ManavA/foxdb by following its
-> [AGENTS-SETUP.md](https://github.com/ManavA/foxdb/blob/main/AGENTS-SETUP.md)
+> Set up fox-db from https://github.com/ManavA/fox-db by following its
+> [AGENTS-SETUP.md](https://github.com/ManavA/fox-db/blob/main/AGENTS-SETUP.md)
 > from top to bottom. Ask me before changing any harness setting.
 
 The agent checks prerequisites, installs `fox` and `foxd` into `~/.foxdb/bin` (no root), indexes
@@ -32,9 +32,9 @@ MCP tools, the session and subagent hooks and the skill; in Claude Code it also 
 agent's PATH. Your settings files are not edited.
 
 ```sh
-curl -fsSL https://raw.githubusercontent.com/ManavA/foxdb/main/scripts/install.sh | sh
-claude plugin marketplace add ManavA/foxdb && claude plugin install foxdb@foxdb   # Claude Code
-codex plugin marketplace add ManavA/foxdb && codex plugin add foxdb@foxdb         # Codex
+curl -fsSL https://raw.githubusercontent.com/ManavA/fox-db/main/scripts/install.sh | sh
+claude plugin marketplace add ManavA/fox-db && claude plugin install foxdb@foxdb   # Claude Code
+codex plugin marketplace add ManavA/fox-db && codex plugin add foxdb@foxdb         # Codex
 ```
 
 Index a project with `~/.foxdb/bin/fox index .` (step 2 below), start a new session there and
@@ -58,12 +58,12 @@ Linux and macOS, x86_64 and arm64; v0.2.2: Linux x86_64 only), the installer dow
 curl (or wget) and checks its sha256; elsewhere you need a Rust toolchain (`cargo`) to build from
 source, which takes several minutes. No GitHub login is needed. Release tarballs from v0.2.4
 also carry a GitHub build provenance attestation; to check a downloaded one, run
-`gh attestation verify foxdb-<version>-<target>.tar.gz --repo ManavA/foxdb`.
+`gh attestation verify foxdb-<version>-<target>.tar.gz --repo ManavA/fox-db`.
 
 1. Get the code and install `fox` and `foxd` into `~/.foxdb/bin` (no root):
 
 ```sh
-git clone https://github.com/ManavA/foxdb.git && cd foxdb
+git clone https://github.com/ManavA/fox-db.git && cd fox-db
 ```
 
 ```sh runnable
@@ -162,7 +162,7 @@ fox handoff take h:12                     # claimed exactly once, even with seve
 fox switch --to codex --handoff h:12      # prints the command to continue the task in Codex
 ```
 
-Claude can run Codex workers and the other way round. Each worker is tracked, gets the foxdb
+Claude can run Codex workers and the other way round. Each worker is tracked, gets the fox-db
 MCP and the parent's packet pointer, and posts its final output as a report:
 
 ```
@@ -211,8 +211,8 @@ Patterns (parallel investigators, one writer, review panels, Claude directing Co
 
 ### T3 Code
 
-Register foxdb once for the providers T3 Code runs (Codex, Claude, OpenCode) and every T3 thread
-shares the same index and board. T3's fork, handoff and merge-back map onto foxdb packets, and
+Register fox-db once for the providers T3 Code runs (Codex, Claude, OpenCode) and every T3 thread
+shares the same index and board. T3's fork, handoff and merge-back map onto fox-db packets, and
 `--for t3` formats a packet to paste into a thread:
 
 ```
@@ -220,7 +220,7 @@ fox handoff render h:12 --for t3          # packet capped at 2,000 characters
 fox switch --for t3 --handoff h:12        # a one-line message pointing at the packet
 ```
 
-Setup and caveats (Codex threads under one T3 app-server share one foxdb identity):
+Setup and caveats (Codex threads under one T3 app-server share one fox-db identity):
 [docs/t3code.md](docs/t3code.md).
 
 ### Scaling
@@ -247,7 +247,7 @@ Measured trade-offs and open targets: [docs/benchmarks.md](docs/benchmarks.md),
 - [docs/usage.md](docs/usage.md): CLI and MCP reference, configuration, supported languages, hooks
 - [docs/multi-agent.md](docs/multi-agent.md): board, packets, dispatch, wait, switching
 - [docs/swarm.md](docs/swarm.md): many workers from one plan, with a review panel
-- [docs/t3code.md](docs/t3code.md): foxdb under T3 Code
+- [docs/t3code.md](docs/t3code.md): fox-db under T3 Code
 - [docs/architecture.md](docs/architecture.md): storage, search pipeline, daemon, caching, and why not Postgres, a graph database or Qdrant yet
 - [docs/search-quality.md](docs/search-quality.md): the search backend seam and the retrieval eval
 - [docs/benchmarks.md](docs/benchmarks.md): measured numbers and open targets

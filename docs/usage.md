@@ -119,7 +119,7 @@ foxd [--version]
 fox-bench run --set FILE --repo DIR [--daemon] [--json OUT]
 ```
 
-Examples, on the foxdb repository itself (Rust, about 100 code files):
+Examples, on the fox-db repository itself (Rust, about 100 code files):
 
 ```
 $ fox index .
@@ -214,8 +214,8 @@ every session pays that once, in its cached prefix.
   and the bytes every session pays before its first call (instructions, tool list and the
   brief's tool line); a test fails when either changes, so growth is deliberate.
 - No tool has an `outputSchema` and no result carries `structuredContent`: Codex shows a result's
-  structured JSON instead of its text, which would replace foxdb's budgeted rows.
-- `initialize` answers with the client's `protocolVersion` when foxdb implements it (2025-11-25,
+  structured JSON instead of its text, which would replace fox-db's budgeted rows.
+- `initialize` answers with the client's `protocolVersion` when fox-db implements it (2025-11-25,
   2025-06-18, 2025-03-26, 2024-11-05) and with 2025-11-25 otherwise, never with an echo of a
   version it does not implement.
 
@@ -233,7 +233,7 @@ Example exchange:
 
 - Every row starts with a handle: `s:` symbol (index store), `c:` tree-sitter symbol, `f:` file, `d:` doc section, `m:` milestone, `a:` summarized dir, `g:` memory, `x:` session, `h:` handoff. Every row ends in an exact `path:line`. Pass a handle (or a `Type.member` name) to `fox_graph` / `fox_read` / `fox code`.
 - `budget` is in tokens (default 500, max 4000). Search answers shrink gracefully: a page that fits as full rows is sent whole; otherwise the top five rows are sent in the richest form they fit (full, else skeleton: handle, kind, name, `path:line`, else ids: handle, `path:line`), with a `cursor` for the rest. A shorter form says so in the footer, and `fox_read <handle>` expands a row. A tight budget never trades the best rows' detail for a long tail of ids.
-- `fox_read` always returns the full answer: one MCP server serves a session and all its subagents and outlives compactions, so it cannot know what a caller still holds. The CLI sends a large `fox code --rel src|outline` answer once per `FOXDB_SESSION` (a dispatched worker's id); a repeat is one line, `= already sent in this session: <handle> ...`, and `--fresh` resends. The PreCompact hook clears that session's set. Through `foxd` the client sends its own session with each request. This covers foxdb's own answers only. Rows are terse: relative paths, each directory and file printed once as a header.
+- `fox_read` always returns the full answer: one MCP server serves a session and all its subagents and outlives compactions, so it cannot know what a caller still holds. The CLI sends a large `fox code --rel src|outline` answer once per `FOXDB_SESSION` (a dispatched worker's id); a repeat is one line, `= already sent in this session: <handle> ...`, and `--fresh` resends. The PreCompact hook clears that session's set. Through `foxd` the client sends its own session with each request. This covers fox-db's own answers only. Rows are terse: relative paths, each directory and file printed once as a header.
 - Graph answers carry code. A `callers` or `refs` row with one site ends in ` | ` and that line's code; a caller with several sites is followed by one `   :line | code` row per site. An `impact` row ends in the dependent's definition line. Code is shown only when the line still names the target (a file changed since indexing shows none), clipped to 140 characters around the name. Code rides along only when the whole answer with it fits the budget; otherwise the rows are locations only and the second line says `code left out to fit the budget; budget=N shows it` (or, past 4000 tokens, that the answer is too long to carry it). Answers with more than 400 sites or dependents carry no code.
 - `fox_read` with no `mode`: a path returns its declarations (`line kind name handle ..last line`, a header saying how to read one; fields are counted, and `mode=outline` on a type lists them), a symbol name or handle returns its body.
 - A footer `+N more · cursor=K` or `+N more (answer cut) · cursor=K` means the answer is incomplete as shown: call again with `cursor=K` for the next page. Narrow the query before raising the budget.
@@ -247,7 +247,7 @@ MCP server (user scope):
 claude mcp add --scope user foxdb -- "$HOME/.foxdb/bin/fox" mcp
 ```
 
-Hooks. foxdb does not install these; add them to `~/.claude/settings.json` yourself
+Hooks. fox-db does not install these; add them to `~/.claude/settings.json` yourself
 (`scripts/install_hook.py` adds the SessionStart one). Every hook is a command hook, fails open
 (prints nothing and exits 0 on any error or after 1.5 s) and uses the `hookSpecificOutput` JSON form.
 
@@ -290,19 +290,19 @@ Opt-in search hooks (off by default; AGENTS-SETUP.md step 6 has the settings ent
   tool output is unchanged. It is silent on compound commands (`;`, `&&` other than a leading
   `cd DIR &&`, `$(...)`, redirection to a file), pipes into anything but `head`, `tail`, `sort`,
   `uniq` or a filtering `grep`, `-l`/`-c`/`--json`-style output, hits outside any definition,
-  files changed since they were indexed, and projects foxdb has not indexed.
+  files changed since they were indexed, and projects fox-db has not indexed.
 - `user-prompt-submit` with `[hooks] prompt_context = true`: for each code-shaped word in the
   prompt (`snake_case`, `camelCase`, `Type.member`, a backticked name, a source path) that
   resolves to exactly one indexed definition (same case) or file, adds its location, caller
   count and handle (at most 5 rows). Plain words and names with several definitions add nothing.
 
-Prompt-cache safety. By default foxdb adds context only at SessionStart and SubagentStart, never from
+Prompt-cache safety. By default fox-db adds context only at SessionStart and SubagentStart, never from
 PreToolUse, PostToolUse or UserPromptSubmit (the opt-in search hooks above are the exception): Claude Code rewrites the cached history when a tool
 hook returns context (anthropics/claude-code#83913), and per-prompt context grows every turn. A
 test runs every hook event and fails if any other one injects. The PreCompact lines are
 summariser instructions, plain text rather than `additionalContext`, and the same test checks
 they stay that way. `context-budget.json` commits the
-size of everything foxdb puts in a cached prefix (brief caps, `tools/list` bytes, server
+size of everything fox-db puts in a cached prefix (brief caps, `tools/list` bytes, server
 instructions, the dispatch brief, the report schema); a test fails if any of them changes, so
 growth is a reviewed edit to that file.
 
@@ -379,10 +379,10 @@ memory/cli.md:5 | Preview with `my-app sync --dry-run`. | `--dry-run` (no such f
 index that your own build produced and makes the tree-sitter answers it covers precise: a
 reference at the same file, line and name as a SCIP occurrence now points at the definition SCIP
 names (a `guess 1 of N` label disappears, a call guessed to the wrong same-name method moves to
-the right one), and `callers`, `callees`, `refs` and `impact` follow. foxdb never runs your
+the right one), and `callers`, `callees`, `refs` and `impact` follow. fox-db never runs your
 build or a language server; it only reads the file. Without an import nothing changes.
 
-Produce the index with the indexer for your language, from the project root (foxdb does not run
+Produce the index with the indexer for your language, from the project root (fox-db does not run
 these):
 
 ```
@@ -413,7 +413,7 @@ library) leave the tree-sitter answer alone.
 
 ## Big projects: tantivy and the walk record
 
-Two things change only for very big projects; below their thresholds foxdb behaves exactly as
+Two things change only for very big projects; below their thresholds fox-db behaves exactly as
 before (same answers, same store, no extra files or background work).
 
 **A tantivy index** (opt-in; builds with the `tantivy` Cargo feature, which release builds
@@ -476,7 +476,7 @@ Then switch it on with `vectors = true` near the top of `~/.foxdb/config.toml` (
 `fox vectors setup` fetches model2vec `potion-code-16M` (MIT, 65 MB) from its Hugging Face
 repository at a pinned commit, checks each file's sha256 and puts it in
 `~/.foxdb/models/potion-code-16M/`; it downloads nothing without `--yes` or a yes at the prompt,
-and nothing else in foxdb uses the network. The model is a table of token vectors (no neural
+and nothing else in fox-db uses the network. The model is a table of token vectors (no neural
 network runs), so embedding a project is quick on a CPU: about 1 s for a 1,500-file Kotlin app
 and about 9 s for kubernetes.
 
@@ -504,13 +504,13 @@ Roots: `FOXDB_CLAUDE_PROJECTS`, `FOXDB_CODEX_SESSIONS`.
 ## With headroom
 
 headroom runs as a local proxy that compresses tool output into hash markers and offers
-`headroom_retrieve`. foxdb does not depend on it and does not compress output in a competing
-way: its answers are already short plain-text rows (no large JSON), and foxdb's "already sent"
-references cover only foxdb's own handles. If headroom does replace a foxdb answer with a marker,
+`headroom_retrieve`. fox-db does not depend on it and does not compress output in a competing
+way: its answers are already short plain-text rows (no large JSON), and fox-db's "already sent"
+references cover only fox-db's own handles. If headroom does replace a fox-db answer with a marker,
 `headroom_retrieve` or `fox_read <handle>` both get it back. The benchmark records which mode each
 number came from.
 
-Recommended owner setting: exclude foxdb's tools from headroom's lossy compression, since their
+Recommended owner setting: exclude fox-db's tools from headroom's lossy compression, since their
 answers are already ranked and budgeted (headroom's default exclusions do not cover MCP tools):
 
 ```sh
@@ -519,7 +519,7 @@ export HEADROOM_EXCLUDE_TOOLS='mcp__foxdb__*'   # add it to any list you already
 
 With the Claude Code plugin the tools are named `mcp__plugin_foxdb_foxdb__*`; exclude that pattern instead.
 
-foxdb output never contains headroom's markers (`hash=`, "compressed", `<<ccr:`, "same as msg");
+fox-db output never contains headroom's markers (`hash=`, "compressed", `<<ccr:`, "same as msg");
 a test checks the tool list, instructions, briefs, answers and the report schema.
 
 ## Limitations

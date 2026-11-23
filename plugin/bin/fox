@@ -6,7 +6,7 @@ fox=${FOXDB_HOME:-$HOME/.foxdb}/bin/fox
 cat >&2 <<EOF
 foxdb: fox is not installed at $fox.
 Install it (no root, no login), then restart the session:
-  curl -fsSL https://raw.githubusercontent.com/ManavA/foxdb/main/scripts/install.sh | sh
-or from a clone: git clone https://github.com/ManavA/foxdb.git && foxdb/scripts/install.sh
+  curl -fsSL https://raw.githubusercontent.com/ManavA/fox-db/main/scripts/install.sh | sh
+or from a clone: git clone https://github.com/ManavA/fox-db.git && fox-db/scripts/install.sh
 EOF
 exit 127

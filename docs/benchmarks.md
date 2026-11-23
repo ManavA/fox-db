@@ -22,10 +22,10 @@ row, the MCP tool-definition size and the store size. `fox-bench tools` prints o
 size. Set `FOXDB_HOME` to a scratch store that already indexes the repo, and
 `FOXDB_CLAUDE_PROJECTS=bench/fixtures/claude-projects` for the memory queries.
 
-The naive alternative is what an agent without foxdb reads for the same query: `rg -n` for the
+The naive alternative is what an agent without fox-db reads for the same query: `rg -n` for the
 query's rarest term (first 250 lines, as agent grep tools truncate) plus one file (first 2,000
 lines): the expected file if grep found it, else grep's first file. It depends only on the query,
-never on foxdb's answer, so a noisier answer cannot raise its own baseline. It is a rough
+never on fox-db's answer, so a noisier answer cannot raise its own baseline. It is a rough
 yardstick; the A/B runner below is the real measure.
 
 Each run says whether it ran with headroom on or off, read from the process environment
@@ -34,7 +34,7 @@ does not go through any model, so the mode is recorded rather than effective; it
 A/B runner.
 
 `bench/ab.py tasks.toml` is the agent A/B runner: the same tasks through `claude -p` and
-`codex exec`, with foxdb as the only MCP server and with none, each in a throwaway clone. It only
+`codex exec`, with fox-db as the only MCP server and with none, each in a throwaway clone. It only
 prints the commands unless given `--run`. `--headroom on|off` sets or removes
 `ANTHROPIC_BASE_URL` for the child processes only; nothing in your settings changes. Results are
 JSON lines with cost, turns, cache reads and writes, pass/fail and the headroom mode.
@@ -42,7 +42,7 @@ JSON lines with cost, turns, cache reads and writes, pass/fail and the headroom 
 Milestone 1 results. Both builds were measured on the same day on the same corpus (a snapshot of
 the Kotlin app's tracked files and of this repo, one store holding both plus the memory fixture),
 5 runs per query, on a shared machine at load 7-11, with headroom off in the bench's environment.
-The JSON for the foxdb rows is in `bench/results/m1-*.json`; the Kotlin app is a private project,
+The JSON for the fox-db rows is in `bench/results/m1-*.json`; the Kotlin app is a private project,
 so its query set and results stay out of the repository (keep yours in the ignored `bench/private/`). "Before" is `3e226d7` (the cascade search
 and full-content FTS5); `foxd` latency is for repeated queries, which its generation-keyed cache
 answers.
@@ -52,13 +52,13 @@ answers.
 | Kotlin app, 26 queries | before | 57 ms | 106 ms | 23/26 | 0.81 | 310 | 86.2 MB |
 | | after, cold CLI | 27 ms | 47 ms | 25/26 | 0.88 | 246 | 72.7 MB |
 | | after, via `foxd` | 7.5 ms | 9.2 ms | 25/26 | 0.88 | 246 | |
-| foxdb itself, 19 queries | before | 38 ms | 63 ms | 15/19 | 0.79 | 24 | |
+| fox-db itself, 19 queries | before | 38 ms | 63 ms | 15/19 | 0.79 | 24 | |
 | | after, cold CLI | 27 ms | 38 ms | 19/19 | 1.00 | 118 | |
 | | after, via `foxd` | 7.6 ms | 9.1 ms | 19/19 | 1.00 | 118 | |
 
 On the Kotlin set the naive alternative averages about 50,000 tokens a query. Tokens per answer
 fell overall but rose for doc sections (249 to 359), which now show the section's own rows instead
-of a shorter list. On the foxdb set the old build answered four natural-language queries with
+of a shorter list. On the fox-db set the old build answered four natural-language queries with
 "no matches"; the new one finds all four, which is most of the rise from 24 to 118 tokens.
 
 The `bench/results/m0-baseline-*.json` files are the earlier baseline of the old build, recorded
@@ -72,18 +72,18 @@ over the same questions on a private Kotlin app, kubernetes and Linux (shallow c
 answering with `fox` only, one with `rg` plus reading whole matching files (first 2,000 lines),
 counting answer bytes / 4 as tokens. Host load was 10-24 throughout.
 
-- Tokens per lookup: about 97-99% fewer with foxdb on medium to very large repos. Naive cost is
+- Tokens per lookup: about 97-99% fewer with fox-db on medium to very large repos. Naive cost is
   mostly whole-file reads; a frugal grep-first agent that reads about 120 lines around each hit
   narrows the gap to roughly 2.5x-30x depending on how much it reads.
 - Tool calls: one `fox` call per lookup against several greps and reads.
-- Vague (natural-language) search: foxdb ranked the right file first or second on most
+- Vague (natural-language) search: fox-db ranked the right file first or second on most
   questions; grep listings held it, but usually far down a count-sorted list, so the naive agent
   needed more reads to land on it.
 - Caller recall: before 0.2.1, C callers and impact covered only callers near the definition
   (a header prototype tied with its definition), Kotlin calls through receiver chains and
   properties and function references were missed, and Go calls through embedded fields went to
   the wrong type. Measured against `rg -w` ground truth (call-shaped uses outside comments and
-  strings, in indexed files; callers of other same-name definitions count against foxdb):
+  strings, in indexed files; callers of other same-name definitions count against fox-db):
 
 | Corpus | Queries | Mean file recall before | after | Pooled recall before | after |
 |---|---|---|---|---|---|
@@ -135,10 +135,10 @@ byte-identical.
 
 | Repo | Measure | Old | New |
 |---|---|---|---|
-| foxdb (this repo) | cold index, median | 1.07 s | 1.09 s |
-| foxdb | one-file save, median | 0.076 s | 0.070 s |
-| foxdb | `find`/`code` p50 / p95 (CLI, 10 queries x 15) | 21.9 / 29.9 ms | 22.1 / 32.0 ms |
-| foxdb | store | 3,497,984 B | 3,497,984 B |
+| fox-db (this repo) | cold index, median | 1.07 s | 1.09 s |
+| fox-db | one-file save, median | 0.076 s | 0.070 s |
+| fox-db | `find`/`code` p50 / p95 (CLI, 10 queries x 15) | 21.9 / 29.9 ms | 22.1 / 32.0 ms |
+| fox-db | store | 3,497,984 B | 3,497,984 B |
 | private Kotlin project (2,214 files) | cold index, median | 6.88 s | 7.01 s |
 | private Kotlin project | one-file save, median | 0.196 s | 0.184 s |
 | private Kotlin project | `find`/`code` p50 / p95 (9 queries x 15) | 36.4 / 52.6 ms | 36.3 / 53.5 ms |
@@ -186,12 +186,12 @@ returns them). A fill took 2.4 minutes in `fox index` and under 2 in `foxd`, who
 | kubernetes | cold index | 81.9 s | 83.7 s |
 | kubernetes | one-file save, median of 10 | 0.89 s | 0.95 s |
 | kubernetes | store | 728,014,848 B | 728,018,944 B |
-| foxdb | `find`/`code` p50 / p95 (21 queries x 15) | 22.2 / 30.0 ms | 22.2 / 29.3 ms |
-| foxdb | cold index, median of 3 | 1.04 s | 1.08 s |
-| foxdb | one-file save, median of 5 | 0.070 s | 0.064 s |
-| foxdb | store | 3,694,592 B | 3,690,496 B |
+| fox-db | `find`/`code` p50 / p95 (21 queries x 15) | 22.2 / 30.0 ms | 22.2 / 29.3 ms |
+| fox-db | cold index, median of 3 | 1.04 s | 1.08 s |
+| fox-db | one-file save, median of 5 | 0.070 s | 0.064 s |
+| fox-db | store | 3,694,592 B | 3,690,496 B |
 
-Every `find` and `code` answer compared was byte-identical (17 on kubernetes, 21 on foxdb, 28 on
+Every `find` and `code` answer compared was byte-identical (17 on kubernetes, 21 on fox-db, 28 on
 a private 2,214-file Kotlin project, whose numbers match the same way), the store schema and the
 files under `FOXDB_HOME` were identical, and the kubernetes retrieval and lexical eval reports
 were identical (the retrieval gate passes). Store sizes differ by one 4 KB page either way. A
@@ -233,9 +233,9 @@ latencies as plus or minus 30%.
 
 | Repo | Measure | Old | New default | New `vectors` build, arm off |
 |---|---|---|---|---|
-| foxdb | `find`/`code` p50 / p95 (21 queries x 5) | 21.6 / 29.8 ms | 22.2 / 30.8 ms | 22.7 / 31.5 ms (old 21.7 / 31.3) |
-| foxdb | cold index, median of 3 | 1.06 s | 1.12 s | 1.06 s (old 1.01) |
-| foxdb | one-file save, median of 5 | 0.071 s | 0.069 s | 0.066 s (old 0.071) |
+| fox-db | `find`/`code` p50 / p95 (21 queries x 5) | 21.6 / 29.8 ms | 22.2 / 30.8 ms | 22.7 / 31.5 ms (old 21.7 / 31.3) |
+| fox-db | cold index, median of 3 | 1.06 s | 1.12 s | 1.06 s (old 1.01) |
+| fox-db | one-file save, median of 5 | 0.071 s | 0.069 s | 0.066 s (old 0.071) |
 | private Kotlin project (2,214 files) | `find`/`code` p50 / p95 | 28.6 / 51.0 ms | 29.3 / 51.2 ms | 28.3 / 53.7 ms (old 29.0 / 53.6) |
 | private Kotlin project | cold index, median of 3 | 6.63 s | 6.69 s | 6.63 s (old 6.52) |
 | private Kotlin project | one-file save, median of 5 | 0.26 s | 0.25 s | 0.23 s (old 0.26) |
@@ -243,7 +243,7 @@ latencies as plus or minus 30%.
 | kubernetes | cold index | 82.1 s | | 83.6 s |
 | kubernetes | one-file save, median of 5 | 0.99 s | | 1.00 s |
 
-Every answer compared was byte-identical (21 on foxdb, 28 on the Kotlin project, 48 on
+Every answer compared was byte-identical (21 on fox-db, 28 on the Kotlin project, 48 on
 kubernetes), and so were the store schemas and the files under `FOXDB_HOME`; store sizes are
 equal or within a page (kubernetes ten pages, 0.006%). A `foxd` on the Kotlin store had the same
 threads and memory (46 MB). The eval gates pass unchanged.
@@ -273,7 +273,7 @@ lexical set (and to eleventh before headings were embedded).
 
 **Only in a store holding one project.** Every number in the table above came from a fresh
 `FOXDB_HOME` holding just the project under test. A review re-run reproduced them exactly in such
-homes, then measured one store holding foxdb, kubernetes and the Kotlin project together, as a
+homes, then measured one store holding fox-db, kubernetes and the Kotlin project together, as a
 real `~/.foxdb` does. There the gain mostly goes away: kubernetes vague MRR 0.278 off against
 0.277 on (only hit@10 rose, 0.43 to 0.46, and one query fell from rank 1 to 2), and the Kotlin
 project's vague recall@5 stayed at 0.24 (MRR 0.13 to 0.15). The arm-off baseline itself is lower

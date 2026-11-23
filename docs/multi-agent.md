@@ -1,6 +1,6 @@
 # Multi-agent
 
-Many agents, in any mix of harnesses, sharing one foxdb store. Whole plans with dependencies and review panels are in [swarm.md](swarm.md); running foxdb under T3 Code is in [t3code.md](t3code.md).
+Many agents, in any mix of harnesses, sharing one fox-db store. Whole plans with dependencies and review panels are in [swarm.md](swarm.md); running fox-db under T3 Code is in [t3code.md](t3code.md).
 
 One store, many agents. Every harness session, subagent and dispatched worker shares
 `$FOXDB_HOME/fox.db` (WAL, writer busy timeout 10 s, readers 500 ms), so a board post, a report or a
@@ -140,7 +140,7 @@ transaction, so parallel spawns (SubagentStart included) share one. Reviewers (`
 `[hooks] skip_agents`) get the task alone, and their SessionStart and SubagentStart hooks inject
 nothing. A reviewer cannot hold the writer lease.
 
-The foxdb MCP server runs outside a caller's sandbox, so dispatch checks the caller instead: a
+The fox-db MCP server runs outside a caller's sandbox, so dispatch checks the caller instead: a
 registered reviewer starts nothing, a read-only worker cannot start a writer, a tree is at most
 `FOXDB_MAX_DEPTH` (default 3) deep, and a parent has at most `FOXDB_MAX_CHILDREN` (default 8)
 running children.
@@ -158,7 +158,7 @@ Neither `--ephemeral` nor `--no-session-persistence` is ever passed. `FOXDB_CODE
 `FOXDB_CLAUDE_BIN` override the executables.
 
 Codex sandbox: in `read-only` and `workspace-write` the child's own shell may be unable to write
-`$FOXDB_HOME` or reach the `foxd` socket, so the brief tells it to use the foxdb MCP tools, whose
+`$FOXDB_HOME` or reach the `foxd` socket, so the brief tells it to use the fox-db MCP tools, whose
 server runs outside the sandbox. Nothing relies on Codex hooks, which need trust.
 
 Whether `codex exec` auto-approves those MCP calls is checked only by one opt-in test that makes
@@ -171,7 +171,7 @@ FOXDB_REAL_SMOKE=1 cargo test --release --test orchestration real_codex_smoke_op
 It dispatches one read-only Codex worker in a scratch repo and store (your real `codex` and its
 login, nothing else of yours) that must call `fox_memory op=post` and answer in the report
 format. It passes when the worker is `done` with a well-formed report and its post is on the
-board, which shows that `codex exec` ran the foxdb MCP call without an approval prompt.
+board, which shows that `codex exec` ran the fox-db MCP call without an approval prompt.
 
 ## Verifiable reports
 
@@ -219,9 +219,9 @@ Claude's Bash `run_in_background` or Monitor on `fox wait …`; Codex runs `fox 
 Waking an idle Claude controller when a worker finishes: Claude Code's `asyncRewake` command
 hooks run in the background, and exit code 2 wakes the session even when it is idle, with the
 hook's stderr as a reminder (the hook `timeout` still applies; in `-p` mode the hook is killed
-at teardown). A PostToolUse hook on `fox dispatch` can wait for the new worker. foxdb installs
+at teardown). A PostToolUse hook on `fox dispatch` can wait for the new worker. fox-db installs
 nothing; add it to `~/.claude/settings.json` yourself (needs `jq`; checked against the Claude
-Code hooks documentation, not exercised by foxdb's tests):
+Code hooks documentation, not exercised by fox-db's tests):
 
 ```json
 {"hooks": {"PostToolUse": [{"matcher": "Bash", "hooks": [{"type": "command",
@@ -245,7 +245,7 @@ The worker's one-line status (`cx-3 done report h:2f  done: …`) then arrives a
   A known agent with no resumable id (a worker that died before reporting) gets a packet
   instead; `--last` is only for when no agent is named.
 - Across harnesses: a packet (given, or built from `--transcript`, which reads Claude `.jsonl` and
-  Codex `.jsonl` / `.jsonl.zst`), then the other harness with the foxdb MCP wired per process and a
+  Codex `.jsonl` / `.jsonl.zst`), then the other harness with the fox-db MCP wired per process and a
   prompt that references the packet (`--inline` pastes it instead). The prompt comes right after
   the harness name, since Claude's `--allowedTools <tools...>` is variadic. The line carries
   `FOXDB_AGENT` (a new id), `FOXDB_PARENT` (the agent or transcript session it continues) and
@@ -258,7 +258,7 @@ FOXDB_AGENT=cx-2b FOXDB_PARENT=5e55-1 FOXDB_HOME=~/.foxdb codex -C /repo -c 'mcp
 
 ## Native mechanisms first
 
-foxdb adds the shared store; it does not replace what a harness already does well.
+fox-db adds the shared store; it does not replace what a harness already does well.
 - Claude in Claude: the Agent tool with the SubagentStart/SubagentStop hooks above. Background
   sessions: `claude --bg`, then `claude agents`, `logs`, `attach`, `stop`.
 - Codex: `codex queue --thread <id> --message <text> [--resume]` to message a running thread,
@@ -302,7 +302,7 @@ opencode (`opencode.json`; MCP tools sit behind its Code Mode by default):
 {"mcp": {"foxdb": {"type": "local", "command": ["/path/to/home/.foxdb/bin/fox", "mcp"]}}}
 ```
 
-DeepSeek harness (DSH): add foxdb as a stdio MCP overlay (`$DSH_HOME/cordis.patch.yml`, same shape
+DeepSeek harness (DSH): add fox-db as a stdio MCP overlay (`$DSH_HOME/cordis.patch.yml`, same shape
 as its memory-server overlays); its bridge strips credential-like and `DSH_*` variables, so set
 `FOXDB_HOME` explicitly if you use a non-default store.
 
