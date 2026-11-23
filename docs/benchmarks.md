@@ -36,8 +36,17 @@ A/B runner.
 `bench/ab.py tasks.toml` is the agent A/B runner: the same tasks through `claude -p` and
 `codex exec`, with fox-db as the only MCP server and with none, each in a throwaway clone. It only
 prints the commands unless given `--run`. `--headroom on|off` sets or removes
-`ANTHROPIC_BASE_URL` for the child processes only; nothing in your settings changes. Results are
-JSON lines with cost, turns, cache reads and writes, pass/fail and the headroom mode.
+`ANTHROPIC_BASE_URL` for the child processes only; nothing in your settings changes. By default
+(`--store scratch`) each "on" run gets its own `FOXDB_HOME` holding only that clone's index, with no
+memory notes or past sessions; `--store live` uses your store. Each repeat (3 by default) shuffles
+the task order and the arm order within a task from a recorded `--seed`. A task can list
+ground-truth items (`expect`, each optionally labelled `call`, `store`, `doc` or `file`); the runner
+scores precision, recall and F1 of the items the final answer names, counting as wrong only other
+names that exist in a scratch index of the repo, and `--grader-selftest` checks the grader against
+each task's prose oracles, empty and padded answers. Results are JSON lines with cost,
+turns, cache reads and writes, scores, the headroom and store modes, seed, model, harness version,
+fox binary sha256 and git commits. `bench/ab.py report RESULTS.jsonl` prints paired on-off
+differences per task and overall with bootstrap 95% CIs, pass^k and p90 cost, one block per run.
 
 Milestone 1 results. Both builds were measured on the same day on the same corpus (a snapshot of
 the Kotlin app's tracked files and of this repo, one store holding both plus the memory fixture),
