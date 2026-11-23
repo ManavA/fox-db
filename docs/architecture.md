@@ -7,7 +7,11 @@ fox-db is one Rust crate with two binaries: `fox` (CLI, MCP server over stdio, h
 `fox index` walks a project (honouring `.gitignore` and the per-project tiers), stores files, directories, Markdown sections and milestone entries as rows of `node`, parses changed code files with tree-sitter in parallel (or reads Xcode index stores for Swift) and resolves call references by name with scope awareness. Unchanged files are skipped by size, mtime and content hash. Secrets are never read. A project is registered the first time `fox` or the MCP server runs inside it, keyed by its git common dir, so worktrees share one project.
 
 **C member calls.** A C function-pointer member (`void (*irq_mask)(struct irq_data *)`) is a
-method of its struct. Fields, functions and typedefs keep their type in `meta.t`, with struct
+method of its struct. So is a member declared through a typedef of a function pointer (`op_fn
+run;`, also a typedef of one or a function typedef behind a `*`): its typedef may live in any
+file, so each resolve re-reads the stored typedefs for the members of the files it scores (every
+member when a typedef changed) and turns them into methods or back into fields; a typedef whose
+definitions disagree, or that shares its name with a C++ class, leaves its members fields. Fields, functions and typedefs keep their type in `meta.t`, with struct
 tags and typedef names in separate namespaces (`S:inode`, `T:irq_chip_t`). A call through a
 member (`inode->i_mapping->a_ops->bmap(...)`) stores the receiver as a type path
 (`ts_ref.rtype`, `S:inode|i_mapping|a_ops|bmap`). Its base is the declared type of a parameter,
@@ -24,6 +28,49 @@ dependents. A re-parse of a C file re-scores the references that store a functio
 members, and those whose type path passes through a field or function whose type changed (every
 type path when a typedef changed). A run that re-parses most of a big project drops the old rows
 in one pass per table and resolves everything again.
+
+**C++ receivers.** A C++ member call keeps its receiver as a type path too, with one namespace
+for type names (`S:Engine`): the declared type of a local, parameter or global (a smart
+pointer's pointee), the class `auto` gets from `Engine()`, `new`, `make_unique<T>()` or a cast,
+and for a name that is no local, or `this`, a field of the class whose method the call is in.
+Each step keeps its operator: a smart pointer or `optional` (`W:Pump`) reaches its pointee only
+through `->` or `*`, and its own members (`p.reset()`) are no project method, nor are those of a
+qualified type in a library namespace (`std::`, `boost::`, ...) when the project has no class of
+its last name. A qualifier matches a class by the name it is written with from outside, past `inline`
+namespaces (`meta.cq`), looked up from the namespaces around the use outward (a qualified
+type path carries them: `S:detail::Engine@a.b`); a match found only at global scope is a guess
+when another class's name ends in the same qualifier (a using-directive, an out-of-line method's
+class, a class-scope type or a namespace alias may name it); skipping any other namespace is no
+match; an unmatched qualifier leaves the name pick, as a guess when classes of that
+name exist elsewhere (`std::string` beside `mylib::string`). Template parameters are no classes.
+Resolution follows the fields to the receiver's class, which must be the only class (or typedef)
+of its name, or for a qualified name the only class whose whole name ends in it; a method that
+class itself defines once is the target with certainty (its out-of-line definition over the
+in-class declaration). Any unknown step, a class that does not define the method (it may inherit
+it), overloads, a `virtual`/`override` method of that name anywhere, or a call `f()` where `f`
+is also a method leave the name-based guess. Adding or removing a class re-scores the type paths
+naming it and every C++ path with a field step (a field's type may now name another class).
+
+**Python method resolution.** After name scoring, a Python call through `self`, `cls` or
+`super()` is re-targeted by the calling class's C3 linearization, built from the stored and
+freshly scored base-class references (`impl` rows), memoized per class in one resolve: the first
+class in that order (past the caller's own for `super()`) defining the name is the target, with
+certainty. A base the index cannot follow (a library class, a guessed link) is an unknown entry:
+with one anywhere in the order only a definition in the calling class itself is sure (the unknown
+base's ancestors may come earlier). A guessed base link, a hierarchy C3 rejects, a class
+attribute of the name that is no method (`step = _other`), or a project subclass whose own order
+would reach another definition leave the call a guess. `super(X, self)` counts only when `X` is
+the enclosing class. Walks are memoized per class, name and start. An incremental run records the classes of
+re-parsed or removed Python files before they go; after scoring, a class that appeared, went or
+whose bases resolve differently (an edit, a re-targeted import, a base class added elsewhere)
+re-scores, in a second pass, the `self`/`cls`/`super()` calls of every class connected to it
+through base links, of the names the changed classes and their old and new ancestors define,
+and the calls in the changed classes and their ancestors of names their descendants define
+(only those can resolve differently). A call no class of the caller's order defines stays a
+guess. A class named by a guessed base link anywhere may have a
+subclass that cannot be told, so its calls stay guesses. Same-name candidates tie by path, then
+id, so a re-parse that renumbers a file breaks ties as a full run does. `tests/differential.rs` checks incremental runs against full ones over
+sequences of edits.
 
 **Change detection on big trees** (`walkcache`). A tree of at least 50,000 files keeps its last
 walk in `$FOXDB_HOME/walk/<project id>`: the directories it entered with their modification
