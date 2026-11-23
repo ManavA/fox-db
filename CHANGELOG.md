@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.2.6 (2026-11-23)
 
 - The project is now called fox-db and lives at github.com/ManavA/fox-db (the old URL redirects). The crate, the `fox` and `foxd` binaries, `~/.foxdb`, the `FOXDB_*` variables, the `foxdb` MCP server, the `fox_*` tools, the `foxdb@foxdb` plugin and the release tarball names are unchanged.
 - C++ member calls resolve through the receiver's declared or inferred type: a local (`Engine e;`, `Engine e(3);`), a parameter (`Pump* p`, `const Pump& p`), a global, a member of a typed struct (`car.engine.start()`) or of the class the method is in (`engine.start()` in `Car::go`, `this->pump->start()`), `auto e = Engine();`, `auto p = std::make_unique<Pump>();`, `new`, casts and `std::unique_ptr`/`shared_ptr` variables reach that class's method with certainty instead of a guess among every class with a `start`. A smart pointer's or `optional`'s own members (`p.reset()`) and a type in a library namespace with no project class of its name reach no project method; `std::string` beside a project `mylib::string` stays a guess. Anything in doubt stays a guess by name: a receiver whose class cannot be told (`auto x = lookup()`, a template parameter, a call `make()` that may be a method), a class name defined twice or also a typedef, a class that inherits the method instead of defining it, overloads, and virtual or overriding methods. Schema 27; C++ files re-parse once.
