@@ -2344,14 +2344,21 @@ impl CTypes {
             // first scope where a class matches decides.
             let around: Vec<&str> = if around.is_empty() { vec![] } else { around.split('.').collect() };
             let mut hits: Vec<&(String, String)> = vec![];
+            let mut at = 0;
             for k in (0..=around.len()).rev() {
                 let want = if k == 0 { q.clone() } else { format!("{}.{q}", around[..k].join(".")) };
                 hits = fulls.iter().filter(|(_, o)| *o == want).collect();
                 if !hits.is_empty() {
+                    at = k;
                     break;
                 }
             }
+            // A match only at global scope is sure only when no other class ends in the same
+            // qualifier: a using-directive, the class of an out-of-line method, a class-scope
+            // type or a namespace alias the index does not follow may name that one instead.
+            let shadowable = at == 0 && fulls.iter().any(|(_, o)| o.ends_with(&format!(".{q}")));
             return match hits.as_slice() {
+                [_] if shadowable => CppRecv::Doubt,
                 [one] => CppRecv::Class(one.0.clone(), unique),
                 [] if !fulls.is_empty() => CppRecv::Doubt,
                 // A library namespace; any other may be an alias or a macro's the index does not

@@ -3075,3 +3075,83 @@ fn cpp_partial_qualifier_resolves_through_enclosing_namespaces() {
     assert!(row_of(&out, "g").is_some_and(|r| r.contains("guess")), "{out}");
     assert!(row_of(&out, "a.h").is_some_and(|r| !r.contains("guess")), "{out}");
 }
+
+/// C++: a partly qualified type that matches only at global scope while another class of that
+/// name ends in the same qualifier (reachable through a using-directive, an out-of-line method's
+/// class, a class-scope type or a namespace alias) is a guess; matches through the namespaces
+/// around the use stay certain.
+#[test]
+fn cpp_global_only_partial_qualifier_is_a_guess_when_shadowable() {
+    let _g = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    let engines = |p: &project::Project| -> String {
+        let c = db::open_ro().unwrap();
+        let mut q = c.prepare("SELECT id FROM node WHERE project_id = ?1 AND name = 'start' AND kind = 'symbol'").unwrap();
+        let ids: Vec<i64> = q.query_map([p.id], |r| r.get(0)).unwrap().flatten().collect();
+        ids.iter().map(|id| fox_code(p, &format!("c:{id:x}"), "callers", 6000)).collect::<Vec<_>>().join("\n")
+    };
+    let guess = [
+        (
+            "k2",
+            "namespace a { namespace detail { class Engine { public: void start() {} }; } }\nnamespace detail { class Engine { public: void start() {} }; }\nusing namespace a;\nvoid k(detail::Engine& e) { e.start(); }\n",
+            "4",
+        ),
+        (
+            "k5",
+            "namespace a { namespace detail { class Engine { public: void start() {} }; } struct X { void f(); }; }\nnamespace detail { class Engine { public: void start() {} }; }\nvoid a::X::f() { detail::Engine e; e.start(); }\n",
+            "3",
+        ),
+        (
+            "k8",
+            "namespace detail { class Engine { public: void start() {} }; }\nnamespace a { struct X { struct detail { class Engine { public: void start() {} }; }; void f(detail::Engine& e) { e.start(); } }; }\n",
+            "2",
+        ),
+        (
+            "k13",
+            "namespace a { namespace detail { class Engine { public: void start() {} }; } }\nnamespace detail { class Engine { public: void start() {} }; }\nnamespace b { namespace detail = a::detail; void k(detail::Engine& e) { e.start(); } }\n",
+            "3",
+        ),
+    ];
+    for (name, src, f) in guess {
+        let (_h, _r, p) = inline_project(&[("e.cpp", src)]);
+        let out = engines(&p);
+        assert!(
+            !out.lines().any(|l| l.trim_start().starts_with(':') && l.trim_start().starts_with(&format!(":{f} ")) && !l.contains("guess")),
+            "{name}: {out}"
+        );
+    }
+    let sure = [
+        (
+            "k3",
+            "namespace a { namespace detail { class Engine { public: void start() {} }; } }\nnamespace a { namespace { void k(detail::Engine& e) { e.start(); } } }\n",
+            "2",
+        ),
+        (
+            "k4",
+            "namespace a { namespace { namespace detail { class Engine { public: void start() {} }; } } }\nvoid k(a::detail::Engine& e) { e.start(); }\n",
+            "2",
+        ),
+        (
+            "k10",
+            "namespace a { namespace detail { class Engine { public: void start() {} }; } }\nnamespace detail { class Engine { public: void start() {} }; }\nnamespace a::b { void k(detail::Engine& e) { e.start(); } }\n",
+            "3",
+        ),
+        (
+            "k11",
+            "namespace a { namespace detail { class Engine { public: void start() {} }; } }\nnamespace detail { class Engine { public: void start() {} }; }\nnamespace a { void k() { auto* e = new detail::Engine(); e->start(); } }\n",
+            "3",
+        ),
+        (
+            "k12",
+            "namespace a { inline namespace v1 { namespace detail { class Engine { public: void start() {} }; } } }\nnamespace detail { class Engine { public: void start() {} }; }\nnamespace a { void k(detail::Engine& e) { e.start(); } }\n",
+            "3",
+        ),
+    ];
+    for (name, src, f) in sure {
+        let (_h, _r, p) = inline_project(&[("e.cpp", src)]);
+        let out = engines(&p);
+        assert!(
+            out.lines().any(|l| l.trim_start().starts_with(':') && l.trim_start().starts_with(&format!(":{f} ")) && !l.contains("guess")),
+            "{name}: {out}"
+        );
+    }
+}

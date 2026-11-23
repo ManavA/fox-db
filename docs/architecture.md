@@ -38,7 +38,10 @@ through `->` or `*`, and its own members (`p.reset()`) are no project method, no
 qualified type in a library namespace (`std::`, `boost::`, ...) when the project has no class of
 its last name. A qualifier matches a class by the name it is written with from outside, past `inline`
 namespaces (`meta.cq`), looked up from the namespaces around the use outward (a qualified
-type path carries them: `S:detail::Engine@a.b`); skipping any other namespace is no match; an unmatched qualifier leaves the name pick, as a guess when classes of that
+type path carries them: `S:detail::Engine@a.b`); a match found only at global scope is a guess
+when another class's name ends in the same qualifier (a using-directive, an out-of-line method's
+class, a class-scope type or a namespace alias may name it); skipping any other namespace is no
+match; an unmatched qualifier leaves the name pick, as a guess when classes of that
 name exist elsewhere (`std::string` beside `mylib::string`). Template parameters are no classes.
 Resolution follows the fields to the receiver's class, which must be the only class (or typedef)
 of its name, or for a qualified name the only class whose whole name ends in it; a method that
