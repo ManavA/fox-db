@@ -301,6 +301,20 @@ def fresh_home(home: Path) -> None:
     (home / "claude-projects").mkdir(parents=True)
 
 
+def fresh_clone(clone: list, dst: Path, repo: Path, hidden: list) -> None:
+    if dst.resolve().is_relative_to(LIVE_HOME.resolve()):
+        sys.exit(f"refusing to wipe {dst}: it is inside the live store {LIVE_HOME}")
+    shutil.rmtree(dst, ignore_errors=True)
+    subprocess.run(clone, check=True)
+    for p in hidden:
+        if p.resolve().is_relative_to(repo.resolve()):
+            leak = dst / p.resolve().relative_to(repo.resolve())
+            if leak.is_dir():
+                shutil.rmtree(leak)
+            else:
+                leak.unlink(missing_ok=True)
+
+
 def env_for(headroom: str, store_env: dict) -> dict:
     env = dict(os.environ)
     if headroom == "on":
@@ -578,8 +592,7 @@ def main(argv: list | None = None) -> int:
         print(shlex.join(gsteps[0]))
         print(" ".join(f"{k}={shlex.quote(v)}" for k, v in gplan["env"].items()), shlex.join(gsteps[1]))
     else:
-        if not gclone.exists():
-            subprocess.run(gsteps[0], check=True)
+        fresh_clone(gsteps[0], gclone, repo, [])
         fresh_home(ghome)
         subprocess.run(gsteps[1], env=env_for(a.headroom, gplan["env"]), check=True)
         universe = store_universe(ghome / "fox.db")
@@ -612,8 +625,7 @@ def main(argv: list | None = None) -> int:
             continue
         if h != "local":
             cfg.write_text(json.dumps(mcp_config_json(a.fox, arm == "on", plan["env"])))
-        if not cwd.exists():
-            subprocess.run(clone, check=True)
+        fresh_clone(clone, cwd, repo, [a.tasks, repo / "bench" / "tasks", repo / "bench" / "private"])
         env = env_for(a.headroom, plan["env"])
         if index:
             fresh_home(work / f"{name}.home")
