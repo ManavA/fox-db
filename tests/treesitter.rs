@@ -3181,3 +3181,18 @@ fn c_functions_behind_nested_declarators_are_definitions() {
     }
     assert!(p.defs.iter().find(|d| d.name == "maker").is_some_and(|d| d.stat), "{:?}", p.defs);
 }
+
+/// A name defined both in C and in a shell script (a test helper of the same name) leads with
+/// the C definition, though the script calls its own more often; C calls never reach the script's.
+#[test]
+fn a_shell_function_does_not_take_the_name_from_a_c_function() {
+    let _g = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    let (_h, _r, p) = inline_project(&[
+        ("path.c", "const char *relative_path(const char *in)\n{\n\treturn in;\n}\n"),
+        ("quote.c", "const char *relative_path(const char *in);\nint show(const char *s)\n{\n\treturn relative_path(s) != 0;\n}\n"),
+        ("t/t0060-path.sh", "relative_path() {\n\techo \"$1\"\n}\nrelative_path a\nrelative_path b\nrelative_path c\n"),
+    ]);
+    let out = fox_code(&p, "relative_path", "callers", 6000);
+    assert!(out.lines().any(|l| l.starts_with("callers of ") && l.ends_with("path.c:1")), "{out}");
+    assert!(rows(&out).contains("show c:") && !rows(&out).contains("(top)"), "{out}");
+}

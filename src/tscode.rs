@@ -97,10 +97,13 @@ pub fn resolve(c: &Connection, pid: i64, q: &str) -> Result<Vec<TSym>> {
         })
         .collect();
     // The name as typed (and its type as typed) beats a same-name symbol in another case
-    // (`render` the method, not `Render` the class); a definition beats its C prototype.
+    // (`render` the method, not `Render` the class); a definition beats its C prototype. A shell
+    // function (a test or build script's helper) yields to a same-name definition in the
+    // project's code, however often the scripts call their own.
     v.sort_by_key(|(t, n, decl, exact, score)| {
         let rank = if is_callable_kind(&t.kind) || is_type_kind(&t.kind) { 0 } else { 1 };
-        (t.name != name || !exact, std::cmp::Reverse(*score), rank, *decl, is_test(&t.path) as u8, std::cmp::Reverse(*n), t.id)
+        let script = crate::lang::for_path(&t.path).is_some_and(|l| l.family == "bash");
+        (t.name != name || !exact, std::cmp::Reverse(*score), rank, script, *decl, is_test(&t.path) as u8, std::cmp::Reverse(*n), t.id)
     });
     Ok(v.into_iter().map(|x| x.0).collect())
 }
