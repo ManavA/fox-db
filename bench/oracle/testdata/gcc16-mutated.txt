@@ -1,0 +1,34 @@
+In file included from t.c:1:
+t.h: In function ‘in_header’:
+t.h:3:44: error: too few arguments to function ‘target’; expected 2, have 1
+t.h:1:5: note: declared here
+t.c: At top level:
+t.c:5:11: error: initialization of ‘int (*)(int)’ from incompatible pointer type ‘int (*)(int,  double)’ [-Wincompatible-pointer-types]
+t.c:5:11: note: (near initialization for ‘table[0].f’)
+t.h:1:5: note: ‘target’ declared here
+t.c:7:20: error: initialization of ‘fn’ {aka ‘int (*)(int)’} from incompatible pointer type ‘int (*)(int,  double)’ [-Wincompatible-pointer-types]
+t.h:1:5: note: ‘target’ declared here
+t.c:2:15: note: ‘fn’ declared here
+t.c: In function ‘user1’:
+t.c:9:26: error: too few arguments to function ‘target’; expected 2, have 1
+t.h:1:5: note: declared here
+t.c: In function ‘user2’:
+t.c:10:27: error: assignment to ‘fn’ {aka ‘int (*)(int)’} from incompatible pointer type ‘int (*)(int,  double)’ [-Wincompatible-pointer-types]
+t.h:1:5: note: ‘target’ declared here
+t.c:2:15: note: ‘fn’ declared here
+t.c:10:42: error: passing argument 1 of ‘take’ from incompatible pointer type [-Wincompatible-pointer-types]
+t.c:8:21: note: expected ‘fn’ {aka ‘int (*)(int)’} but argument is of type ‘int (*)(int,  double)’
+t.h:1:5: note: ‘target’ declared here
+t.c:2:15: note: ‘fn’ declared here
+t.h:2:19: error: too few arguments to function ‘target’; expected 2, have 1
+t.c:10:58: note: in expansion of macro ‘CALL_T’
+t.h:1:5: note: declared here
+t.c: In function ‘user3’:
+t.c:11:25: error: returning ‘int (*)(int,  double)’ from a function with incompatible return type ‘fn’ {aka ‘int (*)(int)’} [-Wincompatible-pointer-types]
+t.h:1:5: note: ‘target’ declared here
+t.c:2:15: note: ‘fn’ declared here
+t.c: In function ‘user4’:
+t.c:12:33: warning: comparison of distinct pointer types lacks a cast [-Wcompare-distinct-pointer-types]
+t.c: At top level:
+t.c:13:5: error: conflicting types for ‘target’; have ‘int(int)’
+t.h:1:5: note: previous declaration of ‘target’ with type ‘int(int,  double)’

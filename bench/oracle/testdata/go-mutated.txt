@@ -1,0 +1,8 @@
+# example.com/t
+./t.go:6:14: not enough arguments in call to target
+	have (number)
+	want (int, float64)
+./t.go:7:24: cannot use target (value of type func(a int, oracle_extra float64) int) as func(int) int value in variable declaration
+./t.go:8:5: cannot use target (value of type func(a int, oracle_extra float64) int) as func(int) int value in argument to cb
+FAIL	example.com/t [build failed]
+FAIL
