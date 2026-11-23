@@ -529,25 +529,20 @@ fn completeness_counts_one_word_names_and_uses_outside_symbols() {
         ("lib/fs.c", "int simple_open(void) { return 0; }\n"),
         ("drivers/x.c", "#define FOPS(n) static const struct fops n = { .open = simple_open }\n"),
     ]);
-    // The argument in src/arg.c and the member assignment in src/field.c are resolved references:
-    // listed by `refs` and `impact`, still unknown to `callers` (what is called through them is
-    // not followed).
+    // The argument in src/arg.c, the member assignment in src/field.c and the initializer in
+    // src/fp.c are resolved references: listed by `refs` and `impact`, still unknown to `callers`
+    // (what is called through them is not followed).
     for (rel, head) in [
         (
             "callers",
-            "6 lines name `helper`: 1 call, 1 definition, 2 references, not calls, 2 unresolved; may be incomplete: 2 unresolved lines",
+            "6 lines name `helper`: 1 call, 1 definition, 3 references, not calls, 1 unresolved; may be incomplete: 1 unresolved line",
         ),
-        ("refs", "6 lines name `helper`: 3 refs, 1 definition, 2 unresolved; may be incomplete: 2 unresolved lines"),
-        ("impact", "6 lines name `helper`: 3 uses (d1), 1 definition, 2 unresolved; partial at d1: 2 unresolved lines"),
+        ("refs", "6 lines name `helper`: 4 refs, 1 definition, 1 unresolved; may be incomplete: 1 unresolved line"),
+        ("impact", "6 lines name `helper`: 4 uses (d1), 1 definition, 1 unresolved; partial at d1: 1 unresolved line"),
     ] {
         let out = fox_code(&p, "helper", rel, 800);
         assert!(out.starts_with(head), "{rel}: {out}");
-        assert!(
-            out.contains(
-                "unresolved mentions:\n  src/fp.c:1 | static int (*fp)(int) = helper;\n  src/macro.c:1 | #define CALL(x) helper(x)\n"
-            ),
-            "{rel}: {out}"
-        );
+        assert!(out.contains("unresolved mentions:\n  src/macro.c:1 | #define CALL(x) helper(x)\n"), "{rel}: {out}");
     }
     let out = fox_code(&p, "simple_open", "refs", 800);
     assert!(out.starts_with("2 lines name `simple_open`: 0 refs, 1 definition, 1 unresolved; may be incomplete"), "{out}");
@@ -3195,4 +3190,37 @@ fn a_shell_function_does_not_take_the_name_from_a_c_function() {
     let out = fox_code(&p, "relative_path", "callers", 6000);
     assert!(out.lines().any(|l| l.starts_with("callers of ") && l.ends_with("path.c:1")), "{out}");
     assert!(rows(&out).contains("show c:") && !rows(&out).contains("(top)"), "{out}");
+}
+
+/// Go: a function in a positional composite literal (`{"loop", loopIndexByteTwo}`) is a stored
+/// reference, and methods of a generic type (`func (s *Set[T]) Add`) are its methods.
+#[test]
+fn go_positional_literals_and_generic_receivers() {
+    let _g = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    let src = "package algo\n\nfunc loopIndexByteTwo(b []byte) int { return 0 }\n\nvar impls = []struct {\n\tname string\n\tfn   func([]byte) int\n}{\n\t{\"loop\", loopIndexByteTwo},\n}\n\ntype ConcurrentSet[T comparable] struct{ m map[T]bool }\n\nfunc (s *ConcurrentSet[T]) Add(v T) { s.m[v] = true }\n\nfunc (s ConcurrentSet[T]) Has(v T) bool { return s.m[v] }\n\nfunc use1(n int) {\n\ts := &ConcurrentSet[int]{}\n\ts.Add(1)\n\t_ = []any{n}\n}\n";
+    let q = qnames(&extract_text("algo/a.go", src));
+    for d in ["ConcurrentSet.Add", "ConcurrentSet.Has"] {
+        assert!(q.iter().any(|x| x == d), "{d}: {q:?}");
+    }
+    let (_h, _r, p) = inline_project(&[("algo/a.go", src)]);
+    let out = fox_code(&p, "loopIndexByteTwo", "refs", 6000);
+    assert!(rows(&out).contains(":9 (top)"), "{out}");
+    let out = fox_code(&p, "ConcurrentSet.Add", "callers", 6000);
+    assert!(rows(&out).contains(":20 use1"), "{out}");
+}
+
+/// C: a function stored in a local by its initializer (`fn_t *p = expire;`) or an assignment
+/// (`q = expire;`) is a reference; a parameter so stored is none.
+#[test]
+fn c_functions_stored_in_locals_are_references() {
+    let _g = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    let (_h, _r, p) = inline_project(&[(
+        "refs.c",
+        "typedef int fn_t(int);\nstatic int expire(int x) { return x; }\nint run(int y)\n{\n\tfn_t *p = expire;\n\tfn_t *q;\n\tq = expire;\n\tint z = y;\n\treturn p(z) + q(1);\n}\n",
+    )]);
+    let out = fox_code(&p, "expire", "refs", 6000);
+    assert!(rows(&out).contains(":5,7 run"), "{out}");
+    let c = db::open_ro().unwrap();
+    let n: i64 = c.query_row("SELECT COUNT(*) FROM ts_ref WHERE name = 'y'", [], |r| r.get(0)).unwrap();
+    assert_eq!(n, 0);
 }

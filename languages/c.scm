@@ -23,6 +23,10 @@
 (argument_list (identifier) @name) @reference.ref
 ; A function stored in a member (`chip->irq_mask = foo_mask;`): a reference.
 (assignment_expression left: (field_expression) right: (identifier) @name) @reference.ref
+; A function stored in a variable by its initializer or an assignment (`fn_t *p = expire;`,
+; `p = expire;`): a reference. Parameters and locals are dropped at extraction.
+(init_declarator value: (identifier) @name) @reference.ref
+(assignment_expression left: (identifier) right: (identifier) @name) @reference.ref
 ; A struct or union field, also behind pointers and arrays: found by name, never a call target.
 (field_declaration declarator: [(field_identifier) @name
   (pointer_declarator declarator: [(field_identifier) @name (pointer_declarator declarator: (field_identifier) @name)])

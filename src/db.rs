@@ -496,11 +496,14 @@ pub(crate) fn migrate(c: &Connection) -> Result<()> {
     }
     if v < 28 {
         // C functions declared behind nested declarators (`**f(void)`, `(*f(int))(int)`) are
-        // definitions. C files parse again once, and their projects re-score.
+        // definitions, a function stored in a C variable or a positional Go literal is a
+        // reference, and Go methods of generic types are methods. C and Go files parse again
+        // once, and their projects re-score.
         c.execute_batch(
-            "UPDATE ts_file SET hash = '', size = -1 WHERE lang = 'c';
+            "UPDATE ts_file SET hash = '', size = -1 WHERE lang IN ('c', 'go');
              INSERT OR REPLACE INTO meta(k, v)
-               SELECT 'rescore:' || p.id, 1 FROM project p WHERE EXISTS (SELECT 1 FROM ts_file f WHERE f.project_id = p.id AND f.lang = 'c');
+               SELECT 'rescore:' || p.id, 1 FROM project p
+               WHERE EXISTS (SELECT 1 FROM ts_file f WHERE f.project_id = p.id AND f.lang IN ('c', 'go'));
              PRAGMA user_version = 28;",
         )?;
     }

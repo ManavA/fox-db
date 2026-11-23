@@ -99,8 +99,8 @@ fn python_lines_are_accounted_for_by_group() {
 }
 
 /// C header prototypes and `extern` declarations are their own group; a line that may use the
-/// function (a function pointer initializer) is unresolved, listed, and makes the answer
-/// read as incomplete.
+/// function (a macro body that is more than one call) is unresolved, listed, and makes the
+/// answer read as incomplete.
 #[test]
 fn c_prototypes_are_declarations_and_unknown_uses_are_listed() {
     let _g = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
@@ -109,7 +109,7 @@ fn c_prototypes_are_declarations_and_unknown_uses_are_listed() {
         ("src/plan.c", "#include \"plan.h\"\nint plan_query(int q) { return q; }\nint run(void) { return plan_query(1); }\n"),
         (
             "src/other.c",
-            "/* plan_query is defined in plan.c */\nint use(void) { return plan_query(2); }\nstatic int (*fp)(int) = plan_query;\n",
+            "/* plan_query is defined in plan.c */\nint use(void) { return plan_query(2); }\n#define PQ(x) (plan_query(x) + 1)\n",
         ),
     ]);
     let out = fox_code(&p, "plan_query", "callers", 2000);
@@ -118,7 +118,7 @@ fn c_prototypes_are_declarations_and_unknown_uses_are_listed() {
         "7 lines name `plan_query`: 2 calls, 1 definition, 2 declarations/prototypes, 1 comment, 1 unresolved; may be incomplete: 1 unresolved line may use it",
         "{out}"
     );
-    assert!(out.contains("unresolved mentions:\n  src/other.c:3 | static int (*fp)(int) = plan_query;"), "{out}");
+    assert!(out.contains("unresolved mentions:\n  src/other.c:3 | #define PQ(x) (plan_query(x) + 1)"), "{out}");
     assert!(out.contains("declarations and prototypes:\n  include/plan.h:2 function plan_query c:"), "{out}");
     assert!(out.contains("include/plan.h:3 "), "{out}");
     // Without that line, every line is accounted for.

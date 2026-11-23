@@ -826,8 +826,16 @@ const FN_KINDS: &[&str] = &[
 
 /// Parents of a value slot whose identifier may name a function (an argument, an initializer
 /// element, a keyed value), or just a parameter or local of the enclosing function.
-const VALUE_SLOTS: &[&str] =
-    &["literal_element", "initializer_pair", "initializer_list", "argument_list", "arguments", "keyword_argument", "assignment_expression"];
+const VALUE_SLOTS: &[&str] = &[
+    "literal_element",
+    "initializer_pair",
+    "initializer_list",
+    "argument_list",
+    "arguments",
+    "keyword_argument",
+    "assignment_expression",
+    "init_declarator",
+];
 
 /// Parameter lists: a name declared in one outside any function body (a C prototype) is no
 /// file-level local.
