@@ -1,6 +1,6 @@
 # Search quality: the body arm, routing, the backend seam and the eval
 
-Milestone 5 changed what `fox find` reads for a question in words, moved FTS5 merge work out of
+Milestone 5 changed what `fox find` reads for a question in words, moved FTS5 [1] merge work out of
 the write path, put the search engine behind a typed seam, and checked in query sets that every
 later change is measured against.
 
@@ -8,12 +8,12 @@ later change is measured against.
 
 **Body arm.** Before, a symbol's full-text row held its split name, qualified name and path,
 nothing else. A question such as "make an HTTP request body readable again so it can be retried"
-shares almost no words with `rewindRequest`, so it was rarely found. Each tree-sitter symbol now
+shares almost no words with `rewindRequest`, so it was rarely found. Each tree-sitter [2] symbol now
 also has a row in `fts_body`: the comment block right above it (`//`, `#`, `/*`, `--`, `;`,
 attributes), then its own source, cut at 1,600 characters, with every identifier followed by its
 parts (`rewindRequest rewind request`). Swift index-store symbols, which come without source,
 get names only. Doc sections, notes and sessions already kept their text in `fts_node`, and the
-body arm reads them from there, merged with the symbols by BM25 score.
+body arm reads them from there, merged with the symbols by BM25 [3] score.
 
 **Routing.** A bare identifier (`dedupDeltas`, `Queue.dedupDeltas`, `omap_dma_cont`) reads names
 only: exact, keyword over names, prefix, trigram and graph arms. Another single token, such as a
@@ -23,7 +23,7 @@ eval and are gone from their route:
 
 - The trigram arm. It matched one word of the question inside paths (`aggregator` in
   `kube-aggregator/`) and then agreed with the body arm on the wrong rows.
-- Strong same-file damping. Fused scores are flat (1/61, 1/62, ...), so halving a repeat from one
+- Strong same-file damping. Fused scores (reciprocal rank fusion [4], k = 60) are flat (1/61, 1/62, ...), so halving a repeat from one
   file moved it some sixty places. The answer to a question often sits beside a better-scoring
   sibling in its file, so for questions a repeat now counts 0.95 times as much (a few places).
 
@@ -153,10 +153,10 @@ measure of agent success; the agent A/B runner (`bench/ab.py`) is that.
 
 ### Graph expansion
 
-File localization on 20 SWE-bench Verified issues (Python: django, sympy, sphinx, astropy,
+File localization on 20 SWE-bench Verified [5] [6] issues (Python: django, sympy, sphinx, astropy,
 xarray, pylint, matplotlib), the whole issue text as the query, test files removed from the
 ranking: recall@5 went from 0.46 to 0.54 and recall@10 from 0.52 to 0.62 with the expansion
-described in [architecture.md](architecture.md#search). Identifier queries taken from the same
+(lexically anchored, after LARGER [7]) described in [architecture.md](architecture.md#search). Identifier queries taken from the same
 issues are not expanded, and their recall is unchanged (0.49 / 0.60), as is recall on 10 Go and
 TypeScript issues (caddy, prometheus, hugo, vue, docusaurus, babel). The expansion's weight was
 picked on these same tasks, so the gain is an optimistic estimate. Median query time was
@@ -165,10 +165,26 @@ unchanged (about 0.07 s), and every query of the checked-in fixture eval still f
 ## Later
 
 - **Tantivy (done in milestone 7, opt-in):** with `backend = "auto"` a project of about 1M rows
-  or more gets a tantivy index (off by default: recall trails FTS5 on the kubernetes sets)
+  or more gets a tantivy [8] index (off by default: recall trails FTS5 on the kubernetes sets)
   kept by `foxd` from a change log written in the same transaction; it falls back to FTS5
   whenever the index lags. See [architecture.md](architecture.md#derived-tantivy-index-for-big-projects)
   and [benchmarks.md](benchmarks.md#big-projects-milestone-7).
-- **Vectors:** a trial with usearch and a code embedding model in native Rust, for questions only
+- **Vectors:** a trial with usearch [9] and a code embedding model in native Rust, for questions only
   (an identifier never reaches it), and only if an agent-task eval shows fewer turns or more
   first-try finds. If it does not, the feature is removed, not tuned.
+
+## References
+
+Stanford CS329Z, Engineering AI Agents (Fall 2026, https://cs329z.stanford.edu/), Lecture 3,
+Retrieval-Augmented Generation (RAG), covers the methods this page builds on: BM25, hybrid
+search, and reciprocal rank fusion with k = 60.
+
+1. SQLite FTS5 extension. https://www.sqlite.org/fts5.html
+2. tree-sitter. https://github.com/tree-sitter/tree-sitter
+3. Robertson, S., Zaragoza, H. (2009). The Probabilistic Relevance Framework: BM25 and Beyond. Foundations and Trends in Information Retrieval 3(4). https://doi.org/10.1561/1500000019
+4. Cormack, G. V., Clarke, C. L. A., Büttcher, S. (2009). Reciprocal Rank Fusion Outperforms Condorcet and Individual Rank Learning Methods. SIGIR 2009. https://doi.org/10.1145/1571941.1572114
+5. Jimenez, C. E., Yang, J., Wettig, A., Yao, S., Pei, K., Press, O., Narasimhan, K. (2023). SWE-bench: Can Language Models Resolve Real-World GitHub Issues? arXiv:2310.06770. https://arxiv.org/abs/2310.06770
+6. OpenAI (2024). Introducing SWE-bench Verified. https://openai.com/index/introducing-swe-bench-verified/
+7. Hu, Y., Su, T., Zhao, L., Zhu, B., Haque, H. (2026). LARGER: Lexically Anchored Repository Graph Exploration and Retrieval. arXiv:2605.16352. https://arxiv.org/abs/2605.16352
+8. tantivy. https://github.com/quickwit-oss/tantivy
+9. USearch. https://github.com/unum-cloud/usearch

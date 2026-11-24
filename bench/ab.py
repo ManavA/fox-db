@@ -56,6 +56,17 @@ llama.cpp llama-server) with three arms instead of on/off: grep (bash only), fox
 `fox` CLI on the scratch store) and packet (bash plus a fox callers/impact packet up front). The
 arm goes in the row's `foxdb` field; report compares fox-cli and packet with grep. Rows add steps,
 cap, forced_final, loop and max_repeat; transcripts go to --work as NAME.transcript.jsonl.
+
+Methods and their sources (docs/benchmarks.md#references; Stanford CS329Z, Engineering AI Agents,
+Lectures 1, 4, 13, 15 and 16, https://cs329z.stanford.edu/):
+    pass^k, estimated as C(c, k) / C(n, k)   Yao et al. 2024, tau-bench, https://arxiv.org/abs/2406.12045
+    grader self-test (oracles, empty, padded) and answers kept out of agent clones
+                                             Zhu et al. 2025, https://arxiv.org/abs/2507.02825
+    per-run cost cap, cost and p90 cost      Kapoor et al. 2024, https://arxiv.org/abs/2407.01502
+    real-repository tasks                    Jimenez et al. 2023, SWE-bench, https://arxiv.org/abs/2310.06770
+    percentile bootstrap CIs                 Efron 1979, https://doi.org/10.1214/aos/1176344552
+    a fresh clone for every run and the grader
+                                             Anthropic 2026, https://www.anthropic.com/engineering/demystifying-evals-for-ai-agents
 """
 
 import argparse

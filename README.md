@@ -3,7 +3,7 @@
 fox-db is a local code graph and index for coding agents. One SQLite db 
 holds every project you work in: files, directories, Markdown doc
 sections, milestone logs, Claude Code memory notes, code symbols and their call graph
-(Swift from Xcode's index store, 18 more languages through built-in tree-sitter). Agents
+(Swift from Xcode's index store, 18 more languages through built-in tree-sitter [1]). Agents
 reach it through a small CLI (`fox`), an optional daemon (`foxd`) and an MCP server with four
 tools, and get short, budgeted answers that end in `path:line` instead of reading whole files.
 It also keeps a handoff board, so several agents in Claude Code, Codex, opencode or T3 Code
@@ -121,8 +121,9 @@ fox find "release checklist" --kind doc   # only doc sections (also: symbol, fil
 fox find config --all --limit 20          # every indexed project, not just the current one
 ```
 
-Results from several search methods (exact name, keyword, substring, fuzzy name, graph
-neighbours, and body text for questions) are fused and ranked; definitions rank above tests and
+Results from several search methods (exact name, keyword (FTS5 [4], BM25 [5]), substring, fuzzy name, graph
+neighbours, and body text for questions, expanded over the call graph [7]) are fused by
+reciprocal rank fusion [6] and ranked; definitions rank above tests and
 generated code. `fox eval retrieval` measures search quality on a fixed query set
 ([docs/search-quality.md](docs/search-quality.md)).
 
@@ -234,11 +235,11 @@ Three opt-in extras change nothing until you turn them on:
 
 | Extra | Turn on | What it gives |
 |---|---|---|
-| Precise tier (SCIP) | `fox scip import index.scip` | exact definitions and call edges from an index your own build produced, replacing name guesses |
-| Tantivy backend | `[search] backend = "auto"` in config.toml, then `fox index rebuild` | about 3x faster keyword search on Linux-sized projects (about 1M rows and up) |
-| Vector arm | build with `--features vectors`, then `fox vectors setup` and `vectors = true` | meaning-based matches for long, vague questions |
+| Precise tier (SCIP [2]) | `fox scip import index.scip` | exact definitions and call edges from an index your own build produced, replacing name guesses |
+| Tantivy [3] backend | `[search] backend = "auto"` in config.toml, then `fox index rebuild` | about 3x faster keyword search on Linux-sized projects (about 1M rows and up) |
+| Vector arm [8] | build with `--features vectors`, then `fox vectors setup` and `vectors = true` | meaning-based matches for long, vague questions |
 
-Measured trade-offs and open targets: [docs/benchmarks.md](docs/benchmarks.md),
+Measured trade-offs and open targets, and the agent A/B harness [9]-[13]: [docs/benchmarks.md](docs/benchmarks.md),
 [docs/architecture.md](docs/architecture.md).
 
 ## Docs
@@ -261,6 +262,33 @@ single-machine and single-user, the call graph outside Swift is name-resolved un
 a SCIP index (treat `callers` as a lower bound), and some performance targets are still open;
 see [docs/benchmarks.md](docs/benchmarks.md) and the limitations in
 [docs/usage.md](docs/usage.md#limitations).
+
+## Acknowledgements
+
+fox-db builds on these tools and ideas; each doc lists the references it uses
+([architecture.md](docs/architecture.md#references),
+[search-quality.md](docs/search-quality.md#references),
+[benchmarks.md](docs/benchmarks.md#references), [roadmap.md](docs/roadmap.md#references)).
+
+The agent A/B harness and the search pipeline draw on Stanford CS329Z, Engineering AI Agents
+(Fall 2026, https://cs329z.stanford.edu/): Lecture 1, Introduction: What Are Agentic Systems?;
+Lecture 3, Retrieval-Augmented Generation (RAG); Lecture 4, Tool Use & Function Calling;
+Lecture 13, Evaluation Fundamentals & Benchmark Design; Lecture 15, LLM-as-Judge & Evaluation
+Infrastructure; and Lecture 16, the SWE-bench guest lecture.
+
+1. tree-sitter. https://github.com/tree-sitter/tree-sitter
+2. SCIP Code Intelligence Protocol. https://github.com/sourcegraph/scip
+3. tantivy. https://github.com/quickwit-oss/tantivy
+4. SQLite FTS5 extension, the keyword index. https://www.sqlite.org/fts5.html
+5. Robertson, S., Zaragoza, H. (2009). The Probabilistic Relevance Framework: BM25 and Beyond. https://doi.org/10.1561/1500000019
+6. Cormack, G. V., Clarke, C. L. A., Büttcher, S. (2009). Reciprocal Rank Fusion Outperforms Condorcet and Individual Rank Learning Methods. SIGIR 2009. https://doi.org/10.1145/1571941.1572114
+7. Hu, Y., et al. (2026). LARGER: Lexically Anchored Repository Graph Exploration and Retrieval, the graph expansion of questions. https://arxiv.org/abs/2605.16352
+8. Model2Vec and potion-code-16M, the optional vector arm. https://github.com/MinishLab/model2vec
+9. Yao, S., et al. (2024). τ-bench, for pass^k. https://arxiv.org/abs/2406.12045
+10. Zhu, Y., et al. (2025). Establishing Best Practices for Building Rigorous Agentic Benchmarks, for the grader self-test and task isolation. https://arxiv.org/abs/2507.02825
+11. Kapoor, S., et al. (2024). AI Agents That Matter, for cost-capped, cost-reported runs. https://arxiv.org/abs/2407.01502
+12. Jimenez, C. E., et al. (2023). SWE-bench, for real-repository tasks and the localization runs. https://arxiv.org/abs/2310.06770
+13. Yang, J., et al. (2024). SWE-agent, and mini-swe-agent (https://github.com/SWE-agent/mini-swe-agent), for the local bash-loop agent. https://arxiv.org/abs/2405.15793
 
 ## License
 

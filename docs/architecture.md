@@ -4,7 +4,7 @@ fox-db is one Rust crate with two binaries: `fox` (CLI, MCP server over stdio, h
 
 ## Indexing
 
-`fox index` walks a project (honouring `.gitignore` and the per-project tiers), stores files, directories, Markdown sections and milestone entries as rows of `node`, parses changed code files with tree-sitter in parallel (or reads Xcode index stores for Swift) and resolves call references by name with scope awareness. Unchanged files are skipped by size, mtime and content hash. Secrets are never read. A project is registered the first time `fox` or the MCP server runs inside it, keyed by its git common dir, so worktrees share one project.
+`fox index` walks a project (honouring `.gitignore` and the per-project tiers), stores files, directories, Markdown sections and milestone entries as rows of `node`, parses changed code files with tree-sitter [2] in parallel (or reads Xcode index stores for Swift) and resolves call references by name with scope awareness. Unchanged files are skipped by size, mtime and content hash. Secrets are never read. A project is registered the first time `fox` or the MCP server runs inside it, keyed by its git common dir, so worktrees share one project.
 
 **C member calls.** A C function-pointer member (`void (*irq_mask)(struct irq_data *)`) is a
 method of its struct. So is a member declared through a typedef of a function pointer (`op_fn
@@ -90,7 +90,7 @@ below the threshold never write a record, and their runs are unchanged.
 
 ## Precise tier (SCIP)
 
-`fox scip import` decodes a SCIP index (only the fields it needs: metadata, documents,
+`fox scip import` decodes a SCIP [3] index (only the fields it needs: metadata, documents,
 occurrences, roles) and stores, per project, `scip_doc` (path and the file's content hash when
 the text the index embedded is the file's current content, empty otherwise; a document without
 text is empty too unless the import was given `--trust-mtime`, which trusts a file last modified
@@ -108,7 +108,7 @@ pay one `sqlite_master` lookup per resolution run.
 
 ## Storage
 
-One SQLite file (WAL) is the system of record. The FTS5 tables are contentless
+One SQLite file (WAL) is the system of record. The FTS5 [1] tables are contentless
 (`content=''`, `contentless_delete=1`): the text lives in the files and in `node`, not a second
 time inside the index, which cut the benchmark store by about 16% (86.2 MB to 72.7 MB). Older stores migrate once on
 open, under a file lock, so several processes opening an old store at once wait for one migration
@@ -134,11 +134,11 @@ Why not something bigger:
 ## Search
 
 `find` routes the query, runs its arms in parallel and fuses their ranked lists with weighted
-reciprocal rank fusion (k = 60). A bare identifier (`loadUserName`, `Type.member`) reads names;
+reciprocal rank fusion (k = 60) [4]. A bare identifier (`loadUserName`, `Type.member`) reads names;
 a question in words reads body text instead; mixing the two hurt both in the retrieval eval.
 
 1. exact name (and `Type.member`), every query;
-2. FTS5 keyword, BM25 with name and signature weighted over path and body. Queries are split
+2. FTS5 keyword, BM25 [5] with name and signature weighted over path and body. Queries are split
    the code way (`loadUserName` -> `load user name`, plus the whole identifier; snake_case is
    one squashed term too), stopwords and one-letter terms dropped, rare-looking terms first.
    An identifier reads names, qualified names and paths only (at most 8 terms). Words read the
@@ -154,7 +154,7 @@ is the query) x3, a file whose stem is the query x1.5, test paths x0.3, vendored
 code x0.3, and each further hit from a file already shown counts half as much again (a twentieth
 less for questions, whose answer often sits beside a sibling).
 
-A question in words is then expanded over the call graph (lexically anchored, after LARGER):
+A question in words is then expanded over the call graph (lexically anchored, after LARGER [6]):
 its five best symbol hits that are not tests or vendored code, each scoring at least 0.3 of the
 best, anchor a one-hop walk over certain references (tree-sitter references that are not
 guesses, and compiler-resolved edges), callers and callees alike, eight neighbours per anchor,
@@ -190,7 +190,7 @@ the single-project BM25 order; the hits are the same.
 
 ## Derived tantivy index for big projects
 
-Builds with the `tantivy` feature can keep a [tantivy](https://github.com/quickwit-oss/tantivy)
+Builds with the `tantivy` feature can keep a [tantivy](https://github.com/quickwit-oss/tantivy) [7]
 index beside SQLite. It is opt-in (the default `backend` is `fts5`, because tantivy's recall
 trails FTS5's on the kubernetes eval sets): with `backend = "auto"` a project of at least
 `tantivy_min_docs` rows gets one (one million by default; a Linux-sized tree has about 1.3
@@ -254,9 +254,9 @@ Builds with the `vectors` feature (not in the default build) add a sixth arm for
 (`src/vectors.rs`). It runs only when `vectors = true`, the model is in place and the query has
 five or more words; the routing above never sends it an identifier, a token or a short phrase.
 
-- **Embeddings:** model2vec `potion-code-16M`, a static table of 256-d token vectors. A text's
+- **Embeddings:** model2vec [8] `potion-code-16M` [9], a static table of 256-d token vectors. A text's
   vector is the mean of its WordPiece tokens' rows (times the model's per-token weights),
-  L2-normalized. The tokenizer is a small BERT WordPiece implementation that reads the model's
+  L2-normalized. The tokenizer is a small BERT WordPiece [10] implementation that reads the model's
   `tokenizer.json` (it matched the reference tokenizer on 2,305 of 2,306 sampled code and text
   chunks; the one difference is in a non-ASCII text). A query reads only its own tokens' rows
   from the safetensors file.
@@ -313,3 +313,20 @@ user service; fox-db never starts it for you.
 
 - [ADR 0001: backend](adr/0001-backend.md)
 - [ADR 0002: code graph](adr/0002-code-graph.md)
+
+## References
+
+Stanford CS329Z, Engineering AI Agents (Fall 2026, https://cs329z.stanford.edu/), Lecture 3,
+Retrieval-Augmented Generation (RAG), covers BM25, hybrid search and reciprocal rank fusion
+with k = 60, the retrieval methods the search pipeline uses.
+
+1. SQLite FTS5 extension. https://www.sqlite.org/fts5.html
+2. tree-sitter. https://github.com/tree-sitter/tree-sitter
+3. SCIP Code Intelligence Protocol. https://github.com/sourcegraph/scip
+4. Cormack, G. V., Clarke, C. L. A., Büttcher, S. (2009). Reciprocal Rank Fusion Outperforms Condorcet and Individual Rank Learning Methods. SIGIR 2009. https://doi.org/10.1145/1571941.1572114
+5. Robertson, S., Zaragoza, H. (2009). The Probabilistic Relevance Framework: BM25 and Beyond. Foundations and Trends in Information Retrieval 3(4). https://doi.org/10.1561/1500000019
+6. Hu, Y., Su, T., Zhao, L., Zhu, B., Haque, H. (2026). LARGER: Lexically Anchored Repository Graph Exploration and Retrieval. arXiv:2605.16352. https://arxiv.org/abs/2605.16352
+7. tantivy. https://github.com/quickwit-oss/tantivy
+8. Model2Vec. https://github.com/MinishLab/model2vec
+9. potion-code-16M. https://huggingface.co/minishlab/potion-code-16M
+10. Devlin, J., Chang, M.-W., Lee, K., Toutanova, K. (2018). BERT: Pre-training of Deep Bidirectional Transformers for Language Understanding. arXiv:1810.04805. https://arxiv.org/abs/1810.04805

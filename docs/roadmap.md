@@ -2,7 +2,7 @@
 
 Milestone 1, measure then stabilize (done): the bench and dry-run A/B runner; cache-stable
 output (deterministic briefs, frozen tool definitions, per-harness caps); contentless FTS5;
-parallel search arms fused with RRF and code-aware ranking; the `foxd` daemon with an in-memory
+parallel search arms fused with RRF [1] and code-aware ranking; the `foxd` daemon with an in-memory
 graph and result cache; tiered results and already-sent references; the handoff board,
 subagent hooks and transcript ingest; `fox drift` and `fox pack`.
 
@@ -36,9 +36,9 @@ a quality gate (vague recall@5 on the kubernetes set 0.11 to 0.43); `fox swarm`;
 and `--for t3`. See [search-quality.md](search-quality.md), [swarm.md](swarm.md)
 and [docs/t3code.md](t3code.md).
 
-Milestone 6, a precise tier from SCIP (done): `fox scip import` reads SCIP indexes your own
+Milestone 6, a precise tier from SCIP [2] (done): `fox scip import` reads SCIP indexes your own
 builds produce (scip-java, rust-analyzer `scip`, scip-python, scip-typescript, scip-go) with a
-small built-in protobuf reader (no new dependency) and upgrades matching tree-sitter references,
+small built-in protobuf reader (no new dependency) and upgrades matching tree-sitter [3] references,
 and the call edges they carry, to the definitions SCIP names. Freshness is per file by content:
 a document counts only when the index embedded its text and that text is the current file, so a
 file changed since the index was built keeps its tree-sitter answers until the next import, and a
@@ -47,7 +47,7 @@ with `--trust-mtime`, since a modification time cannot prove what the indexer re
 fresh it is; `fox drift` reports a symbol moved to another file by its SCIP id. A store that
 never imports gains no tables and no work. See [usage.md](usage.md#precise-tier-scip).
 
-Milestone 7, big projects (done): an opt-in tantivy index for a project of about a million rows
+Milestone 7, big projects (done): an opt-in tantivy [4] index for a project of about a million rows
 or more (with `[search] backend = "auto"` past `tantivy_min_docs`, or by `[search.projects]` in
 config.toml; off by default because its recall trails FTS5 on the kubernetes eval sets), kept by `foxd` from a change log written in the same SQLite transaction as the
 full-text rows, read only when it has applied every logged change and otherwise replaced by
@@ -64,7 +64,7 @@ not yet match FTS5's recall on keyword and vague queries, which is what keeps it
 
 Milestone 8, an optional vector arm (done, opt-in and not in the default build): the
 `vectors` Cargo feature, `vectors = true` in config.toml, and `fox vectors setup`, which names
-model2vec `potion-code-16M` (MIT, 65 MB, Hugging Face, pinned commit, sha256-checked) before it
+model2vec [5] `potion-code-16M` (MIT, 65 MB, Hugging Face, pinned commit, sha256-checked) before it
 downloads it. Static embeddings computed in Rust over symbol body text and doc headings, one flat
 int8 file per project with an exact scan, refreshed after each index run (changed files only;
 otherwise only a stamp moves), read only when current and intact. Sentences of five or more
@@ -88,14 +88,37 @@ in without touching the arms, fusion or ranking):
   200k files.
 - A Postgres team mode, when an index must be shared or written across machines or people.
 - Vectors beyond milestone 8's static arm, only if an eval on our own agent tasks shows a gain:
-  a transformer code model (ONNX) and usearch HNSW past about a million rows; Qdrant later.
+  a transformer code model (ONNX) and usearch [6] HNSW [7] past about a million rows; Qdrant later.
 - Not planned: graph databases, Apache AGE, Milvus, Weaviate, Vespa, turbopuffer.
 
 Later, each only if the A/B runs show a gap:
 - Run the agent A/B at scale and tune the RRF weights from what agents open next.
 - Bi-temporal memory (valid from/to, supersedes) anchored to symbols, flagged stale when the code changes.
 - Verified handoffs: check a report's `path:line` evidence against the current index when it is read.
-- Personalized PageRank over the graph and an Aider-style budgeted repo map.
+- Personalized PageRank over the graph and an Aider-style budgeted repo map [8].
 - Content-hash, worktree-tagged artifacts so new worktrees cost nothing to index.
 - Notes, memory and session text in the vector arm (it covers symbols and doc headings).
-- Indexed regex over the trigram table with a dirty-file overlay.
+- Indexed regex over the trigram table with a dirty-file overlay [9].
+- Tune the committed briefs, tool descriptions and dispatch prompts against the A/B tasks with a
+  reflective prompt optimizer such as GEPA [10], which DSPy [11] ships, keeping the
+  `context-budget.json` caps.
+
+## References
+
+GEPA and DSPy are future work here, from Stanford CS329Z, Engineering AI Agents (Fall 2026,
+https://cs329z.stanford.edu/), Lecture 9, Optimization. Retrieval references for the finished
+milestones are in [architecture.md](architecture.md#references) and
+[search-quality.md](search-quality.md#references); evaluation references in
+[benchmarks.md](benchmarks.md#references).
+
+1. Cormack, G. V., Clarke, C. L. A., Büttcher, S. (2009). Reciprocal Rank Fusion Outperforms Condorcet and Individual Rank Learning Methods. SIGIR 2009. https://doi.org/10.1145/1571941.1572114
+2. SCIP Code Intelligence Protocol. https://github.com/sourcegraph/scip
+3. tree-sitter. https://github.com/tree-sitter/tree-sitter
+4. tantivy. https://github.com/quickwit-oss/tantivy
+5. Model2Vec. https://github.com/MinishLab/model2vec
+6. USearch. https://github.com/unum-cloud/usearch
+7. Malkov, Y. A., Yashunin, D. A. (2016). Efficient and Robust Approximate Nearest Neighbor Search Using Hierarchical Navigable Small World Graphs. arXiv:1603.09320. https://arxiv.org/abs/1603.09320
+8. Aider repository map. https://aider.chat/docs/repomap.html
+9. Cox, R. (2012). Regular Expression Matching with a Trigram Index. https://swtch.com/~rsc/regexp/regexp4.html
+10. Agrawal, L. A., Tan, S., Soylu, D., et al. (2025). GEPA: Reflective Prompt Evolution Can Outperform Reinforcement Learning. arXiv:2507.19457. https://arxiv.org/abs/2507.19457
+11. Khattab, O., Singhvi, A., Maheshwari, P., et al. (2023). DSPy: Compiling Declarative Language Model Calls into Self-Improving Pipelines. arXiv:2310.03714. https://arxiv.org/abs/2310.03714

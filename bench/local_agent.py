@@ -23,6 +23,10 @@ left the server broken until restart, hence -ub 16 -b 16.
 Commands run as the user with HOME pointed at --scratch, and with `fox` on PATH only in the fox-cli
 arm. That keeps the live store and user config out of reach of a well-behaved command; it is not a
 sandbox.
+
+The loop follows SWE-agent (Yang et al. 2024, https://arxiv.org/abs/2405.15793) and
+mini-swe-agent (https://github.com/SWE-agent/mini-swe-agent): bash as the only tool, one action
+per turn, capped observations.
 """
 
 import argparse

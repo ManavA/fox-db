@@ -33,8 +33,11 @@ Each run says whether it ran with headroom on or off, read from the process envi
 does not go through any model, so the mode is recorded rather than effective; it matters for the
 A/B runner.
 
-`bench/ab.py tasks.toml` is the agent A/B runner: the same tasks through `claude -p` and
-`codex exec`, with fox-db as the only MCP server and with none, each in a throwaway clone. It only
+`bench/ab.py tasks.toml` is the agent A/B runner: the same tasks on a real repository, in the
+style of SWE-bench [4], through `claude -p` and `codex exec`, with fox-db as the only MCP server
+and with none. Each run, and the grader, starts from a fresh clone, and the agent's clone has the
+task file, `bench/tasks` and `bench/private` removed so it cannot read the answers [2] [8]. A
+claude run stops at `--max-usd` (1 USD by default), so arms are compared at a fixed budget [3]. It only
 prints the commands unless given `--run`. `--headroom on|off` sets or removes
 `ANTHROPIC_BASE_URL` for the child processes only; nothing in your settings changes. By default
 (`--store scratch`) each "on" run gets its own `FOXDB_HOME` holding only that clone's index, with no
@@ -43,13 +46,16 @@ the task order and the arm order within a task from a recorded `--seed`. A task 
 ground-truth items (`expect`, each optionally labelled `call`, `store`, `doc` or `file`); the runner
 scores precision, recall and F1 of the items the final answer names, counting as wrong only other
 names that exist in a scratch index of the repo, and `--grader-selftest` checks the grader against
-each task's prose oracles, empty and padded answers. Results are JSON lines with cost,
+each task's prose oracles (must score 1), an empty answer (the do-nothing agent, must score 0) and
+an oracle padded with decoys (listing every name must not pass) [2]. Results are JSON lines with cost,
 turns, cache reads and writes, scores, the headroom and store modes, seed, model, harness version,
 fox binary sha256 and git commits. `bench/ab.py report RESULTS.jsonl` prints paired on-off
-differences per task and overall with bootstrap 95% CIs, pass^k and p90 cost, one block per run.
+differences per task and overall with bootstrap 95% CIs [7], pass^k (the chance that all k
+repeats pass, estimated as in τ-bench [1]) and p90 cost [3], one block per run.
 
 `--harness local` asks whether fox-db helps a small local model, where frontier models already find
-every caller with grep. It drives `bench/local_agent.py`, a one-command-per-turn bash loop, against
+every caller with grep. It drives `bench/local_agent.py`, a one-command-per-turn bash loop after
+SWE-agent [5] and mini-swe-agent [6], against
 an OpenAI-compatible server such as llama.cpp's `llama-server` (`--local-url`, temperature 0), with
 three arms: `grep` (bash only), `fox-cli` (bash plus the `fox` CLI on the scratch store) and
 `packet` (bash plus a fox callers/impact packet for the names in the question, about 800 tokens).
@@ -318,3 +324,21 @@ rewrites only its stamp.
 ## Orchestration (milestones 2 and 3)
 
 Packet size, dispatch and wait latency: see [multi-agent.md](multi-agent.md#worked-examples).
+
+## References
+
+The A/B runner's evaluation methods follow Stanford CS329Z, Engineering AI Agents (Fall 2026,
+https://cs329z.stanford.edu/): Lecture 4, Tool Use & Function Calling, and Lecture 15,
+LLM-as-Judge & Evaluation Infrastructure (pass^k); Lecture 13, Evaluation Fundamentals &
+Benchmark Design (task validity, isolation, budgets, error bars and costs in every report);
+Lecture 1, Introduction: What Are Agentic Systems? (cost-controlled evaluation); and Lecture 16,
+the SWE-bench guest lecture (real-repository tasks).
+
+1. Yao, S., Shinn, N., Razavi, P., Narasimhan, K. (2024). τ-bench: A Benchmark for Tool-Agent-User Interaction in Real-World Domains. arXiv:2406.12045. https://arxiv.org/abs/2406.12045
+2. Zhu, Y., Jin, T., Pruksachatkun, Y., et al. (2025). Establishing Best Practices for Building Rigorous Agentic Benchmarks. arXiv:2507.02825. https://arxiv.org/abs/2507.02825
+3. Kapoor, S., Stroebl, B., Siegel, Z. S., Nadgir, N., Narayanan, A. (2024). AI Agents That Matter. arXiv:2407.01502. https://arxiv.org/abs/2407.01502
+4. Jimenez, C. E., Yang, J., Wettig, A., Yao, S., Pei, K., Press, O., Narasimhan, K. (2023). SWE-bench: Can Language Models Resolve Real-World GitHub Issues? arXiv:2310.06770. https://arxiv.org/abs/2310.06770
+5. Yang, J., Jimenez, C. E., Wettig, A., Lieret, K., Yao, S., Narasimhan, K., Press, O. (2024). SWE-agent: Agent-Computer Interfaces Enable Automated Software Engineering. arXiv:2405.15793. https://arxiv.org/abs/2405.15793
+6. mini-swe-agent. https://github.com/SWE-agent/mini-swe-agent
+7. Efron, B. (1979). Bootstrap Methods: Another Look at the Jackknife. The Annals of Statistics 7(1). https://doi.org/10.1214/aos/1176344552
+8. Grace, M., Hadfield, J., Olivares, R., De Jonghe, J. (2026). Demystifying evals for AI agents. Anthropic. https://www.anthropic.com/engineering/demystifying-evals-for-ai-agents
