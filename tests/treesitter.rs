@@ -3344,3 +3344,107 @@ fn rust_calls_inside_macro_arguments_are_calls() {
     let out = fox_code(&p, "helper", "callers", 6000);
     assert!(rows(&out).contains(":8,9 P.sink") && !rows(&out).contains(":17"), "{out}");
 }
+
+/// C: a macro calling one of its own parameters (`#define APPLY(fn, x) fn(x)`) stands for no
+/// function, even when a function has the parameter's name.
+#[test]
+fn c_macros_calling_their_parameters_call_nothing() {
+    let _g = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    let (_h, _r, p) = inline_project(&[(
+        "m.c",
+        "#define APPLY(fn, x) fn(x)\nint fn(int x) { return x; }\nint sq(int x) { return x * x; }\nint main(void) { return APPLY(sq, 2); }\n",
+    )]);
+    let out = fox_code(&p, "fn", "callers", 6000);
+    assert!(rows(&out).is_empty(), "{out}");
+}
+
+/// Rust: `self.f()` reaches the method of the caller's impl type in its own file; a same-name
+/// type of another file (`map.rs` and `set.rs` each with an `Iter`) is never certain.
+#[test]
+fn rust_self_calls_do_not_merge_same_name_types_of_other_files() {
+    let _g = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    let (_h, _r, p) = inline_project(&[
+        ("src/map.rs", "pub struct Iter;\nimpl Iter {\n    pub fn size_hint(&self) -> usize {\n        0\n    }\n}\n"),
+        ("src/set.rs", "pub struct Iter;\nimpl Iter {\n    pub fn len(&self) -> usize {\n        self.size_hint()\n    }\n}\n"),
+    ]);
+    let out = fox_code(&p, "size_hint", "callers", 6000);
+    not_certain(&out, "Iter.len");
+    assert!(!out.contains("all accounted for"), "{out}");
+}
+
+fn c_sym_parent(p: &project::Project, name: &str, parent: &str) -> String {
+    let c = db::open_ro().unwrap();
+    let id: i64 = c
+        .query_row(
+            "SELECT id FROM node WHERE project_id = ?1 AND name = ?2 AND kind = 'symbol' AND json_extract(meta,'$.parent') = ?3",
+            rusqlite::params![p.id, name, parent],
+            |r| r.get(0),
+        )
+        .unwrap();
+    format!("c:{id:x}")
+}
+
+/// Rust: a path through an inline module (`b::S::make()`) names that module's type, not a
+/// same-name type of another inline module of the file.
+#[test]
+fn rust_paths_through_inline_modules_keep_the_module() {
+    let _g = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    let (_h, _r, p) = inline_project(&[(
+        "src/lib.rs",
+        "mod a {\n    pub struct S;\n    impl S {\n        pub fn make() -> S {\n            S\n        }\n    }\n}\nmod b {\n    pub struct S;\n    impl S {\n        pub fn make() -> S {\n            S\n        }\n    }\n}\nfn go() {\n    b::S::make();\n}\n",
+    )]);
+    let out = fox_code(&p, &c_sym_parent(&p, "make", "b.S"), "callers", 6000);
+    sure(&out, "go");
+    let out = fox_code(&p, &c_sym_parent(&p, "make", "a.S"), "callers", 6000);
+    assert!(rows(&out).is_empty(), "{out}");
+}
+
+/// Rust: a `use` inside a function body is visible only in that block: a call elsewhere in the
+/// module reads the path as written.
+#[test]
+fn rust_uses_in_function_bodies_stay_in_their_block() {
+    let _g = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    let (_h, _r, p) = inline_project(&[
+        (
+            "src/main.rs",
+            "mod db;\nmod other;\nfn one() {\n    use crate::db as store;\n    store::open();\n}\nfn two() {\n    store::open();\n}\nfn main() {}\n",
+        ),
+        ("src/db.rs", "pub fn open() {}\n"),
+        ("src/other.rs", "pub mod store {\n    pub fn open() {}\n}\n"),
+    ]);
+    let out = fox_code(&p, &c_sym(&p, "src/db.rs", "open"), "callers", 6000);
+    sure(&out, "one");
+    assert!(row_of(&out, "two").is_none(), "{out}");
+}
+
+/// Rust macro tokens: `fn name(..)` declares what the macro generates, and a closure parameter
+/// called there (`|check| check(1)`) calls no definition.
+#[test]
+fn rust_macro_tokens_skip_declared_functions_and_closure_parameters() {
+    let _g = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    let (_h, _r, p) = inline_project(&[(
+        "src/lib.rs",
+        "macro_rules! make {\n    ($($t:tt)*) => { $($t)* };\n}\nfn generated(x: u8) -> u8 {\n    x\n}\nfn check(x: u8) -> bool {\n    x > 0\n}\nmake! {\n    fn generated(x: u8) -> u8 { x }\n}\nfn run() {\n    assert!([1u8].iter().all(|check| check(1) > 0));\n}\n",
+    )]);
+    for name in ["generated", "check"] {
+        let out = fox_code(&p, &c_sym(&p, "src/lib.rs", name), "callers", 6000);
+        assert!(rows(&out).is_empty(), "{name}: {out}");
+    }
+}
+
+/// Rust: deeply nested blocks index in linear time.
+#[test]
+fn rust_deep_nesting_indexes_fast() {
+    let mut src = String::from("fn f() {\n");
+    for _ in 0..400 {
+        src.push_str("{ a::b(); ");
+    }
+    for _ in 0..400 {
+        src.push('}');
+    }
+    src.push_str("\n}\n");
+    let t = std::time::Instant::now();
+    let p = extract_text("src/x.rs", &src);
+    assert_eq!(p.refs.iter().filter(|r| r.name == "b").count(), 400);
+    assert!(t.elapsed() < std::time::Duration::from_secs(5), "{:?}", t.elapsed());
+}
