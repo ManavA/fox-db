@@ -554,6 +554,7 @@ def run_parser() -> argparse.ArgumentParser:
     ap.add_argument("--out", type=Path, default=Path("ab-results.jsonl"))
     ap.add_argument("--grader-selftest", action="store_true", help="check the grader on each task and exit")
     ap.add_argument("--run", action="store_true", help="actually run (default: dry-run, print commands)")
+    ap.add_argument("--resume", action="store_true", help="skip (task, harness, arm, rep) cells already in --out")
     return ap
 
 
@@ -566,6 +567,18 @@ def report_main(argv: list) -> int:
     rows = [json.loads(ln) for ln in a.results.read_text().splitlines() if ln.strip()]
     print(report(rows, a.seed, a.draws))
     return 0
+
+
+def done_cells(out: Path) -> set:
+    cells = set()
+    if out.exists():
+        for line in out.read_text().splitlines():
+            try:
+                r = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            cells.add((r["task"], r["harness"], r["foxdb"], r["rep"]))
+    return cells
 
 
 def main(argv: list | None = None) -> int:
@@ -611,8 +624,11 @@ def main(argv: list | None = None) -> int:
         prov["bench_commit"] = _out(["git", "-C", str(Path(__file__).resolve().parent), "rev-parse", "HEAD"])
         versions = {h: local_version(a.local_url) if h == "local" else _out([h, "--version"]) for h in harnesses}
     out = a.out.open("a") if a.run else None
+    done = done_cells(a.out) if a.resume else set()
     for slot, s in enumerate(schedule(list(tasks), harnesses, a.repeat, seed)):
         t, h, arm, rep = tasks[s["task"]], s["harness"], s["arm"], s["rep"]
+        if (t["id"], h, arm, rep) in done:
+            continue
         name = f"{t['id']}-{h}-{arm}-{rep}"
         cwd = work / name
         clone = ["git", "clone", "--quiet", "--shared", str(repo), str(cwd)]

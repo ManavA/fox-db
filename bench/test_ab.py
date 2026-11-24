@@ -329,3 +329,15 @@ class DryRun(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class Resume(unittest.TestCase):
+    def test_done_cells_reads_rows_and_skips_a_truncated_line(self):
+        import tempfile
+        with tempfile.TemporaryDirectory() as d:
+            out = Path(d) / "r.jsonl"
+            out.write_text(json.dumps({"task": "t", "harness": "local", "foxdb": "grep", "rep": 0}) + "\n{\"task\": \"t\", \"har")
+            self.assertEqual(ab.done_cells(out), {("t", "local", "grep", 0)})
+
+    def test_missing_file_is_empty(self):
+        self.assertEqual(ab.done_cells(Path("/nonexistent/r.jsonl")), set())
