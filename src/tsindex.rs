@@ -1053,7 +1053,7 @@ fn walk_tree<'t>(root: tree_sitter::Node<'t>, src: &[u8], c_lang: bool, cpp: boo
             }
             let here = rust_ctx.last().map_or(0, |c| c.1);
             if matches!(n.kind(), "use_declaration" | "mod_item" | "token_tree")
-                || n.kind() == "identifier" && anc.last().is_some_and(|p| p.kind() == "scoped_identifier")
+                || n.kind() == "identifier" && anc.last().is_some_and(|p| matches!(p.kind(), "scoped_identifier" | "call_expression"))
             {
                 rust_at.insert(n.id(), here);
             }
@@ -1438,16 +1438,23 @@ pub fn extract(l: &Lang, src: &[u8]) -> Parsed {
             }
             let parent = walk.parents.get(&nn.id()).copied().or_else(|| nn.parent());
             let kind = ref_kind(k);
-            let recv = kind != "import" && has_receiver(nn, parent);
+            let mut recv = kind != "import" && has_receiver(nn, parent);
             let rv = if recv { receiver_name(nn, parent, src) } else { None };
             let recv_local = rv.as_ref().is_some_and(|(_, at)| walk.locals.contains(at));
             let mut via = if kind == "import" { import_source(nn, &walk.parents, src) } else { rv.map(|x| x.0) };
             // Rust: a call through a path (`db::open_ro()`) keeps the path, read from where it is.
-            let qual = rust && kind == "call" && recv && parent.is_some_and(|p| p.kind() == "scoped_identifier");
+            let mut qual = rust && kind == "call" && recv && parent.is_some_and(|p| p.kind() == "scoped_identifier");
             if qual {
                 let segs = parent.and_then(|p| p.child_by_field_name("path")).and_then(|q| rust_segments(q.utf8_text(src).ok()?));
                 let at = walk.rust_place(nn);
                 via = segs.and_then(|s| rust_qualifier(&s, &at.mods, &at.blocks, at.ty.as_deref(), &rust_scopes, 0));
+            }
+            if rust && kind == "call" && !recv {
+                if parent.is_some_and(|p| p.kind() == "macro_invocation") {
+                    via = Some(RUST_MACRO.to_string());
+                } else if let Some(v) = rust_imported(&name, walk.rust_place(nn), &rust_scopes) {
+                    (recv, qual, via) = (true, true, v);
+                }
             }
             let rtype = match (c_lang, kind, parent) {
                 (true, "call", Some(p)) if recv && p.kind() == "field_expression" => c_chain(p, &walk, src, 0),
@@ -1503,9 +1510,16 @@ pub fn extract(l: &Lang, src: &[u8]) -> Parsed {
 }
 
 /// Rust: a method of an impl inside inline modules is named with them (`a.S` for `mod a { impl S
-/// { .. } }`), like a function there (`a.f`): two same-name types of one file stay apart.
+/// { .. } }`), like a function there (`a.f`): two same-name types of one file stay apart. A
+/// function there stays a function: only an impl's or trait's is a method.
 fn rust_impl_modules(p: &mut Parsed) {
     for i in 0..p.defs.len() {
+        if p.defs[i].kind == "method"
+            && p.defs[i].container_name.is_none()
+            && p.defs[i].container.is_some_and(|c| p.defs[c].kind == "module")
+        {
+            p.defs[i].kind = "function".into();
+        }
         if let (Some(c), Some(name)) = (p.defs[i].container, p.defs[i].container_name.as_ref())
             && p.defs[c].kind == "module"
         {
@@ -1733,6 +1747,20 @@ fn rust_qualifier(segs: &[String], mods: &[String], blocks: &[usize], ty: Option
     }
 }
 
+/// Rust: the `via` of a macro invocation's reference (`write!(..)`), which reaches only macros.
+const RUST_MACRO: &str = "!";
+
+/// Rust: a bare call of a name a `use` around it brings in (`use std::fs::read; read(..)`) is a
+/// call through that path: Some(the path before the name), Some(None) when the `use` renames
+/// another item (`as`). None when no `use` names it, or for a type (`Wrapper(x)`).
+fn rust_imported(name: &str, at: &RustPlace, sc: &RustScopes) -> Option<Option<String>> {
+    if name.starts_with(|c: char| c.is_ascii_uppercase()) {
+        return None;
+    }
+    let full = rust_qualifier(&[name.to_string()], &at.mods, &at.blocks, at.ty.as_deref(), sc, 0)?;
+    (full != name).then(|| full.strip_suffix(name).and_then(|p| p.strip_suffix("::")).map(str::to_string))
+}
+
 /// Rust words that may stand before a parenthesized group in a macro's arguments without
 /// calling anything.
 const RUST_NOT_CALLS: &[&str] = &["Some", "Ok", "Err"];
@@ -1836,6 +1864,8 @@ fn rust_token_calls<'t>(
             let at = walk.rust_place(root);
             (recv, qual) = (true, true);
             via = rust_qualifier(&segs, &at.mods, &at.blocks, at.ty.as_deref(), sc, 0);
+        } else if let Some(v) = rust_imported(name, walk.rust_place(root), sc) {
+            (recv, qual, via) = (true, true, v);
         }
         refs.push(Ref {
             kind: "call",
@@ -3439,6 +3469,11 @@ fn score_name(r: &RefRow, cands: &[Cand], imp: Option<&FileImports>) -> (i64, i6
         }
         // Python and JS: a bare name (`f()`, `g(x)`) never reaches a method; that takes a receiver.
         if dynamic && !r.recv && s.kind == "method" {
+            continue;
+        }
+        // Rust: nor does one there; a macro invocation (`write!`) reaches only macros, a call
+        // never one.
+        if fam == "rust" && call && !r.recv && (s.kind == "method" || (s.kind == "macro") != (r.via.as_deref() == Some(RUST_MACRO))) {
             continue;
         }
         // Through a receiver that is not `self`/`this` nor named like the candidate's type

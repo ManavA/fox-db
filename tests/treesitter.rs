@@ -3448,3 +3448,59 @@ fn rust_deep_nesting_indexes_fast() {
     assert_eq!(p.refs.iter().filter(|r| r.name == "b").count(), 400);
     assert!(t.elapsed() < std::time::Duration::from_secs(5), "{:?}", t.elapsed());
 }
+
+fn c_sym_kind(p: &project::Project, path: &str, name: &str, kind: &str) -> String {
+    let c = db::open_ro().unwrap();
+    let id: i64 = c
+        .query_row(
+            "SELECT id FROM node WHERE project_id = ?1 AND path = ?2 AND name = ?3 AND kind = 'symbol' AND json_extract(meta,'$.k') = ?4",
+            rusqlite::params![p.id, path, name, kind],
+            |r| r.get(0),
+        )
+        .unwrap();
+    format!("c:{id:x}")
+}
+
+/// Rust: a macro invocation (`write!(..)`, `m!()`) calls a macro, never a function or method of
+/// that name.
+#[test]
+fn rust_macro_invocations_call_only_macros() {
+    let _g = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    let (_h, _r, p) = inline_project(&[(
+        "src/lib.rs",
+        "use std::io::Write;\npub struct P {\n    w: Vec<u8>,\n}\nimpl P {\n    fn write(&mut self, b: &[u8]) {\n        self.w.extend_from_slice(b);\n    }\n    fn go(&mut self) {\n        write!(self.w, \"x\").unwrap();\n    }\n}\nmacro_rules! m {\n    () => {};\n}\nfn m() {}\nfn run() {\n    m!();\n}\n",
+    )]);
+    let out = fox_code(&p, "P.write", "callers", 6000);
+    assert!(row_of(&out, "P.go").is_none(), "{out}");
+    sure(&fox_code(&p, &c_sym_kind(&p, "src/lib.rs", "m", "macro"), "callers", 6000), "run");
+    let out = fox_code(&p, &c_sym_kind(&p, "src/lib.rs", "m", "function"), "callers", 6000);
+    assert!(row_of(&out, "run").is_none(), "{out}");
+}
+
+/// Rust: a bare call (`search_path(..)` inside the method `search_path`) never reaches a method;
+/// that takes `self.` or a path.
+#[test]
+fn rust_bare_calls_never_reach_methods() {
+    let _g = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    let (_h, _r, p) = inline_project(&[(
+        "src/search.rs",
+        "pub struct W;\nimpl W {\n    fn search_path(&self, x: u8) {\n        search_path(x)\n    }\n}\nfn search_path(x: u8) {\n    let _ = x;\n}\n",
+    )]);
+    let out = fox_code(&p, "W.search_path", "callers", 6000);
+    assert!(row_of(&out, "W.search_path").is_none(), "{out}");
+    sure(&fox_code(&p, &c_sym_kind(&p, "src/search.rs", "search_path", "function"), "callers", 6000), "W.search_path");
+}
+
+/// Rust: a bare call of a name a `use` brings in from another crate (`use std::os::unix::fs::symlink`
+/// inside a helper also called `symlink`) reaches that crate's item, not the project's.
+#[test]
+fn rust_bare_calls_of_imported_names_follow_the_use() {
+    let _g = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    let (_h, _r, p) = inline_project(&[(
+        "src/walk.rs",
+        "#[cfg(test)]\nmod tests {\n    use std::path::Path;\n\n    fn symlink<P: AsRef<Path>, Q: AsRef<Path>>(src: P, dst: Q) {\n        use std::os::unix::fs::symlink;\n        symlink(src, dst).unwrap();\n    }\n\n    #[test]\n    fn links() {\n        symlink(\"a\", \"b\");\n    }\n}\n",
+    )]);
+    let out = fox_code(&p, "tests.symlink", "callers", 6000);
+    assert!(row_of(&out, "tests.symlink").is_none(), "{out}");
+    sure(&out, "tests.links");
+}
