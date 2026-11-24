@@ -97,10 +97,13 @@ pub fn resolve(c: &Connection, pid: i64, q: &str) -> Result<Vec<TSym>> {
         })
         .collect();
     // The name as typed (and its type as typed) beats a same-name symbol in another case
-    // (`render` the method, not `Render` the class); a definition beats its C prototype.
+    // (`render` the method, not `Render` the class); a definition beats its C prototype. A shell
+    // function (a test or build script's helper) yields to a same-name definition in the
+    // project's code, however often the scripts call their own.
     v.sort_by_key(|(t, n, decl, exact, score)| {
         let rank = if is_callable_kind(&t.kind) || is_type_kind(&t.kind) { 0 } else { 1 };
-        (t.name != name || !exact, std::cmp::Reverse(*score), rank, *decl, is_test(&t.path) as u8, std::cmp::Reverse(*n), t.id)
+        let script = crate::lang::for_path(&t.path).is_some_and(|l| l.family == "bash");
+        (t.name != name || !exact, std::cmp::Reverse(*score), rank, script, *decl, is_test(&t.path) as u8, std::cmp::Reverse(*n), t.id)
     });
     Ok(v.into_iter().map(|x| x.0).collect())
 }
@@ -192,26 +195,36 @@ type Sites = (usize, HashSet<String>, HashSet<account::Line>, usize, usize);
 
 /// Call or reference sites of `targets`, grouped by file: `path (n)` then `  :line Caller c:h`.
 /// A site whose target was guessed by name among several same-name definitions ends in
-/// `guess 1 of N`; one guessed among more than [`WEAK_GUESS`] is only counted. Returns (sites,
-/// their files, their lines, guessed sites, weak guesses left out).
-fn sites(c: &Connection, root: &std::path::Path, name: &str, targets: &[i64], calls_only: bool, lines: &mut Vec<String>) -> Result<Sites> {
+/// `guess 1 of N`; one guessed among more than [`WEAK_GUESS`] is only counted. A site of a
+/// target in `macros` (a C macro that stands for the first target) is labelled `via macro M`.
+/// Returns (sites, their files, their lines, guessed sites, weak guesses left out).
+fn sites(
+    c: &Connection,
+    root: &std::path::Path,
+    name: &str,
+    targets: &[i64],
+    macros: &HashMap<i64, String>,
+    calls_only: bool,
+    lines: &mut Vec<String>,
+) -> Result<Sites> {
     let ids = targets.iter().map(i64::to_string).collect::<Vec<_>>().join(",");
     let kind = if calls_only { "AND r.kind = 'call'" } else { "" };
     let sql = format!(
         "SELECT r.path, r.line, r.src, s.name, json_extract(s.meta,'$.parent'), r.amb, r.recv, r.via, json_extract(d.meta,'$.parent'),
-                d.path, r.project_id
+                d.path, r.project_id, r.dst
          FROM ts_ref r LEFT JOIN node s ON s.id = r.src LEFT JOIN node d ON d.id = r.dst
          WHERE r.dst != 0 AND r.dst IN ({ids}) {kind} ORDER BY r.path, r.line"
     );
     let mut q = c.prepare(&sql)?;
-    // path -> [(caller display, [lines], most same-name candidates)], callers in first-seen order.
-    type Who = (String, Vec<i64>, i64);
+    // path -> [(caller display, [lines], most same-name candidates, the name the lines hold)],
+    // callers in first-seen order.
+    type Who = (String, Vec<i64>, i64, String);
     let mut by: BTreeMap<String, Vec<Who>> = BTreeMap::new();
     let mut seen = HashSet::new();
     let (mut n, mut guessed, mut weak) = (0, 0, 0);
     let mut at: HashSet<(String, i64)> = HashSet::new();
     let mut imports = FileImportNames::default();
-    for (path, line, src, sname, sparent, amb, recv, via, dparent, dpath, pid) in q
+    for (path, line, src, sname, sparent, amb, recv, via, dparent, dpath, pid, dst) in q
         .query_map([], |r| {
             Ok((
                 r.get::<_, String>(0)?,
@@ -225,6 +238,7 @@ fn sites(c: &Connection, root: &std::path::Path, name: &str, targets: &[i64], ca
                 r.get::<_, Option<String>>(8)?,
                 r.get::<_, Option<String>>(9)?,
                 r.get::<_, i64>(10)?,
+                r.get::<_, i64>(11)?,
             ))
         })?
         .flatten()
@@ -239,18 +253,25 @@ fn sites(c: &Connection, root: &std::path::Path, name: &str, targets: &[i64], ca
             continue;
         }
         at.insert((path.clone(), line));
-        let who = match (sname, sparent) {
+        let mut who = match (sname, sparent) {
             (Some(nm), Some(p)) if !p.is_empty() => format!("{p}.{nm} c:{src:x}"),
             (Some(nm), _) => format!("{nm} c:{src:x}"),
             _ => "(top)".into(),
         };
+        let named = match macros.get(&dst) {
+            Some(m) => {
+                who = format!("{who} via macro {m}");
+                m.clone()
+            }
+            None => name.to_string(),
+        };
         let e = by.entry(path).or_default();
         match e.iter_mut().find(|(w, ..)| *w == who) {
-            Some((_, ls, a)) => {
+            Some((_, ls, a, _)) => {
                 ls.push(line);
                 *a = (*a).max(amb);
             }
-            None => e.push((who, vec![line], amb)),
+            None => e.push((who, vec![line], amb, named)),
         }
         n += 1;
         if amb > 0 {
@@ -263,13 +284,13 @@ fn sites(c: &Connection, root: &std::path::Path, name: &str, targets: &[i64], ca
         by.into_iter().map(|(path, v)| {
             let count: usize = v.iter().map(|x| x.1.len()).sum();
             let mut rows = vec![];
-            for (who, ls, amb) in v {
+            for (who, ls, amb, named) in v {
                 let head = format!("  :{} {who}{}", ls.iter().map(i64::to_string).collect::<Vec<_>>().join(","), guess_note(amb));
                 match ls.as_slice() {
-                    [one] => rows.push(src.with_code(head, &path, *one, name)),
+                    [one] => rows.push(src.with_code(head, &path, *one, &named)),
                     _ => {
                         rows.push(head);
-                        rows.extend(ls.iter().filter_map(|l| src.line(&path, *l, name).map(|code| format!("   :{l} | {code}"))));
+                        rows.extend(ls.iter().filter_map(|l| src.line(&path, *l, &named).map(|code| format!("   :{l} | {code}"))));
                     }
                 }
             }
@@ -608,6 +629,19 @@ pub(crate) fn body_paths(c: &Connection, pid: i64, name: &str) -> Result<Vec<Str
     Ok(f.query_map(params![format!("body:\"{word}\""), pid], |r| r.get::<_, String>(0))?.flatten().collect())
 }
 
+/// C: the function-like macros whose body is one call of `top` (`#define abbrev_branch(n)
+/// abbrev_ref(n, "refs/heads/")`), by id: a call of one runs `top`.
+fn alias_macros(c: &Connection, top: &TSym) -> Result<HashMap<i64, String>> {
+    if crate::lang::for_path(&top.path).is_none_or(|l| l.family != "c") {
+        return Ok(HashMap::new());
+    }
+    let mut q = c.prepare_cached(
+        "SELECT m.id, m.name FROM ts_ref r JOIN node m ON m.id = r.src
+         WHERE r.dst = ?1 AND r.dst != 0 AND r.kind = 'call' AND r.amb = 0 AND json_extract(m.meta,'$.k') = 'macro' AND m.lang = 'c'",
+    )?;
+    Ok(q.query_map([top.id], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?)))?.flatten().filter(|(id, _)| *id != top.id).collect())
+}
+
 /// ` guess 1 of N` after a site resolved by name among N same-name definitions; ` guess by
 /// name` when the only candidate was taken on its name alone (a call through a receiver).
 fn guess_note(amb: i64) -> String {
@@ -713,7 +747,10 @@ pub fn run(c: &Connection, p: &Project, sym: &str, rel: &str, depth: usize, curs
             let calls = rel == "callers" && is_callable_kind(&top.kind);
             lines.push(format!("{rel} of {}", top.row()));
             let at = lines.len();
-            let (n, files, at_lines, guessed, weak) = sites(c, &p.root, &top.name, &[top.id], calls, &mut lines)?;
+            // C: calls through a macro whose body is one call of the target count as its calls.
+            let macros = if calls { alias_macros(c, top)? } else { HashMap::new() };
+            let targets: Vec<i64> = std::iter::once(top.id).chain(macros.keys().copied()).collect();
+            let (n, files, at_lines, guessed, weak) = sites(c, &p.root, &top.name, &targets, &macros, calls, &mut lines)?;
             let g = if guessed > 0 { format!(", {guessed} guessed by name") } else { String::new() } + &weak_note(weak);
             lines.insert(at, format!("{n} {} in {} files{g}", if calls { "call sites" } else { "refs" }, files.len()));
             if weak > 0 {

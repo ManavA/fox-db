@@ -303,3 +303,64 @@ fn python_descendant_names_follow_base_changes() {
     // n14.
     check(&[("a.py", a_nested), ("c.py", c_plain), ("d.py", d)], &[("C gains A", &[("c.py", Some(c_sub))])]);
 }
+
+/// C: a macro standing for a function, and calls through it, follow edits of either.
+#[test]
+fn c_alias_macro_edits_match_a_full_index() {
+    let _g = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    check(
+        &[
+            ("r.h", "int abbrev_ref(const char *n, int k);\n#define abbrev_branch(n) abbrev_ref((n), 1)\n"),
+            ("r.c", "#include \"r.h\"\nint abbrev_ref(const char *n, int k) { return k; }\n"),
+            ("s.c", "#include \"r.h\"\nint show(const char *n) { return abbrev_branch(n); }\n"),
+        ],
+        &[
+            (
+                "retarget the macro",
+                &[("r.h", Some("int abbrev_ref(const char *n, int k);\n#define abbrev_branch(n) (abbrev_ref((n), 2) + 1)\n"))],
+            ),
+            ("restore it", &[("r.h", Some("int abbrev_ref(const char *n, int k);\n#define abbrev_branch(n) abbrev_ref((n), 1)\n"))]),
+            (
+                "move the function",
+                &[("r.c", None), ("r2.c", Some("#include \"r.h\"\nint abbrev_ref(const char *n, int k) { return k; }\n"))],
+            ),
+            (
+                "a file-local macro of the name",
+                &[(
+                    "s.c",
+                    Some("#include \"r.h\"\n#define abbrev_branch(n) other(n)\nint show(const char *n) { return abbrev_branch(n); }\n"),
+                )],
+            ),
+        ],
+    );
+}
+
+/// Rust: calls through module paths, `Self`, `self` and macro arguments follow edits of the
+/// modules they name.
+#[test]
+fn rust_edits_match_a_full_index() {
+    let _g = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    let main = "mod db;\nmod util;\nfn main() {\n    db::open();\n    crate::util::help();\n    assert!(util::help());\n}\n";
+    check(
+        &[
+            ("src/main.rs", main),
+            (
+                "src/db.rs",
+                "pub fn open() {}\npub struct S;\nimpl S {\n    fn a(&self) {\n        self.b();\n        Self::c();\n    }\n    fn b(&self) {}\n    fn c() {}\n}\n",
+            ),
+            ("src/util.rs", "pub fn help() -> bool {\n    super::db::open();\n    true\n}\n"),
+        ],
+        &[
+            ("a second open elsewhere", &[("src/other.rs", Some("pub fn open() {}\npub fn help() -> bool {\n    false\n}\n"))]),
+            (
+                "move open",
+                &[(
+                    "src/db.rs",
+                    Some("pub struct S;\nimpl S {\n    fn a(&self) {\n        self.b();\n        Self::c();\n    }\n    fn c() {}\n}\n"),
+                )],
+            ),
+            ("b on another type", &[("src/other.rs", Some("pub fn open() {}\npub struct T;\nimpl T {\n    fn b(&self) {}\n}\n"))]),
+            ("rename the module", &[("src/util.rs", None), ("src/helpers.rs", Some("pub fn help() -> bool {\n    true\n}\n"))]),
+        ],
+    );
+}

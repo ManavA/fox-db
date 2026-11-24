@@ -99,8 +99,8 @@ fn python_lines_are_accounted_for_by_group() {
 }
 
 /// C header prototypes and `extern` declarations are their own group; a line that may use the
-/// function (a function pointer initializer) is unresolved, listed, and makes the answer
-/// read as incomplete.
+/// function (a macro body that is more than one call) is unresolved, listed, and makes the
+/// answer read as incomplete.
 #[test]
 fn c_prototypes_are_declarations_and_unknown_uses_are_listed() {
     let _g = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
@@ -109,7 +109,7 @@ fn c_prototypes_are_declarations_and_unknown_uses_are_listed() {
         ("src/plan.c", "#include \"plan.h\"\nint plan_query(int q) { return q; }\nint run(void) { return plan_query(1); }\n"),
         (
             "src/other.c",
-            "/* plan_query is defined in plan.c */\nint use(void) { return plan_query(2); }\nstatic int (*fp)(int) = plan_query;\n",
+            "/* plan_query is defined in plan.c */\nint use(void) { return plan_query(2); }\n#define PQ(x) (plan_query(x) + 1)\n",
         ),
     ]);
     let out = fox_code(&p, "plan_query", "callers", 2000);
@@ -118,7 +118,7 @@ fn c_prototypes_are_declarations_and_unknown_uses_are_listed() {
         "7 lines name `plan_query`: 2 calls, 1 definition, 2 declarations/prototypes, 1 comment, 1 unresolved; may be incomplete: 1 unresolved line may use it",
         "{out}"
     );
-    assert!(out.contains("unresolved mentions:\n  src/other.c:3 | static int (*fp)(int) = plan_query;"), "{out}");
+    assert!(out.contains("unresolved mentions:\n  src/other.c:3 | #define PQ(x) (plan_query(x) + 1)"), "{out}");
     assert!(out.contains("declarations and prototypes:\n  include/plan.h:2 function plan_query c:"), "{out}");
     assert!(out.contains("include/plan.h:3 "), "{out}");
     // Without that line, every line is accounted for.
@@ -256,16 +256,13 @@ fn ends_complete(out: &str) -> bool {
 }
 
 /// A line naming the target inside another same-name definition with no reference row (a Rust
-/// macro argument) is unresolved, not part of that definition.
+/// function named as a value) is unresolved, not part of that definition.
 #[test]
 fn lines_without_a_reference_inside_same_name_definitions_are_unresolved() {
     let _g = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
     let (_h, _r, p) = inline_project(&[
         ("Cargo.toml", "[package]\nname=\"rs4\"\nversion=\"0.1.0\"\n"),
-        (
-            "src/main.rs",
-            "mod inner;\n\nfn plan() -> i32 {\n    println!(\"{}\", inner::plan());\n    2\n}\n\nfn main() {\n    let _ = plan();\n}\n",
-        ),
+        ("src/main.rs", "mod inner;\n\nfn plan() -> i32 {\n    let _f = inner::plan;\n    2\n}\n\nfn main() {\n    let _ = plan();\n}\n"),
         ("src/inner.rs", "pub fn plan() -> i32 {\n    1\n}\n"),
     ]);
     let out = fox_code(&p, "inner.plan", "callers", 2000);
@@ -285,7 +282,7 @@ fn multi_line_strings_do_not_open_comments() {
         ),
     ]);
     let out = fox_code(&p, "plan", "callers", 2000);
-    assert!(!out.contains("comment") && out.contains("src/main.rs:9 "), "{out}");
+    assert!(!out.contains("comment") && out.contains("  :9 main c:"), "{out}");
     let (_h, _r, p) = inline_project(&[
         (
             "Outer.kt",

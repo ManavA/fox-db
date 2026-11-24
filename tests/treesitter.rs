@@ -458,14 +458,17 @@ fn non_call_mentions_do_not_read_as_incomplete() {
     let (_h, _r, p) = inline_project(&[
         ("src/plan.c", "int plan_query(int q) { return q; }\nint run(void) { return plan_query(1); }\n"),
         ("include/proto.h", "#include \"plan_query.h\"\n"),
-        ("mm/b.c", "#define USE_B() plan_query(2)\n"),
+        ("mm/b.c", "#define USE_B() (plan_query(2) + 1)\n"),
     ]);
     let out = fox_code(&p, "plan_query", "callers", 800);
     assert!(
         out.starts_with("4 lines name `plan_query`: 1 call, 1 definition, 1 in strings (may be dynamic uses), 1 unresolved; may be incomplete: 1 unresolved line may use it\n"),
         "{out}"
     );
-    assert!(out.contains("unresolved mentions:\n  mm/b.c:1 | #define USE_B() plan_query(2)") && !out.contains("include/proto.h"), "{out}");
+    assert!(
+        out.contains("unresolved mentions:\n  mm/b.c:1 | #define USE_B() (plan_query(2) + 1)") && !out.contains("include/proto.h"),
+        "{out}"
+    );
 }
 
 /// A first-level impact row shows the line that uses the target, not only the dependent's
@@ -529,25 +532,17 @@ fn completeness_counts_one_word_names_and_uses_outside_symbols() {
         ("lib/fs.c", "int simple_open(void) { return 0; }\n"),
         ("drivers/x.c", "#define FOPS(n) static const struct fops n = { .open = simple_open }\n"),
     ]);
-    // The argument in src/arg.c and the member assignment in src/field.c are resolved references:
-    // listed by `refs` and `impact`, still unknown to `callers` (what is called through them is
-    // not followed).
+    // The argument in src/arg.c, the member assignment in src/field.c and the initializer in
+    // src/fp.c are resolved references: listed by `refs` and `impact`, still unknown to `callers`
+    // (what is called through them is not followed). The macro whose body is one call calls it.
     for (rel, head) in [
-        (
-            "callers",
-            "6 lines name `helper`: 1 call, 1 definition, 2 references, not calls, 2 unresolved; may be incomplete: 2 unresolved lines",
-        ),
-        ("refs", "6 lines name `helper`: 3 refs, 1 definition, 2 unresolved; may be incomplete: 2 unresolved lines"),
-        ("impact", "6 lines name `helper`: 3 uses (d1), 1 definition, 2 unresolved; partial at d1: 2 unresolved lines"),
+        ("callers", "6 lines name `helper`: 2 calls, 1 definition, 3 references, not calls; may be incomplete: 3 lines pass it as a value"),
+        ("refs", "6 lines name `helper`: 5 refs, 1 definition; all accounted for"),
+        ("impact", "6 lines name `helper`: 5 uses (d1), 1 definition; all accounted for"),
     ] {
         let out = fox_code(&p, "helper", rel, 800);
         assert!(out.starts_with(head), "{rel}: {out}");
-        assert!(
-            out.contains(
-                "unresolved mentions:\n  src/fp.c:1 | static int (*fp)(int) = helper;\n  src/macro.c:1 | #define CALL(x) helper(x)\n"
-            ),
-            "{rel}: {out}"
-        );
+        assert!(!out.contains("unresolved mentions"), "{rel}: {out}");
     }
     let out = fox_code(&p, "simple_open", "refs", 800);
     assert!(out.starts_with("2 lines name `simple_open`: 0 refs, 1 definition, 1 unresolved; may be incomplete"), "{out}");
@@ -3154,4 +3149,302 @@ fn cpp_global_only_partial_qualifier_is_a_guess_when_shadowable() {
             "{name}: {out}"
         );
     }
+}
+
+fn extract_text(path: &str, src: &str) -> Parsed {
+    tsindex::extract(lang::for_path(path).unwrap(), src.as_bytes())
+}
+
+/// C: a function returning a pointer to a pointer, or a function pointer, is a definition (and
+/// a prototype one), so the calls in its body belong to it; a pointer variable is none.
+#[test]
+fn c_functions_behind_nested_declarators_are_definitions() {
+    let p = extract_text(
+        "x.c",
+        "struct node **append(struct node **tail, int v)\n{\n\treturn link(tail, v);\n}\nint ***deep(void) { return grow(); }\nvoid (*pick(int k))(int)\n{\n\treturn choose(k);\n}\nstatic char *(*maker(void))(int) { return build(); }\nint **proto(int);\nvoid (*sig(int, void (*)(int)))(int);\nint (*fp)(int);\nint **pp;\n",
+    );
+    let cs = calls(&p);
+    for (a, b) in [("append", "link"), ("deep", "grow"), ("pick", "choose"), ("maker", "build")] {
+        assert!(cs.iter().any(|(x, y)| x == a && y == b), "{a} -> {b}: {cs:?}");
+    }
+    let q = qnames(&p);
+    for d in ["proto", "sig"] {
+        assert!(q.iter().any(|x| x == d), "{d}: {q:?}");
+    }
+    for d in ["fp", "pp", "tail"] {
+        assert!(!q.iter().any(|x| x == d), "{d}: {q:?}");
+    }
+    assert!(p.defs.iter().find(|d| d.name == "maker").is_some_and(|d| d.stat), "{:?}", p.defs);
+}
+
+/// A name defined both in C and in a shell script (a test helper of the same name) leads with
+/// the C definition, though the script calls its own more often; C calls never reach the script's.
+#[test]
+fn a_shell_function_does_not_take_the_name_from_a_c_function() {
+    let _g = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    let (_h, _r, p) = inline_project(&[
+        ("path.c", "const char *relative_path(const char *in)\n{\n\treturn in;\n}\n"),
+        ("quote.c", "const char *relative_path(const char *in);\nint show(const char *s)\n{\n\treturn relative_path(s) != 0;\n}\n"),
+        ("t/t0060-path.sh", "relative_path() {\n\techo \"$1\"\n}\nrelative_path a\nrelative_path b\nrelative_path c\n"),
+    ]);
+    let out = fox_code(&p, "relative_path", "callers", 6000);
+    assert!(out.lines().any(|l| l.starts_with("callers of ") && l.ends_with("path.c:1")), "{out}");
+    assert!(rows(&out).contains("show c:") && !rows(&out).contains("(top)"), "{out}");
+}
+
+/// Go: a function in a positional composite literal (`{"loop", loopIndexByteTwo}`) is a stored
+/// reference, and methods of a generic type (`func (s *Set[T]) Add`) are its methods.
+#[test]
+fn go_positional_literals_and_generic_receivers() {
+    let _g = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    let src = "package algo\n\nfunc loopIndexByteTwo(b []byte) int { return 0 }\n\nvar impls = []struct {\n\tname string\n\tfn   func([]byte) int\n}{\n\t{\"loop\", loopIndexByteTwo},\n}\n\ntype ConcurrentSet[T comparable] struct{ m map[T]bool }\n\nfunc (s *ConcurrentSet[T]) Add(v T) { s.m[v] = true }\n\nfunc (s ConcurrentSet[T]) Has(v T) bool { return s.m[v] }\n\nfunc use1(n int) {\n\ts := &ConcurrentSet[int]{}\n\ts.Add(1)\n\t_ = []any{n}\n}\n";
+    let q = qnames(&extract_text("algo/a.go", src));
+    for d in ["ConcurrentSet.Add", "ConcurrentSet.Has"] {
+        assert!(q.iter().any(|x| x == d), "{d}: {q:?}");
+    }
+    let (_h, _r, p) = inline_project(&[("algo/a.go", src)]);
+    let out = fox_code(&p, "loopIndexByteTwo", "refs", 6000);
+    assert!(rows(&out).contains(":9 (top)"), "{out}");
+    let out = fox_code(&p, "ConcurrentSet.Add", "callers", 6000);
+    assert!(rows(&out).contains(":20 use1"), "{out}");
+}
+
+/// C: a function stored in a local by its initializer (`fn_t *p = expire;`) or an assignment
+/// (`q = expire;`) is a reference; a parameter so stored is none.
+#[test]
+fn c_functions_stored_in_locals_are_references() {
+    let _g = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    let (_h, _r, p) = inline_project(&[(
+        "refs.c",
+        "typedef int fn_t(int);\nstatic int expire(int x) { return x; }\nint run(int y)\n{\n\tfn_t *p = expire;\n\tfn_t *q;\n\tq = expire;\n\tint z = y;\n\treturn p(z) + q(1);\n}\n",
+    )]);
+    let out = fox_code(&p, "expire", "refs", 6000);
+    assert!(rows(&out).contains(":5,7 run"), "{out}");
+    let c = db::open_ro().unwrap();
+    let n: i64 = c.query_row("SELECT COUNT(*) FROM ts_ref WHERE name = 'y'", [], |r| r.get(0)).unwrap();
+    assert_eq!(n, 0);
+}
+
+/// C: a call through a function-like macro whose body is one call (`#define abbrev_branch(n)
+/// abbrev_ref(n, "refs/heads/")`) is listed among the callers of that call's target, labelled
+/// as through the macro; a macro with another body is not.
+#[test]
+fn c_calls_through_an_alias_macro_reach_its_target() {
+    let _g = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    let (_h, _r, p) = inline_project(&[
+        (
+            "remote.h",
+            "const char *abbrev_ref(const char *name, const char *prefix);\n#define abbrev_branch(name) abbrev_ref((name), \"refs/heads/\")\n#define twice(x) (abbrev_ref(x, 0), abbrev_ref(x, 0))\n",
+        ),
+        ("remote.c", "#include \"remote.h\"\nconst char *abbrev_ref(const char *name, const char *prefix)\n{\n\treturn name;\n}\n"),
+        ("show.c", "#include \"remote.h\"\nstatic void show(const char *n)\n{\n\tabbrev_branch(n);\n\ttwice(n);\n\tabbrev_ref(n, 0);\n}\n"),
+    ]);
+    let out = fox_code(&p, "abbrev_ref", "callers", 6000);
+    let r = rows(&out);
+    assert!(r.lines().any(|l| l.contains(":4 show c:") && l.contains("via macro abbrev_branch") && !l.contains("guess")), "{out}");
+    assert!(r.lines().any(|l| l.contains(":6 show c:") && !l.contains("via macro")), "{out}");
+    assert!(!r.contains(":5 "), "{out}");
+    let out = fox_code(&p, "abbrev_branch", "callers", 6000);
+    assert!(rows(&out).contains(":4 show c:"), "{out}");
+}
+
+/// `func`'s call is credited to the target with certainty.
+fn sure(out: &str, func: &str) {
+    assert!(row_of(out, func).is_some_and(|r| !r.contains("guess")), "{func} must be certain: {out}");
+}
+
+const RUST_MODS: &[(&str, &str)] = &[
+    ("Cargo.toml", "[package]\nname = \"x\"\n"),
+    (
+        "src/main.rs",
+        "mod db;\nmod util;\nfn main() {\n    db::open_ro();\n    crate::util::helper();\n    self::local();\n    std::fs::read(\"x\");\n}\nfn local() {}\n",
+    ),
+    (
+        "src/db.rs",
+        "pub fn open_ro() {}\npub fn open_rw() {\n    super::local();\n}\npub struct Store;\nimpl Store {\n    pub fn new() -> Store {\n        Self::make()\n    }\n    fn make() -> Store {\n        Store\n    }\n}\n",
+    ),
+    ("src/util/mod.rs", "pub mod deep;\npub fn helper() {}\n"),
+    (
+        "src/util/deep.rs",
+        "use crate::db;\nuse crate::db::Store;\npub fn go() {\n    db::open_ro();\n    super::helper();\n    super::super::local();\n    Store::new();\n}\n#[cfg(test)]\nmod tests {\n    #[test]\n    fn t() {\n        super::go();\n    }\n}\n",
+    ),
+    (
+        "src/other.rs",
+        "pub fn open_ro() {}\npub fn helper() {}\npub fn go() {}\npub fn local() {}\npub fn new() {}\npub fn make() {}\npub fn read() {}\n",
+    ),
+];
+
+/// Rust: a path-qualified call (`db::open_ro()`, `crate::util::helper()`, `super::f()`,
+/// `self::f()`, `Self::make()`, `Store::new()`) reaches the item its module path names, with
+/// certainty when the path pins it; a path into the standard library reaches nothing.
+#[test]
+fn rust_path_qualified_calls_follow_the_module_tree() {
+    let _g = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    let (_h, _r, p) = inline_project(RUST_MODS);
+    let callers = |path: &str, name: &str| fox_code(&p, &c_sym(&p, path, name), "callers", 6000);
+    let out = callers("src/db.rs", "open_ro");
+    sure(&out, "main");
+    sure(&out, "go");
+    let out = callers("src/util/mod.rs", "helper");
+    sure(&out, "main");
+    sure(&out, "go");
+    let out = callers("src/main.rs", "local");
+    sure(&out, "main");
+    sure(&out, "open_rw");
+    sure(&out, "go");
+    sure(&callers("src/util/deep.rs", "go"), "tests.t");
+    sure(&callers("src/db.rs", "new"), "go");
+    sure(&callers("src/db.rs", "make"), "Store.new");
+    for name in ["open_ro", "helper", "go", "local", "new", "make", "read"] {
+        let out = callers("src/other.rs", name);
+        assert!(rows(&out).is_empty(), "{name}: {out}");
+    }
+}
+
+/// Rust: a method call through a receiver of unknown type (`ft.is_symlink()` on a library type,
+/// `self.seq.literals()`, `w.is_symlink()`) is never certain; `self.f()` in an impl of the
+/// method's own type is.
+#[test]
+fn rust_receiver_calls_of_unknown_type_are_guesses() {
+    let _g = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    let (_h, _r, p) = inline_project(&[
+        (
+            "src/walk.rs",
+            "pub struct Work { dent: Dent }\nimpl Work {\n    pub fn is_symlink(&self) -> bool {\n        self.dent.file_type().map_or(false, |ft| ft.is_symlink())\n    }\n    pub fn check(&self) -> bool {\n        self.is_symlink()\n    }\n}\npub fn other(w: &Work) -> bool {\n    w.is_symlink()\n}\n",
+        ),
+        (
+            "src/lit.rs",
+            "pub struct TSeq;\nimpl TSeq {\n    pub fn literals(&self) -> Option<u8> {\n        None\n    }\n}\npub struct Inner {\n    seq: Seq,\n}\nimpl Inner {\n    pub fn one(&self) {\n        let _ = self.seq.literals();\n    }\n}\n",
+        ),
+        (
+            "src/two.rs",
+            "struct A;\nimpl A {\n    fn run(&self) {\n        self.go()\n    }\n    fn go(&self) {}\n}\nstruct B;\nimpl B {\n    fn go(&self) {}\n}\n",
+        ),
+    ]);
+    let out = fox_code(&p, "Work.is_symlink", "callers", 6000);
+    not_certain(&out, "Work.is_symlink");
+    not_certain(&out, "other");
+    sure(&out, "Work.check");
+    not_certain(&fox_code(&p, "TSeq.literals", "callers", 6000), "Inner.one");
+    sure(&fox_code(&p, "A.go", "callers", 6000), "A.run");
+    not_certain(&fox_code(&p, "B.go", "callers", 6000), "A.run");
+}
+
+/// Rust: calls inside macro arguments (`debug_assert!(self.multi_line())`, `assert_eq!(f(1), 1)`)
+/// are calls; a `macro_rules!` body is no caller.
+#[test]
+fn rust_calls_inside_macro_arguments_are_calls() {
+    let _g = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    let (_h, _r, p) = inline_project(&[(
+        "src/p.rs",
+        "pub struct P;\nimpl P {\n    fn multi_line(&self) -> bool {\n        true\n    }\n    fn sink(&self) {\n        debug_assert!(self.multi_line());\n        assert_eq!(helper(1), 1, \"{}\", self.multi_line());\n        let v = vec![crate::p::helper(2)];\n    }\n}\nfn helper(x: u8) -> u8 {\n    x\n}\nmacro_rules! m {\n    ($e:expr) => {\n        helper($e)\n    };\n}\n",
+    )]);
+    let out = fox_code(&p, "P.multi_line", "callers", 6000);
+    assert!(rows(&out).contains(":7,8 P.sink") && !rows(&out).contains("guess"), "{out}");
+    let out = fox_code(&p, "helper", "callers", 6000);
+    assert!(rows(&out).contains(":8,9 P.sink") && !rows(&out).contains(":17"), "{out}");
+}
+
+/// C: a macro calling one of its own parameters (`#define APPLY(fn, x) fn(x)`) stands for no
+/// function, even when a function has the parameter's name.
+#[test]
+fn c_macros_calling_their_parameters_call_nothing() {
+    let _g = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    let (_h, _r, p) = inline_project(&[(
+        "m.c",
+        "#define APPLY(fn, x) fn(x)\nint fn(int x) { return x; }\nint sq(int x) { return x * x; }\nint main(void) { return APPLY(sq, 2); }\n",
+    )]);
+    let out = fox_code(&p, "fn", "callers", 6000);
+    assert!(rows(&out).is_empty(), "{out}");
+}
+
+/// Rust: `self.f()` reaches the method of the caller's impl type in its own file; a same-name
+/// type of another file (`map.rs` and `set.rs` each with an `Iter`) is never certain.
+#[test]
+fn rust_self_calls_do_not_merge_same_name_types_of_other_files() {
+    let _g = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    let (_h, _r, p) = inline_project(&[
+        ("src/map.rs", "pub struct Iter;\nimpl Iter {\n    pub fn size_hint(&self) -> usize {\n        0\n    }\n}\n"),
+        ("src/set.rs", "pub struct Iter;\nimpl Iter {\n    pub fn len(&self) -> usize {\n        self.size_hint()\n    }\n}\n"),
+    ]);
+    let out = fox_code(&p, "size_hint", "callers", 6000);
+    not_certain(&out, "Iter.len");
+    assert!(!out.contains("all accounted for"), "{out}");
+}
+
+fn c_sym_parent(p: &project::Project, name: &str, parent: &str) -> String {
+    let c = db::open_ro().unwrap();
+    let id: i64 = c
+        .query_row(
+            "SELECT id FROM node WHERE project_id = ?1 AND name = ?2 AND kind = 'symbol' AND json_extract(meta,'$.parent') = ?3",
+            rusqlite::params![p.id, name, parent],
+            |r| r.get(0),
+        )
+        .unwrap();
+    format!("c:{id:x}")
+}
+
+/// Rust: a path through an inline module (`b::S::make()`) names that module's type, not a
+/// same-name type of another inline module of the file.
+#[test]
+fn rust_paths_through_inline_modules_keep_the_module() {
+    let _g = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    let (_h, _r, p) = inline_project(&[(
+        "src/lib.rs",
+        "mod a {\n    pub struct S;\n    impl S {\n        pub fn make() -> S {\n            S\n        }\n    }\n}\nmod b {\n    pub struct S;\n    impl S {\n        pub fn make() -> S {\n            S\n        }\n    }\n}\nfn go() {\n    b::S::make();\n}\n",
+    )]);
+    let out = fox_code(&p, &c_sym_parent(&p, "make", "b.S"), "callers", 6000);
+    sure(&out, "go");
+    let out = fox_code(&p, &c_sym_parent(&p, "make", "a.S"), "callers", 6000);
+    assert!(rows(&out).is_empty(), "{out}");
+}
+
+/// Rust: a `use` inside a function body is visible only in that block: a call elsewhere in the
+/// module reads the path as written.
+#[test]
+fn rust_uses_in_function_bodies_stay_in_their_block() {
+    let _g = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    let (_h, _r, p) = inline_project(&[
+        (
+            "src/main.rs",
+            "mod db;\nmod other;\nfn one() {\n    use crate::db as store;\n    store::open();\n}\nfn two() {\n    store::open();\n}\nfn main() {}\n",
+        ),
+        ("src/db.rs", "pub fn open() {}\n"),
+        ("src/other.rs", "pub mod store {\n    pub fn open() {}\n}\n"),
+    ]);
+    let out = fox_code(&p, &c_sym(&p, "src/db.rs", "open"), "callers", 6000);
+    sure(&out, "one");
+    assert!(row_of(&out, "two").is_none(), "{out}");
+}
+
+/// Rust macro tokens: `fn name(..)` declares what the macro generates, and a closure parameter
+/// called there (`|check| check(1)`) calls no definition.
+#[test]
+fn rust_macro_tokens_skip_declared_functions_and_closure_parameters() {
+    let _g = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    let (_h, _r, p) = inline_project(&[(
+        "src/lib.rs",
+        "macro_rules! make {\n    ($($t:tt)*) => { $($t)* };\n}\nfn generated(x: u8) -> u8 {\n    x\n}\nfn check(x: u8) -> bool {\n    x > 0\n}\nmake! {\n    fn generated(x: u8) -> u8 { x }\n}\nfn run() {\n    assert!([1u8].iter().all(|check| check(1) > 0));\n}\n",
+    )]);
+    for name in ["generated", "check"] {
+        let out = fox_code(&p, &c_sym(&p, "src/lib.rs", name), "callers", 6000);
+        assert!(rows(&out).is_empty(), "{name}: {out}");
+    }
+}
+
+/// Rust: deeply nested blocks index in linear time.
+#[test]
+fn rust_deep_nesting_indexes_fast() {
+    let mut src = String::from("fn f() {\n");
+    for _ in 0..400 {
+        src.push_str("{ a::b(); ");
+    }
+    for _ in 0..400 {
+        src.push('}');
+    }
+    src.push_str("\n}\n");
+    let t = std::time::Instant::now();
+    let p = extract_text("src/x.rs", &src);
+    assert_eq!(p.refs.iter().filter(|r| r.name == "b").count(), 400);
+    assert!(t.elapsed() < std::time::Duration::from_secs(5), "{:?}", t.elapsed());
 }
