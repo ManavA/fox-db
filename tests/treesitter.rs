@@ -3593,7 +3593,8 @@ fn rust_bare_calls_follow_renaming_uses() {
 }
 
 /// Rust: a name a block declares (`fn open() {}` in a body), a `let` binding or a parameter
-/// shadows the one a `use` brings in: calling it is no certain call of the imported function.
+/// shadows the one a `use` brings in: calling it is no certain call of the imported function. A
+/// `let` binding is visible only after its statement (`let open = open();` calls the function).
 #[test]
 fn rust_block_names_shadow_uses() {
     let _g = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
@@ -3601,7 +3602,7 @@ fn rust_block_names_shadow_uses() {
         ("Cargo.toml", "[package]\nname = \"x\"\n"),
         (
             "src/main.rs",
-            "mod db;\nuse crate::db::open;\nfn a() {\n    let open = || 1;\n    open();\n}\nfn b(open: impl Fn()) {\n    open();\n}\nfn c() {\n    fn open() {}\n    open();\n}\nfn d() {\n    open();\n}\nfn main() {\n    a();\n    b(|| {});\n    c();\n    d();\n}\n",
+            "mod db;\nuse crate::db::open;\nfn a() {\n    let open = || 1;\n    open();\n}\nfn b(open: impl Fn()) {\n    open();\n}\nfn c() {\n    fn open() {}\n    open();\n}\nfn d() {\n    open();\n}\nfn e() {\n    let open = open();\n    let _ = open;\n}\nfn main() {\n    a();\n    b(|| {});\n    c();\n    d();\n}\n",
         ),
         ("src/db.rs", "pub fn open() {}\n"),
     ]);
@@ -3610,4 +3611,5 @@ fn rust_block_names_shadow_uses() {
         not_certain(&out, f);
     }
     sure(&out, "d");
+    sure(&out, "e");
 }

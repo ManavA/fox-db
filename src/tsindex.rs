@@ -1014,6 +1014,9 @@ fn walk_tree<'t>(root: tree_sitter::Node<'t>, src: &[u8], c_lang: bool, cpp: boo
     let mut scopes: Vec<(usize, HashSet<String>)> = vec![(0, HashSet::new())];
     // C: per scope, the declared type of each name that has a struct or typedef type.
     let mut types: Vec<HashMap<String, String>> = vec![HashMap::new()];
+    // Rust: per scope, where a name only `let` declares becomes visible (the end of its first
+    // `let`): `let builder = builder(&root);` still calls the function.
+    let mut let_from: Vec<HashMap<String, usize>> = vec![HashMap::new()];
     // Open scopes: (depth of the scope node, scope index).
     let mut open: Vec<(usize, usize)> = vec![];
     // C++: open classes and out-of-line methods: (depth of the node, class name).
@@ -1107,6 +1110,7 @@ fn walk_tree<'t>(root: tree_sitter::Node<'t>, src: &[u8], c_lang: bool, cpp: boo
             let parent = open.last().map_or(0, |o| o.1);
             scopes.push((parent, HashSet::new()));
             types.push(HashMap::new());
+            let_from.push(HashMap::new());
             open.push((anc.len(), scopes.len() - 1));
         }
         let scope = open.last().map_or(0, |o| o.1);
@@ -1119,7 +1123,22 @@ fn walk_tree<'t>(root: tree_sitter::Node<'t>, src: &[u8], c_lang: bool, cpp: boo
                 || !anc.iter().any(|a| PARAM_LISTS.contains(&a.kind()))
                     && !anc.last().is_some_and(|p| p.kind() == "assignment" && anc.iter().any(|a| a.kind() == "module"));
             if file_ok && !(cfam && c_foreign_param(&anc)) && declares(n, &anc, src) {
-                scopes[scope].1.insert(name.to_string());
+                let fresh = scopes[scope].1.insert(name.to_string());
+                if rust {
+                    match anc.iter().rev().find(|a| a.kind() == "let_declaration") {
+                        Some(d) if fresh => {
+                            let_from[scope].insert(name.to_string(), d.end_byte());
+                        }
+                        Some(d) => {
+                            if let Some(f) = let_from[scope].get_mut(name) {
+                                *f = (*f).min(d.end_byte());
+                            }
+                        }
+                        None => {
+                            let_from[scope].remove(name);
+                        }
+                    }
+                }
                 if cfam
                     && let Some(d) =
                         anc.iter().rev().find(|a| matches!(a.kind(), "parameter_declaration" | "declaration" | "for_range_loop"))
@@ -1179,7 +1198,7 @@ fn walk_tree<'t>(root: tree_sitter::Node<'t>, src: &[u8], c_lang: bool, cpp: boo
     let mut recv_types = HashMap::new();
     for (pos, mut sc, name) in uses {
         loop {
-            if scopes[sc].1.contains(&name) {
+            if scopes[sc].1.contains(&name) && let_from[sc].get(&name).is_none_or(|f| pos >= *f) {
                 if let Some(t) = types[sc].get(&name).filter(|t| *t != C_TYPE_CONFLICT) {
                     recv_types.insert(pos, t.clone());
                 }
