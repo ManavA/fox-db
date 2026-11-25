@@ -3448,3 +3448,168 @@ fn rust_deep_nesting_indexes_fast() {
     assert_eq!(p.refs.iter().filter(|r| r.name == "b").count(), 400);
     assert!(t.elapsed() < std::time::Duration::from_secs(5), "{:?}", t.elapsed());
 }
+
+fn c_sym_kind(p: &project::Project, path: &str, name: &str, kind: &str) -> String {
+    let c = db::open_ro().unwrap();
+    let id: i64 = c
+        .query_row(
+            "SELECT id FROM node WHERE project_id = ?1 AND path = ?2 AND name = ?3 AND kind = 'symbol' AND json_extract(meta,'$.k') = ?4",
+            rusqlite::params![p.id, path, name, kind],
+            |r| r.get(0),
+        )
+        .unwrap();
+    format!("c:{id:x}")
+}
+
+/// Rust: a macro invocation (`write!(..)`, `m!()`) calls a macro, never a function or method of
+/// that name.
+#[test]
+fn rust_macro_invocations_call_only_macros() {
+    let _g = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    let (_h, _r, p) = inline_project(&[(
+        "src/lib.rs",
+        "use std::io::Write;\npub struct P {\n    w: Vec<u8>,\n}\nimpl P {\n    fn write(&mut self, b: &[u8]) {\n        self.w.extend_from_slice(b);\n    }\n    fn go(&mut self) {\n        write!(self.w, \"x\").unwrap();\n    }\n}\nmacro_rules! m {\n    () => {};\n}\nfn m() {}\nfn run() {\n    m!();\n}\n",
+    )]);
+    let out = fox_code(&p, "P.write", "callers", 6000);
+    assert!(row_of(&out, "P.go").is_none(), "{out}");
+    sure(&fox_code(&p, &c_sym_kind(&p, "src/lib.rs", "m", "macro"), "callers", 6000), "run");
+    let out = fox_code(&p, &c_sym_kind(&p, "src/lib.rs", "m", "function"), "callers", 6000);
+    assert!(row_of(&out, "run").is_none(), "{out}");
+}
+
+/// Rust: a bare call (`search_path(..)` inside the method `search_path`) never reaches a method;
+/// that takes `self.` or a path.
+#[test]
+fn rust_bare_calls_never_reach_methods() {
+    let _g = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    let (_h, _r, p) = inline_project(&[(
+        "src/search.rs",
+        "pub struct W;\nimpl W {\n    fn search_path(&self, x: u8) {\n        search_path(x)\n    }\n}\nfn search_path(x: u8) {\n    let _ = x;\n}\n",
+    )]);
+    let out = fox_code(&p, "W.search_path", "callers", 6000);
+    assert!(row_of(&out, "W.search_path").is_none(), "{out}");
+    sure(&fox_code(&p, &c_sym_kind(&p, "src/search.rs", "search_path", "function"), "callers", 6000), "W.search_path");
+}
+
+/// Rust: a bare call of a name a `use` brings in from another crate (`use std::os::unix::fs::symlink`
+/// inside a helper also called `symlink`) reaches that crate's item, not the project's.
+#[test]
+fn rust_bare_calls_of_imported_names_follow_the_use() {
+    let _g = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    let (_h, _r, p) = inline_project(&[(
+        "src/walk.rs",
+        "#[cfg(test)]\nmod tests {\n    use std::path::Path;\n\n    fn symlink<P: AsRef<Path>, Q: AsRef<Path>>(src: P, dst: Q) {\n        use std::os::unix::fs::symlink;\n        symlink(src, dst).unwrap();\n    }\n\n    #[test]\n    fn links() {\n        symlink(\"a\", \"b\");\n    }\n}\n",
+    )]);
+    let out = fox_code(&p, "tests.symlink", "callers", 6000);
+    assert!(row_of(&out, "tests.symlink").is_none(), "{out}");
+    sure(&out, "tests.links");
+}
+
+/// Rust: a generic bare call (`open::<u8>()`) reads the `use` of its own module, not the file's.
+#[test]
+fn rust_generic_bare_calls_read_their_modules_use() {
+    let _g = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    let (_h, _r, p) = inline_project(&[
+        ("Cargo.toml", "[package]\nname = \"x\"\n"),
+        (
+            "src/lib.rs",
+            "mod db;\nmod other;\nuse crate::db::open;\nmod b {\n    use crate::other::open;\n    pub fn g() {\n        open::<u8>();\n    }\n}\n",
+        ),
+        ("src/db.rs", "pub fn open<T>() {}\n"),
+        ("src/other.rs", "pub fn open<T>() {}\n"),
+    ]);
+    let out = fox_code(&p, &c_sym_kind(&p, "src/db.rs", "open", "function"), "callers", 6000);
+    assert!(row_of(&out, "b.g").is_none(), "{out}");
+    sure(&fox_code(&p, &c_sym_kind(&p, "src/other.rs", "open", "function"), "callers", 6000), "b.g");
+}
+
+/// Rust: a bare call of a name imported through the crate's own name (`use x::db::open_ro`) or a
+/// re-export (`use crate::open_db` of `pub use db::open_db`) still finds the project's
+/// function, as a guess.
+#[test]
+fn rust_bare_calls_through_unresolved_project_uses_stay_guesses() {
+    let _g = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    let (_h, _r, p) = inline_project(&[
+        ("Cargo.toml", "[package]\nname = \"x\"\n"),
+        ("src/lib.rs", "pub mod db;\nmod a;\npub use db::open_db;\n"),
+        ("src/db.rs", "pub fn open_ro() {}\npub fn open_db() {}\n"),
+        ("src/main.rs", "use x::db::open_ro;\nfn main() {\n    open_ro();\n}\n"),
+        ("src/a.rs", "use crate::open_db;\npub fn run() {\n    open_db();\n}\n"),
+    ]);
+    for (name, caller) in [("open_ro", "main"), ("open_db", "run")] {
+        let out = fox_code(&p, name, "callers", 6000);
+        assert!(row_of(&out, caller).is_some_and(|r| r.contains("guess")), "{name}: {out}");
+    }
+}
+
+/// Rust: a module's own function beats a name its `use super::*` brings in, and a function of an
+/// impl for a reference type (`impl Tr for &S`) is a method, which a bare call never reaches.
+#[test]
+fn rust_own_functions_beat_glob_imports() {
+    let _g = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    let (_h, _r, p) = inline_project(&[
+        (
+            "src/lib.rs",
+            "use std::fs::read;\npub fn top() {\n    let _ = read(\"x\");\n}\n#[cfg(test)]\nmod tests {\n    use super::*;\n    fn read(_: &str) {}\n    #[test]\n    fn t() {\n        read(\"y\");\n    }\n}\n",
+        ),
+        (
+            "src/h.rs",
+            "pub fn helper() {}\nmod a {\n    use super::*;\n    pub struct S;\n    pub trait Tr {\n        fn helper(&self);\n    }\n    impl Tr for &S {\n        fn helper(&self) {}\n    }\n    pub fn g() {\n        helper();\n    }\n}\n",
+        ),
+    ]);
+    let out = fox_code(&p, "tests.read", "callers", 6000);
+    sure(&out, "tests.t");
+    assert!(row_of(&out, "top").is_none(), "{out}");
+    sure(&fox_code(&p, &c_sym_kind(&p, "src/h.rs", "helper", "function"), "callers", 6000), "a.g");
+    let c = db::open_ro().unwrap();
+    let methods: i64 = c
+        .query_row(
+            "SELECT COUNT(*) FROM node WHERE project_id = ?1 AND path = 'src/h.rs' AND name = 'helper' AND json_extract(meta,'$.k') = 'method'",
+            [p.id],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(methods, 1);
+}
+
+/// Rust: a bare call through a renaming `use` (`use crate::db::open as start; start()`) reaches
+/// the renamed item; one renaming a standard library item reaches no project method.
+#[test]
+fn rust_bare_calls_follow_renaming_uses() {
+    let _g = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    let (_h, _r, p) = inline_project(&[
+        ("src/main.rs", "mod db;\nmod load;\nuse crate::db::open as start;\nfn main() {\n    start();\n}\n"),
+        ("src/db.rs", "pub fn open() {}\npub fn start() {}\n"),
+        (
+            "src/load.rs",
+            "use std::fs::read as load;\npub struct S;\nimpl S {\n    pub fn load(&self) {}\n}\npub fn run() {\n    let _ = load(\"x\");\n}\n",
+        ),
+    ]);
+    sure(&fox_code(&p, &c_sym(&p, "src/db.rs", "open"), "callers", 6000), "main");
+    let out = fox_code(&p, &c_sym(&p, "src/db.rs", "start"), "callers", 6000);
+    assert!(rows(&out).is_empty(), "{out}");
+    let out = fox_code(&p, "S.load", "callers", 6000);
+    assert!(row_of(&out, "run").is_none(), "{out}");
+}
+
+/// Rust: a name a block declares (`fn open() {}` in a body), a `let` binding or a parameter
+/// shadows the one a `use` brings in: calling it is no certain call of the imported function. A
+/// `let` binding is visible only after its statement (`let open = open();` calls the function).
+#[test]
+fn rust_block_names_shadow_uses() {
+    let _g = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    let (_h, _r, p) = inline_project(&[
+        ("Cargo.toml", "[package]\nname = \"x\"\n"),
+        (
+            "src/main.rs",
+            "mod db;\nuse crate::db::open;\nfn a() {\n    let open = || 1;\n    open();\n}\nfn b(open: impl Fn()) {\n    open();\n}\nfn c() {\n    fn open() {}\n    open();\n}\nfn d() {\n    open();\n}\nfn e() {\n    let open = open();\n    let _ = open;\n}\nfn main() {\n    a();\n    b(|| {});\n    c();\n    d();\n}\n",
+        ),
+        ("src/db.rs", "pub fn open() {}\n"),
+    ]);
+    let out = fox_code(&p, &c_sym_kind(&p, "src/db.rs", "open", "function"), "callers", 6000);
+    for f in ["a", "b", "c"] {
+        not_certain(&out, f);
+    }
+    sure(&out, "d");
+    sure(&out, "e");
+}
