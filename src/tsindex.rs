@@ -910,8 +910,9 @@ fn is_ident(k: &str) -> bool {
 /// parameter hides a name only inside that lambda), Python comprehensions, and C blocks and `for`
 /// statements (a local declared there is visible only there; an unbraced `case` arm is part of
 /// its `switch` block).
-fn is_scope(k: &str, c_lang: bool) -> bool {
+fn is_scope(k: &str, c_lang: bool, rust: bool) -> bool {
     FN_KINDS.contains(&k)
+        || rust && matches!(k, "function_item" | "closure_expression" | "block")
         || matches!(k, "list_comprehension" | "set_comprehension" | "dictionary_comprehension" | "generator_expression")
         || c_lang && matches!(k, "compound_statement" | "for_statement" | "for_range_loop")
 }
@@ -983,6 +984,8 @@ struct Walk<'t> {
     rust_fns: HashSet<(String, String)>,
     /// Rust: start bytes of the functions of impl and trait bodies: the file's methods.
     rust_methods: HashSet<usize>,
+    /// Rust: the functions declared in a block, as (block node id, name).
+    rust_block_fns: HashSet<(usize, String)>,
 }
 
 /// Rust: where a node sits: the inline modules around it (outermost first), the type of the impl
@@ -1022,6 +1025,7 @@ fn walk_tree<'t>(root: tree_sitter::Node<'t>, src: &[u8], c_lang: bool, cpp: boo
     let mut rust_places: Vec<RustPlace> = vec![RustPlace::default()];
     let mut rust_fns: HashSet<(String, String)> = HashSet::new();
     let mut rust_methods: HashSet<usize> = HashSet::new();
+    let mut rust_block_fns: HashSet<(usize, String)> = HashSet::new();
     // Open Rust contexts: (depth of the node, place index).
     let mut rust_ctx: Vec<(usize, usize)> = vec![];
     // (start byte, innermost scope, name) of identifiers in value slots and receiver positions.
@@ -1072,6 +1076,10 @@ fn walk_tree<'t>(root: tree_sitter::Node<'t>, src: &[u8], c_lang: bool, cpp: boo
                     && let Some(f) = n.child_by_field_name("name").and_then(|x| x.utf8_text(src).ok())
                 {
                     rust_fns.insert((rust_places[here].mods.join("::"), f.to_string()));
+                } else if let Some(b) = anc.last().filter(|b| b.kind() == "block")
+                    && let Some(f) = n.child_by_field_name("name").and_then(|x| x.utf8_text(src).ok())
+                {
+                    rust_block_fns.insert((b.id(), f.to_string()));
                 }
             }
             let name = |f: &str| n.child_by_field_name(f);
@@ -1095,7 +1103,7 @@ fn walk_tree<'t>(root: tree_sitter::Node<'t>, src: &[u8], c_lang: bool, cpp: boo
                 rust_ctx.push((anc.len(), rust_places.len() - 1));
             }
         }
-        if is_scope(n.kind(), cfam) {
+        if is_scope(n.kind(), cfam, rust) {
             let parent = open.last().map_or(0, |o| o.1);
             scopes.push((parent, HashSet::new()));
             types.push(HashMap::new());
@@ -1191,7 +1199,20 @@ fn walk_tree<'t>(root: tree_sitter::Node<'t>, src: &[u8], c_lang: bool, cpp: boo
     if cpp {
         recv_types.retain(|_, t| !cpp_tparam(t, &tparams));
     }
-    Walk { locals, file_locals, parents, recv_types, recv_class, tparams, rust_items, rust_at, rust_places, rust_fns, rust_methods }
+    Walk {
+        locals,
+        file_locals,
+        parents,
+        recv_types,
+        recv_class,
+        tparams,
+        rust_items,
+        rust_at,
+        rust_places,
+        rust_fns,
+        rust_methods,
+        rust_block_fns,
+    }
 }
 
 /// Is identifier `x` in a declaring position (a parameter or variable name, not a use)?
@@ -1228,6 +1249,10 @@ fn declares(x: tree_sitter::Node, anc: &[tree_sitter::Node], src: &[u8]) -> bool
                 return is_field(p, "name", c) && !fn_value && !required;
             }
             "required_parameter" | "optional_parameter" => return is_field(p, "pattern", c),
+            // Rust: `let x`, `fn f(x: T)`, `|x: T|`, `|x|`, `let mut x`.
+            "let_declaration" | "parameter" => return is_field(p, "pattern", c),
+            "closure_parameters" => return true,
+            "mut_pattern" => c = p,
             "arrow_function" => return is_field(p, "parameter", c),
             "catch_clause" => return is_field(p, "parameter", c),
             "pair_pattern" => {
@@ -1609,6 +1634,8 @@ struct RustScopes {
     glob_super: HashSet<String>,
     /// See [`Walk::rust_fns`]: a module's own function shadows a name a glob brings in.
     fns: HashSet<(String, String)>,
+    /// See [`Walk::rust_block_fns`].
+    block_fns: HashSet<(usize, String)>,
 }
 
 /// Rust: the last name of a type (`Vec<u8>` -> `Vec`, `a::Engine` -> `Engine`).
@@ -1643,7 +1670,7 @@ fn rust_segments(text: &str) -> Option<Vec<String>> {
 
 /// Rust: the `use` declarations and `mod` items of a file (see [`RustScopes`]).
 fn rust_scopes(walk: &Walk, src: &[u8]) -> RustScopes {
-    let mut sc = RustScopes { fns: walk.rust_fns.clone(), ..Default::default() };
+    let mut sc = RustScopes { fns: walk.rust_fns.clone(), block_fns: walk.rust_block_fns.clone(), ..Default::default() };
     for n in &walk.rust_items {
         match n.kind() {
             "mod_item" => {
@@ -1778,6 +1805,16 @@ const RUST_USE: &str = "use:";
 fn rust_imported(name: &str, at: &RustPlace, sc: &RustScopes) -> Option<(String, String)> {
     if name.starts_with(|c: char| c.is_ascii_uppercase()) {
         return None;
+    }
+    // A function a block around the call declares, nearer than any `use` of the name, is the one.
+    let module = at.mods.join("::");
+    for b in at.blocks.iter().rev() {
+        if sc.uses.contains_key(&(module.clone(), *b, name.to_string())) {
+            break;
+        }
+        if sc.block_fns.contains(&(*b, name.to_string())) {
+            return None;
+        }
     }
     let full = rust_qualifier(&[name.to_string()], &at.mods, &at.blocks, at.ty.as_deref(), sc, 0)?;
     if full == name {
