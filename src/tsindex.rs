@@ -979,6 +979,10 @@ struct Walk<'t> {
     /// trees and the names of path calls, by node id: an index into `rust_places`.
     rust_at: HashMap<usize, usize>,
     rust_places: Vec<RustPlace>,
+    /// Rust: the functions of each module (not in a block, impl or trait), as (module, name).
+    rust_fns: HashSet<(String, String)>,
+    /// Rust: start bytes of the functions of impl and trait bodies: the file's methods.
+    rust_methods: HashSet<usize>,
 }
 
 /// Rust: where a node sits: the inline modules around it (outermost first), the type of the impl
@@ -1016,6 +1020,8 @@ fn walk_tree<'t>(root: tree_sitter::Node<'t>, src: &[u8], c_lang: bool, cpp: boo
     let mut rust_items: Vec<tree_sitter::Node<'t>> = vec![];
     let mut rust_at: HashMap<usize, usize> = HashMap::new();
     let mut rust_places: Vec<RustPlace> = vec![RustPlace::default()];
+    let mut rust_fns: HashSet<(String, String)> = HashSet::new();
+    let mut rust_methods: HashSet<usize> = HashSet::new();
     // Open Rust contexts: (depth of the node, place index).
     let mut rust_ctx: Vec<(usize, usize)> = vec![];
     // (start byte, innermost scope, name) of identifiers in value slots and receiver positions.
@@ -1053,9 +1059,20 @@ fn walk_tree<'t>(root: tree_sitter::Node<'t>, src: &[u8], c_lang: bool, cpp: boo
             }
             let here = rust_ctx.last().map_or(0, |c| c.1);
             if matches!(n.kind(), "use_declaration" | "mod_item" | "token_tree")
-                || n.kind() == "identifier" && anc.last().is_some_and(|p| matches!(p.kind(), "scoped_identifier" | "call_expression"))
+                || n.kind() == "identifier"
+                    && anc.last().is_some_and(|p| matches!(p.kind(), "scoped_identifier" | "call_expression" | "generic_function"))
             {
                 rust_at.insert(n.id(), here);
+            }
+            if n.kind() == "function_item" {
+                let up = |i: usize| anc.len().checked_sub(i).map(|j| anc[j].kind());
+                if matches!(up(2), Some("impl_item" | "trait_item")) && up(1) == Some("declaration_list") {
+                    rust_methods.insert(n.start_byte());
+                } else if (up(1) == Some("source_file") || up(1) == Some("declaration_list") && up(2) == Some("mod_item"))
+                    && let Some(f) = n.child_by_field_name("name").and_then(|x| x.utf8_text(src).ok())
+                {
+                    rust_fns.insert((rust_places[here].mods.join("::"), f.to_string()));
+                }
             }
             let name = |f: &str| n.child_by_field_name(f);
             let next = match n.kind() {
@@ -1174,7 +1191,7 @@ fn walk_tree<'t>(root: tree_sitter::Node<'t>, src: &[u8], c_lang: bool, cpp: boo
     if cpp {
         recv_types.retain(|_, t| !cpp_tparam(t, &tparams));
     }
-    Walk { locals, file_locals, parents, recv_types, recv_class, tparams, rust_items, rust_at, rust_places }
+    Walk { locals, file_locals, parents, recv_types, recv_class, tparams, rust_items, rust_at, rust_places, rust_fns, rust_methods }
 }
 
 /// Is identifier `x` in a declaring position (a parameter or variable name, not a use)?
@@ -1438,22 +1455,23 @@ pub fn extract(l: &Lang, src: &[u8]) -> Parsed {
             }
             let parent = walk.parents.get(&nn.id()).copied().or_else(|| nn.parent());
             let kind = ref_kind(k);
-            let mut recv = kind != "import" && has_receiver(nn, parent);
+            let recv = kind != "import" && has_receiver(nn, parent);
             let rv = if recv { receiver_name(nn, parent, src) } else { None };
             let recv_local = rv.as_ref().is_some_and(|(_, at)| walk.locals.contains(at));
             let mut via = if kind == "import" { import_source(nn, &walk.parents, src) } else { rv.map(|x| x.0) };
             // Rust: a call through a path (`db::open_ro()`) keeps the path, read from where it is.
-            let mut qual = rust && kind == "call" && recv && parent.is_some_and(|p| p.kind() == "scoped_identifier");
+            let qual = rust && kind == "call" && recv && parent.is_some_and(|p| p.kind() == "scoped_identifier");
             if qual {
                 let segs = parent.and_then(|p| p.child_by_field_name("path")).and_then(|q| rust_segments(q.utf8_text(src).ok()?));
                 let at = walk.rust_place(nn);
                 via = segs.and_then(|s| rust_qualifier(&s, &at.mods, &at.blocks, at.ty.as_deref(), &rust_scopes, 0));
             }
+            let mut name = name;
             if rust && kind == "call" && !recv {
                 if parent.is_some_and(|p| p.kind() == "macro_invocation") {
                     via = Some(RUST_MACRO.to_string());
-                } else if let Some(v) = rust_imported(&name, walk.rust_place(nn), &rust_scopes) {
-                    (recv, qual, via) = (true, true, v);
+                } else if let Some((item, path)) = rust_imported(&name, walk.rust_place(nn), &rust_scopes) {
+                    (name, via) = (item, Some(format!("{RUST_USE}{path}")));
                 }
             }
             let rtype = match (c_lang, kind, parent) {
@@ -1504,21 +1522,19 @@ pub fn extract(l: &Lang, src: &[u8]) -> Parsed {
     }
     nest(&mut out);
     if rust {
-        rust_impl_modules(&mut out);
+        rust_impl_modules(&mut out, &walk.rust_methods);
     }
     out
 }
 
 /// Rust: a method of an impl inside inline modules is named with them (`a.S` for `mod a { impl S
 /// { .. } }`), like a function there (`a.f`): two same-name types of one file stay apart. A
-/// function there stays a function: only an impl's or trait's is a method.
-fn rust_impl_modules(p: &mut Parsed) {
+/// function is a method exactly when it is in an impl or trait body (`methods`, by start byte),
+/// whatever type the impl is for (`impl Tr for &S`).
+fn rust_impl_modules(p: &mut Parsed, methods: &HashSet<usize>) {
     for i in 0..p.defs.len() {
-        if p.defs[i].kind == "method"
-            && p.defs[i].container_name.is_none()
-            && p.defs[i].container.is_some_and(|c| p.defs[c].kind == "module")
-        {
-            p.defs[i].kind = "function".into();
+        if matches!(p.defs[i].kind.as_str(), "function" | "method") {
+            p.defs[i].kind = if methods.contains(&p.defs[i].start) { "method" } else { "function" }.into();
         }
         if let (Some(c), Some(name)) = (p.defs[i].container, p.defs[i].container_name.as_ref())
             && p.defs[c].kind == "module"
@@ -1591,6 +1607,8 @@ struct RustScopes {
     mods: HashSet<(String, String)>,
     /// Modules that take their parent's names (`use super::*;`).
     glob_super: HashSet<String>,
+    /// See [`Walk::rust_fns`]: a module's own function shadows a name a glob brings in.
+    fns: HashSet<(String, String)>,
 }
 
 /// Rust: the last name of a type (`Vec<u8>` -> `Vec`, `a::Engine` -> `Engine`).
@@ -1625,7 +1643,7 @@ fn rust_segments(text: &str) -> Option<Vec<String>> {
 
 /// Rust: the `use` declarations and `mod` items of a file (see [`RustScopes`]).
 fn rust_scopes(walk: &Walk, src: &[u8]) -> RustScopes {
-    let mut sc = RustScopes::default();
+    let mut sc = RustScopes { fns: walk.rust_fns.clone(), ..Default::default() };
     for n in &walk.rust_items {
         match n.kind() {
             "mod_item" => {
@@ -1737,7 +1755,7 @@ fn rust_qualifier(segs: &[String], mods: &[String], blocks: &[usize], ty: Option
                 if sc.mods.contains(&(key.clone(), name.to_string())) {
                     return Some(join("self", &mods[..m], segs));
                 }
-                if m > 0 && sc.glob_super.contains(&key) {
+                if m > 0 && sc.glob_super.contains(&key) && !sc.fns.contains(&(key.clone(), name.to_string())) {
                     m -= 1;
                     continue;
                 }
@@ -1750,15 +1768,23 @@ fn rust_qualifier(segs: &[String], mods: &[String], blocks: &[usize], ty: Option
 /// Rust: the `via` of a macro invocation's reference (`write!(..)`), which reaches only macros.
 const RUST_MACRO: &str = "!";
 
-/// Rust: a bare call of a name a `use` around it brings in (`use std::fs::read; read(..)`) is a
-/// call through that path: Some(the path before the name), Some(None) when the `use` renames
-/// another item (`as`). None when no `use` names it, or for a type (`Wrapper(x)`).
-fn rust_imported(name: &str, at: &RustPlace, sc: &RustScopes) -> Option<Option<String>> {
+/// Rust: the `via` prefix of a bare call through a `use` (`use std::fs::read; read(..)`),
+/// followed by the path before the item's name.
+const RUST_USE: &str = "use:";
+
+/// Rust: the item a bare call names when a `use` around it brings the name in: (its name, its
+/// path before the name), past a rename (`use a::f as g`). None when no `use` names it, or for a
+/// type (`Wrapper(x)`).
+fn rust_imported(name: &str, at: &RustPlace, sc: &RustScopes) -> Option<(String, String)> {
     if name.starts_with(|c: char| c.is_ascii_uppercase()) {
         return None;
     }
     let full = rust_qualifier(&[name.to_string()], &at.mods, &at.blocks, at.ty.as_deref(), sc, 0)?;
-    (full != name).then(|| full.strip_suffix(name).and_then(|p| p.strip_suffix("::")).map(str::to_string))
+    if full == name {
+        return None;
+    }
+    let (path, last) = full.rsplit_once("::").unwrap_or(("", &full));
+    Some((last.to_string(), path.to_string()))
 }
 
 /// Rust words that may stand before a parenthesized group in a macro's arguments without
@@ -1864,12 +1890,14 @@ fn rust_token_calls<'t>(
             let at = walk.rust_place(root);
             (recv, qual) = (true, true);
             via = rust_qualifier(&segs, &at.mods, &at.blocks, at.ty.as_deref(), sc, 0);
-        } else if let Some(v) = rust_imported(name, walk.rust_place(root), sc) {
-            (recv, qual, via) = (true, true, v);
+        }
+        let mut name = name.to_string();
+        if !recv && let Some((item, path)) = rust_imported(&name, walk.rust_place(root), sc) {
+            (name, via) = (item, Some(format!("{RUST_USE}{path}")));
         }
         refs.push(Ref {
             kind: "call",
-            name: name.to_string(),
+            name,
             line: k.start_position().row as u32 + 1,
             caller: None,
             recv,
@@ -3282,7 +3310,21 @@ fn stem_of(p: &str) -> &str {
 fn score(r: &RefRow, cands: &[Cand], imp: Option<&FileImports>) -> (i64, i64) {
     let rust = r.kind == "call" && lang::for_path(&r.path).is_some_and(|l| l.family == "rust");
     if rust && r.qual {
-        return rust_path_score(r, cands);
+        return rust_path_score(r.via.as_deref(), &r.path, cands);
+    }
+    // A bare call through a `use`: the item that path names; nothing for the standard library;
+    // a guess by name when the path names no project item the index can follow (the crate's own
+    // name, another workspace crate, a re-export).
+    if rust
+        && !r.recv
+        && let Some(path) = r.via.as_deref().and_then(|v| v.strip_prefix(RUST_USE))
+    {
+        let x = if path.is_empty() { (0, 0) } else { rust_path_score(Some(path), &r.path, cands) };
+        if x.0 != 0 || matches!(path.split("::").next(), Some("std" | "core" | "alloc")) {
+            return x;
+        }
+        let (d, a) = score_name(r, cands, imp);
+        return (d, if d != 0 { a.max(1) } else { 0 });
     }
     let rust_recv = rust && r.recv;
     if rust_recv && let Some(x) = rust_self_score(r, cands) {
@@ -3326,10 +3368,10 @@ fn rust_self_score(r: &RefRow, cands: &[Cand]) -> Option<(i64, i64)> {
 /// file holds or `Self`); as a guess when only the path's ending matches (a module or type of
 /// that name elsewhere, which another crate may hold too); nothing when none matches (the
 /// standard library, another crate).
-fn rust_path_score(r: &RefRow, cands: &[Cand]) -> (i64, i64) {
-    let Some(via) = r.via.as_deref() else { return (0, 0) };
+fn rust_path_score(via: Option<&str>, at: &str, cands: &[Cand]) -> (i64, i64) {
+    let Some(via) = via else { return (0, 0) };
     let segs: Vec<&str> = via.split("::").collect();
-    let here = rust_mod_path(&r.path);
+    let here = rust_mod_path(at);
     // (form, the module path the qualifier names, the type it ends in)
     let (form, mut path, ty): (&str, Vec<&str>, Option<&str>) = match segs[0] {
         "crate" => ("crate", segs[1..].to_vec(), None),
@@ -3351,7 +3393,7 @@ fn rust_path_score(r: &RefRow, cands: &[Cand]) -> (i64, i64) {
     let (mut exact, mut loose) = (vec![], vec![]);
     for s in cands.iter().filter(|s| s.family == "rust" && is_callable_kind(&s.kind)) {
         let cm = rust_mod_path(&s.path);
-        let same = s.path == r.path;
+        let same = s.path == at;
         // A type's module: its file's, then the inline modules around its impl (`a.S` -> `a`).
         let tmod: Vec<&str> = {
             let mut v: Vec<&str> = cm.clone();

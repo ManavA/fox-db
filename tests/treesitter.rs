@@ -3504,3 +3504,90 @@ fn rust_bare_calls_of_imported_names_follow_the_use() {
     assert!(row_of(&out, "tests.symlink").is_none(), "{out}");
     sure(&out, "tests.links");
 }
+
+/// Rust: a generic bare call (`open::<u8>()`) reads the `use` of its own module, not the file's.
+#[test]
+fn rust_generic_bare_calls_read_their_modules_use() {
+    let _g = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    let (_h, _r, p) = inline_project(&[
+        ("Cargo.toml", "[package]\nname = \"x\"\n"),
+        (
+            "src/lib.rs",
+            "mod db;\nmod other;\nuse crate::db::open;\nmod b {\n    use crate::other::open;\n    pub fn g() {\n        open::<u8>();\n    }\n}\n",
+        ),
+        ("src/db.rs", "pub fn open<T>() {}\n"),
+        ("src/other.rs", "pub fn open<T>() {}\n"),
+    ]);
+    let out = fox_code(&p, &c_sym_kind(&p, "src/db.rs", "open", "function"), "callers", 6000);
+    assert!(row_of(&out, "b.g").is_none(), "{out}");
+    sure(&fox_code(&p, &c_sym_kind(&p, "src/other.rs", "open", "function"), "callers", 6000), "b.g");
+}
+
+/// Rust: a bare call of a name imported through the crate's own name (`use x::db::open_ro`) or a
+/// re-export (`use crate::open_db` of `pub use db::open_db`) still finds the project's
+/// function, as a guess.
+#[test]
+fn rust_bare_calls_through_unresolved_project_uses_stay_guesses() {
+    let _g = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    let (_h, _r, p) = inline_project(&[
+        ("Cargo.toml", "[package]\nname = \"x\"\n"),
+        ("src/lib.rs", "pub mod db;\nmod a;\npub use db::open_db;\n"),
+        ("src/db.rs", "pub fn open_ro() {}\npub fn open_db() {}\n"),
+        ("src/main.rs", "use x::db::open_ro;\nfn main() {\n    open_ro();\n}\n"),
+        ("src/a.rs", "use crate::open_db;\npub fn run() {\n    open_db();\n}\n"),
+    ]);
+    for (name, caller) in [("open_ro", "main"), ("open_db", "run")] {
+        let out = fox_code(&p, name, "callers", 6000);
+        assert!(row_of(&out, caller).is_some_and(|r| r.contains("guess")), "{name}: {out}");
+    }
+}
+
+/// Rust: a module's own function beats a name its `use super::*` brings in, and a function of an
+/// impl for a reference type (`impl Tr for &S`) is a method, which a bare call never reaches.
+#[test]
+fn rust_own_functions_beat_glob_imports() {
+    let _g = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    let (_h, _r, p) = inline_project(&[
+        (
+            "src/lib.rs",
+            "use std::fs::read;\npub fn top() {\n    let _ = read(\"x\");\n}\n#[cfg(test)]\nmod tests {\n    use super::*;\n    fn read(_: &str) {}\n    #[test]\n    fn t() {\n        read(\"y\");\n    }\n}\n",
+        ),
+        (
+            "src/h.rs",
+            "pub fn helper() {}\nmod a {\n    use super::*;\n    pub struct S;\n    pub trait Tr {\n        fn helper(&self);\n    }\n    impl Tr for &S {\n        fn helper(&self) {}\n    }\n    pub fn g() {\n        helper();\n    }\n}\n",
+        ),
+    ]);
+    let out = fox_code(&p, "tests.read", "callers", 6000);
+    sure(&out, "tests.t");
+    assert!(row_of(&out, "top").is_none(), "{out}");
+    sure(&fox_code(&p, &c_sym_kind(&p, "src/h.rs", "helper", "function"), "callers", 6000), "a.g");
+    let c = db::open_ro().unwrap();
+    let methods: i64 = c
+        .query_row(
+            "SELECT COUNT(*) FROM node WHERE project_id = ?1 AND path = 'src/h.rs' AND name = 'helper' AND json_extract(meta,'$.k') = 'method'",
+            [p.id],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(methods, 1);
+}
+
+/// Rust: a bare call through a renaming `use` (`use crate::db::open as start; start()`) reaches
+/// the renamed item; one renaming a standard library item reaches no project method.
+#[test]
+fn rust_bare_calls_follow_renaming_uses() {
+    let _g = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    let (_h, _r, p) = inline_project(&[
+        ("src/main.rs", "mod db;\nmod load;\nuse crate::db::open as start;\nfn main() {\n    start();\n}\n"),
+        ("src/db.rs", "pub fn open() {}\npub fn start() {}\n"),
+        (
+            "src/load.rs",
+            "use std::fs::read as load;\npub struct S;\nimpl S {\n    pub fn load(&self) {}\n}\npub fn run() {\n    let _ = load(\"x\");\n}\n",
+        ),
+    ]);
+    sure(&fox_code(&p, &c_sym(&p, "src/db.rs", "open"), "callers", 6000), "main");
+    let out = fox_code(&p, &c_sym(&p, "src/db.rs", "start"), "callers", 6000);
+    assert!(rows(&out).is_empty(), "{out}");
+    let out = fox_code(&p, "S.load", "callers", 6000);
+    assert!(row_of(&out, "run").is_none(), "{out}");
+}

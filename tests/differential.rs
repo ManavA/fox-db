@@ -364,3 +364,36 @@ fn rust_edits_match_a_full_index() {
         ],
     );
 }
+
+/// A schema-28 store holding Rust rows of the older parse (`write!` scored as the method
+/// `write`) matches a fresh full index once it opens: Rust files parse again and re-score.
+#[test]
+fn rust_rows_of_schema_28_match_a_full_index_after_upgrade() {
+    let _g = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    let home = tempfile::tempdir().unwrap();
+    let repo = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(repo.path().join("src")).unwrap();
+    std::fs::write(
+        repo.path().join("src/lib.rs"),
+        "pub struct P {\n    w: Vec<u8>,\n}\nimpl P {\n    fn write(&mut self, b: &[u8]) {\n        self.w.extend_from_slice(b);\n    }\n    fn go(&mut self) {\n        write!(self.w, \"x\").unwrap();\n        search(1);\n    }\n    fn search(&self, x: u8) {\n        let _ = x;\n    }\n}\nfn search(x: u8) {\n    let _ = x;\n}\n",
+    )
+    .unwrap();
+    set_home(home.path());
+    index(repo.path());
+    {
+        let c = db::open_rw().unwrap();
+        c.execute_batch(
+            "UPDATE ts_ref SET via = NULL, amb = 0, dst = (SELECT id FROM node WHERE kind = 'symbol' AND name = 'write') WHERE name = 'write';
+             PRAGMA user_version = 28;",
+        )
+        .unwrap();
+    }
+    index(repo.path());
+    let upgraded = dump();
+    let full_home = tempfile::tempdir().unwrap();
+    set_home(full_home.path());
+    index(repo.path());
+    let full = dump();
+    set_home(home.path());
+    assert_eq!(upgraded, full);
+}
