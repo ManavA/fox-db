@@ -3544,6 +3544,8 @@ fn score_name(r: &RefRow, cands: &[Cand], imp: Option<&FileImports>) -> (i64, i6
     let mut eligible = 0i64;
     // The best candidate is a function-holding field reached without receiver evidence.
     let mut field_fn_guess = false;
+    // Go: the best candidate is a free function reached through a name that is no package's.
+    let mut go_value_guess = false;
     for s in cands {
         if !lang::interop(fam, s.family) || s.id == r.src && call && is_type_kind(&s.kind) {
             continue;
@@ -3555,6 +3557,13 @@ fn score_name(r: &RefRow, cands: &[Cand], imp: Option<&FileImports>) -> (i64, i6
             continue;
         }
         let member = s.pid != 0 || !s.parent.is_empty();
+        // Go: only an imported package's name qualifies a free function (`fzf.Run()`). Through a
+        // value (`cmd.Run()`, `exec.Command(c).Run()`) it is a method call; through another name
+        // (a package variable, a field) it may be one.
+        let go_value = fam == "go" && call && r.recv && !member && !pkg_qualified;
+        if go_value && (r.recv_local || via.is_none()) {
+            continue;
+        }
         // C: a function-pointer member is reached only through a receiver (see `c_member_score`).
         if s.field_fn && s.family == "c" && c_file {
             continue;
@@ -3652,6 +3661,7 @@ fn score_name(r: &RefRow, cands: &[Cand], imp: Option<&FileImports>) -> (i64, i6
         if score > best.0 {
             best = (score, s.id, 1, same_file, member, score - via_bonus);
             field_fn_guess = s.field_fn && !same_file && !own_receiver;
+            go_value_guess = go_value;
             best_module = r.recv && via.is_some() && source == Some(Source::Match);
         } else if score == best.0 {
             best.2 += 1;
@@ -3674,7 +3684,7 @@ fn score_name(r: &RefRow, cands: &[Cand], imp: Option<&FileImports>) -> (i64, i6
     let guess = dst != 0
         && !best.3
         && (eligible > 1 && (best.2 > 1 || call && r.recv && !best_module || name_only) || name_only && call && r.recv || via_only);
-    let guess = guess || dst != 0 && field_fn_guess;
+    let guess = guess || dst != 0 && (field_fn_guess || go_value_guess);
     (dst, if guess { eligible.max(1) } else { 0 })
 }
 

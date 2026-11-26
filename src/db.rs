@@ -519,6 +519,15 @@ pub(crate) fn migrate(c: &Connection) -> Result<()> {
              PRAGMA user_version = 29;",
         )?;
     }
+    if v < 30 {
+        // Go: a call through a value (`cmd.Run()`) never reaches a free function, and one through
+        // a name that is no imported package's is a guess. Go projects re-score.
+        c.execute_batch(
+            "INSERT OR REPLACE INTO meta(k, v)
+               SELECT 'rescore:' || p.id, 1 FROM project p WHERE EXISTS (SELECT 1 FROM ts_file f WHERE f.project_id = p.id AND f.lang = 'go');
+             PRAGMA user_version = 30;",
+        )?;
+    }
     // Cheap when already set: the setting lives in each table's own config.
     for t in MERGE_TABLES {
         defer_merges(c, t)?;
@@ -820,7 +829,7 @@ pub fn minority(c: &Connection, ranges: &[(i64, i64)]) -> bool {
 }
 
 /// The schema version this build writes.
-pub const LATEST: i64 = 29;
+pub const LATEST: i64 = 30;
 
 /// Read-only connection for the hot paths. None if the store does not exist yet.
 pub fn open_ro() -> Option<Connection> {

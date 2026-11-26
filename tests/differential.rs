@@ -304,6 +304,24 @@ fn python_descendant_names_follow_base_changes() {
     check(&[("a.py", a_nested), ("c.py", c_plain), ("d.py", d)], &[("C gains A", &[("c.py", Some(c_sub))])]);
 }
 
+/// Go: a call through a package variable, then through a local, of a same-name free function
+/// follows edits of either.
+#[test]
+fn go_value_receiver_edits_match_a_full_index() {
+    let _g = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    let global = "package fzf\n\nimport \"os/exec\"\n\nvar cmd = exec.Command(\"x\")\n\nfunc label() { cmd.Run() }\n";
+    let local = "package fzf\n\nimport \"os/exec\"\n\nfunc label() {\n\tcmd := exec.Command(\"x\")\n\tcmd.Run()\n}\n";
+    let core = "package fzf\n\nfunc Run() {}\n";
+    check(
+        &[("go.mod", "module example.com/f\n"), ("core.go", core), ("tmux.go", global)],
+        &[
+            ("cmd becomes a local", &[("tmux.go", Some(local))]),
+            ("Run goes away", &[("core.go", None)]),
+            ("Run and the variable come back", &[("core.go", Some(core)), ("tmux.go", Some(global))]),
+        ],
+    );
+}
+
 /// C: a macro standing for a function, and calls through it, follow edits of either.
 #[test]
 fn c_alias_macro_edits_match_a_full_index() {

@@ -534,15 +534,16 @@ fn completeness_counts_one_word_names_and_uses_outside_symbols() {
     ]);
     // The argument in src/arg.c, the member assignment in src/field.c and the initializer in
     // src/fp.c are resolved references: listed by `refs` and `impact`, still unknown to `callers`
-    // (what is called through them is not followed). The macro whose body is one call calls it.
+    // (what is called through them is not followed). The macro body names helper, and a caller
+    // would have to expand the macro to call it.
     for (rel, head) in [
-        ("callers", "6 lines name `helper`: 2 calls, 1 definition, 3 references, not calls; may be incomplete: 3 lines pass it as a value"),
+        ("callers", "6 lines name `helper`: 1 call, 1 definition, 3 references, not calls, 1 unresolved"),
         ("refs", "6 lines name `helper`: 5 refs, 1 definition; all accounted for"),
         ("impact", "6 lines name `helper`: 5 uses (d1), 1 definition; all accounted for"),
     ] {
         let out = fox_code(&p, "helper", rel, 800);
         assert!(out.starts_with(head), "{rel}: {out}");
-        assert!(!out.contains("unresolved mentions"), "{rel}: {out}");
+        assert_eq!(out.contains("unresolved mentions"), rel == "callers", "{rel}: {out}");
     }
     let out = fox_code(&p, "simple_open", "refs", 800);
     assert!(out.starts_with("2 lines name `simple_open`: 0 refs, 1 definition, 1 unresolved; may be incomplete"), "{out}");
@@ -3246,6 +3247,43 @@ fn c_calls_through_an_alias_macro_reach_its_target() {
     assert!(!r.contains(":5 "), "{out}");
     let out = fox_code(&p, "abbrev_branch", "callers", 6000);
     assert!(rows(&out).contains(":4 show c:"), "{out}");
+}
+
+/// C: an alias macro is no caller of its target; the functions that use it are, through it.
+#[test]
+fn c_alias_macro_is_not_its_targets_caller() {
+    let _g = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    let (_h, _r, p) = inline_project(&[(
+        "remote.c",
+        "static const char *abbrev_ref(const char *name, const char *prefix)\n{\n\treturn name;\n}\n#define abbrev_branch(name) abbrev_ref((name), \"refs/heads/\")\nstatic void show(const char *n)\n{\n\tabbrev_branch(n);\n}\n",
+    )]);
+    let out = fox_code(&p, "abbrev_ref", "callers", 6000);
+    assert!(rows(&out).contains(":8 show c:"), "{out}");
+    assert!(row_of(&out, "abbrev_branch").is_none(), "{out}");
+}
+
+/// Go: `x.Run()` on a value (a local, a parameter, a call's result) is a method call, never a
+/// call of this package's free function `Run`; only an imported package's name qualifies one.
+/// A receiver that names no import nor local (a package variable) leaves it a guess.
+#[test]
+fn go_method_calls_on_values_are_not_free_function_calls() {
+    let _g = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    let (_h, _r, p) = inline_project(&[
+        ("go.mod", "module example.com/f\n\ngo 1.21\n"),
+        ("src/core.go", "package fzf\n\nfunc Run(n int) int { return n }\n"),
+        (
+            "src/tmux.go",
+            "package fzf\n\nimport \"os/exec\"\n\nvar runner = exec.Command(\"y\")\n\nfunc label() { exec.Command(\"tmux\").Run() }\n\nfunc proxy() {\n\tcmd := exec.Command(\"x\")\n\tcmd.Run()\n}\n\nfunc global() { runner.Run() }\n",
+        ),
+        ("src/core_test.go", "package fzf\n\nimport \"testing\"\n\nfunc BenchmarkRun(b *testing.B) { b.Run(\"x\", nil) }\n"),
+        ("main.go", "package main\n\nimport fzf \"example.com/f/src\"\n\nfunc main() { fzf.Run(1) }\n"),
+    ]);
+    let out = fox_code(&p, "Run", "callers", 6000);
+    sure(&out, "main");
+    for f in ["label", "proxy", "BenchmarkRun"] {
+        assert!(row_of(&out, f).is_none(), "{f}: {out}");
+    }
+    not_certain(&out, "global");
 }
 
 /// `func`'s call is credited to the target with certainty.

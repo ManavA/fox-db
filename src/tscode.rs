@@ -196,7 +196,8 @@ type Sites = (usize, HashSet<String>, HashSet<account::Line>, usize, usize);
 /// Call or reference sites of `targets`, grouped by file: `path (n)` then `  :line Caller c:h`.
 /// A site whose target was guessed by name among several same-name definitions ends in
 /// `guess 1 of N`; one guessed among more than [`WEAK_GUESS`] is only counted. A site of a
-/// target in `macros` (a C macro that stands for the first target) is labelled `via macro M`.
+/// target in `macros` (a C macro that stands for the first target) is labelled `via macro M`;
+/// the call in M's own body is no site.
 /// Returns (sites, their files, their lines, guessed sites, weak guesses left out).
 fn sites(
     c: &Connection,
@@ -243,7 +244,7 @@ fn sites(
         })?
         .flatten()
     {
-        if !seen.insert((path.clone(), line, src)) {
+        if !seen.insert((path.clone(), line, src)) || macros.contains_key(&src) {
             continue;
         }
         if is_weak(amb, recv, via.as_deref(), dparent.as_deref())
