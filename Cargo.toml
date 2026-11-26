@@ -18,6 +18,7 @@ serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.154"
 sha2 = { version = "0.10.9", optional = true }
 streaming-iterator = "0.1.9"
+tempfile = "3.27.0"
 tantivy = { version = "0.27.0", default-features = false, features = ["mmap"], optional = true }
 toml = "1.1.8"
 unicode-normalization = { version = "0.1.24", optional = true }
@@ -52,9 +53,6 @@ tantivy = ["dep:tantivy"]
 # model2vec embeddings, a flat in-process index, `fox vectors setup` to fetch the model.
 # Not in the default build.
 vectors = ["dep:unicode-normalization", "dep:ureq", "dep:sha2"]
-
-[dev-dependencies]
-tempfile = "3.27.0"
 
 [lib]
 name = "foxdb"

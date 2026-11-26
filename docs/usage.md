@@ -251,7 +251,8 @@ claude mcp add --scope user foxdb -- "$HOME/.foxdb/bin/fox" mcp
 
 Hooks. fox-db does not install these; add them to `~/.claude/settings.json` yourself
 (`scripts/install_hook.py` adds the SessionStart one). Every hook is a command hook, fails open
-(prints nothing and exits 0 on any error or after 1.5 s) and uses the `hookSpecificOutput` JSON form.
+(prints nothing and exits 0 on errors or timeouts). Context hooks use the `hookSpecificOutput`
+JSON form and have a 1.5 s deadline. Stop hooks have a 25 s deadline.
 
 ```json
 {"hooks": {
@@ -259,7 +260,7 @@ Hooks. fox-db does not install these; add them to `~/.claude/settings.json` your
     "command": "H=\"$HOME/.foxdb/bin/fox\"; [ -x \"$H\" ] && \"$H\" hook session-start --harness claude; exit 0"}]}],
   "SubagentStart": [{"hooks": [{"type": "command", "timeout": 2,
     "command": "H=\"$HOME/.foxdb/bin/fox\"; [ -x \"$H\" ] && \"$H\" hook subagent-start --harness claude; exit 0"}]}],
-  "SubagentStop": [{"hooks": [{"type": "command", "timeout": 2,
+  "SubagentStop": [{"hooks": [{"type": "command", "timeout": 30,
     "command": "H=\"$HOME/.foxdb/bin/fox\"; [ -x \"$H\" ] && \"$H\" hook subagent-stop --harness claude; exit 0"}]}],
   "PreCompact": [{"hooks": [{"type": "command", "timeout": 2,
     "command": "H=\"$HOME/.foxdb/bin/fox\"; [ -x \"$H\" ] && \"$H\" hook pre-compact --harness claude; exit 0"}]}]
@@ -272,8 +273,8 @@ Hooks. fox-db does not install these; add them to `~/.claude/settings.json` your
   pointer to the parent session's board snapshot (`parent packet h:…`), not the board itself. The
   snapshot is taken once per parent session, so siblings started before and after a board post
   still get byte-identical text and share a cached prefix. The helper is registered as an agent.
-- `subagent-stop`: saves the helper's final message as a `report` handoff row (redacted), marks
-  the agent done and prints nothing.
+- `subagent-stop`: saves the helper's final message as a redacted `report` handoff row and marks
+  the agent done once the stop is accepted. Only the optional stop gate can print a decision.
 - `pre-compact`: saves a handoff packet from the transcript and clears the CLI's "already sent"
   set for `FOXDB_SESSION`. With `--harness claude` it prints four plain lines, which Claude Code
   passes to the compaction summariser as instructions (not as context): keep the `path:line`
@@ -347,10 +348,9 @@ To find or trace code, run `~/.foxdb/bin/fox` first, even when a grep looks quic
 `fox check [--project P] [--no-fresh]` asks one question of the working tree: did the diff update
 every caller of the functions whose signature it changed? It re-indexes the changed files first
 (skip with `--no-fresh`), so callers the diff itself added or moved are seen at their new lines.
-A definition counts as changed when `git diff HEAD` (plus untracked files) touches its signature
-lines, from its first line to the line that opens its body; a body-only edit changes nothing. A
-caller counts as updated when the diff touches its enclosing function, or its own line at file
-top level.
+The check compares parsed signatures against HEAD, including signatures in new files. An edit
+confined to the body does not change the signature. A caller counts as updated when the diff
+touches its enclosing function, or its own line at file top level.
 
 ```
 $ fox check
@@ -366,14 +366,15 @@ same-name definitions get their own list and the existing `guess 1 of N` / `gues
 wording. The exit code is 3 when a certain caller is missed, 0 when every one is in the diff
 (`fox check: ok; all 3 certain callers of the changed definitions are in the diff`), and 1 on an
 error. It reads the tree-sitter index only (no Swift index-store edges yet), runs in the
-checkout the project indexes (not a linked worktree), and does not follow renames or deleted
-definitions: their callers no longer resolve to anything.
+checkout the project indexes. For a renamed or deleted definition, it checks HEAD for calls
+that still exist and lack a certain target in the working tree. With `--no-fresh`, stale
+caller rows are used only when their indexed source can be checked against the working tree or HEAD.
 
 The opt-in Stop gate (`[hooks] stop_check = true`, hook entries in AGENTS-SETUP.md step 6) runs
 the same check from `fox hook stop` and `fox hook subagent-stop`, and blocks the stop once with
 `{"decision": "block", "reason": "<the rows above>"}`. With `stop_hook_active: true` in its
-input it lets the stop through, so it never blocks twice in a row. A SubagentStop it blocks
-saves no report; the next stop saves it.
+input it lets the stop through, so it never blocks twice in a row. SubagentStop saves the report
+before running the check. A retry with the same agent ID updates the report in place.
 
 ## Docs anchored to code
 

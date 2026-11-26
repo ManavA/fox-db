@@ -291,7 +291,7 @@ the hooks work whatever `PATH` Codex sees):
 {"hooks": {
   "SessionStart": [{"hooks": [{"type": "command", "command": "/path/to/home/.foxdb/bin/fox hook session-start --harness codex"}]}],
   "SubagentStart": [{"hooks": [{"type": "command", "command": "/path/to/home/.foxdb/bin/fox hook subagent-start --harness codex"}]}],
-  "SubagentStop": [{"hooks": [{"type": "command", "command": "/path/to/home/.foxdb/bin/fox hook subagent-stop --harness codex"}]}],
+  "SubagentStop": [{"hooks": [{"type": "command", "timeout": 30, "command": "/path/to/home/.foxdb/bin/fox hook subagent-stop --harness codex"}]}],
   "PreCompact": [{"hooks": [{"type": "command", "command": "/path/to/home/.foxdb/bin/fox hook pre-compact --harness codex"}]}]
 }}
 ```

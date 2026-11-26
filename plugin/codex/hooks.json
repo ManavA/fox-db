@@ -7,7 +7,7 @@
       {"hooks": [{"type": "command", "command": "\"$PLUGIN_ROOT/scripts/hook.sh\" subagent-start codex", "timeout": 5}]}
     ],
     "SubagentStop": [
-      {"hooks": [{"type": "command", "command": "\"$PLUGIN_ROOT/scripts/hook.sh\" subagent-stop codex", "timeout": 5}]}
+      {"hooks": [{"type": "command", "command": "\"$PLUGIN_ROOT/scripts/hook.sh\" subagent-stop codex", "timeout": 30}]}
     ],
     "PreCompact": [
       {"hooks": [{"type": "command", "command": "\"$PLUGIN_ROOT/scripts/hook.sh\" pre-compact codex", "timeout": 5}]}

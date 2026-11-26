@@ -234,8 +234,8 @@ fn main() -> ExitCode {
     // Hooks fail open too: read stdin, print the hook JSON or nothing, always exit 0.
     if verb.first() == Some(&"hook") {
         let event = verb.get(1).map(|s| s.to_string()).unwrap_or_default();
-        // The stop gate re-indexes the diff first, so it gets longer than the context hooks.
-        let fallback = if matches!(event.as_str(), "stop" | "subagent-stop") { 30_000 } else { 1500 };
+        // Leave time for the harness to collect the result before its 30 s timeout.
+        let fallback = if matches!(event.as_str(), "stop" | "subagent-stop") { 25_000 } else { 1500 };
         let deadline_ms = std::env::var("FOXDB_BRIEF_DEADLINE_MS").ok().and_then(|v| v.parse().ok()).unwrap_or(fallback);
         let h = hook::Harness::parse(&a.harness);
         let mut input = String::new();

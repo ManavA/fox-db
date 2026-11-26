@@ -28,6 +28,7 @@ pub struct Def {
     pub end_line: u32,
     start: usize,
     end: usize,
+    signature: Option<(std::ops::Range<usize>, i64)>,
     /// Index of the enclosing definition in `Parsed::defs`.
     pub container: Option<usize>,
     /// Explicit container name from a `@container` capture (Go receivers, C++ `A::f`).
@@ -1327,6 +1328,46 @@ fn declares(x: tree_sitter::Node, anc: &[tree_sitter::Node], src: &[u8]) -> bool
     false
 }
 
+impl Def {
+    pub(crate) fn signature<'a>(&self, src: &'a str) -> Option<(&'a str, i64)> {
+        let (range, line) = self.signature.as_ref()?;
+        Some((src.get(range.clone())?.trim_end(), *line))
+    }
+}
+
+fn signature_end(node: tree_sitter::Node, last: tree_sitter::Node) -> Option<usize> {
+    if node.has_error() {
+        return None;
+    }
+    let node = node
+        .child_by_field_name("value")
+        .or_else(|| node.child_by_field_name("right"))
+        .filter(|n| matches!(n.kind(), "arrow_function" | "function_expression" | "function" | "lambda"))
+        .unwrap_or(node);
+    let mut cursor = node.walk();
+    let body = node.child_by_field_name("body").or_else(|| {
+        node.children(&mut cursor).find(|n| matches!(n.kind(), "function_body" | "function_block" | "block" | "compound_statement"))
+    });
+    match body {
+        Some(body) => Some(body.start_byte()),
+        None if last != node && last.start_byte() >= node.end_byte() => Some(last.start_byte()),
+        None if matches!(
+            node.kind(),
+            "declaration"
+                | "field_declaration"
+                | "function_signature"
+                | "function_item"
+                | "function_signature_item"
+                | "method_signature"
+                | "abstract_method_signature"
+        ) =>
+        {
+            Some(node.end_byte())
+        }
+        _ => None,
+    }
+}
+
 /// Parse one file and extract definitions and references.
 pub fn extract(l: &Lang, src: &[u8]) -> Parsed {
     let mut out = Parsed::default();
@@ -1464,7 +1505,14 @@ pub fn extract(l: &Lang, src: &[u8]) -> Parsed {
                 });
                 stat = true;
             }
+            let signature = if is_callable_kind(&kind) || field_fn {
+                let sig_node = outer.map_or(node, |(capture, _)| capture);
+                signature_end(sig_node, last).map(|end| (sig_node.start_byte()..end, sig_node.start_position().row as i64 + 1))
+            } else {
+                None
+            };
             out.defs.push(Def {
+                signature,
                 kind,
                 name,
                 line: nn.start_position().row as u32 + 1,
