@@ -4,16 +4,18 @@ Read these numbers with their conditions. Every run below was taken on a shared 
 
 ## Local models
 
-Headline: fox-db helps small local models most, and strong models little.
+Use a model that can already make tool calls reliably.
 
-- **Small local model.** Inkling-2-Mini (IQ4_NL, llama.cpp, temperature 0) on 6 compiler-oracle
-  caller tasks in a C project, 2 reps each: pass rate 0.42 with bash and grep, 0.75 with the `fox`
+- **Inkling-2-Mini.** This local model (IQ4_NL, llama.cpp, temperature 0) ran 6 compiler-oracle
+  C caller tasks, with 2 reps each. The pass rate was 0.42 with bash and grep, 0.75 with the `fox`
   CLI added (`fox-cli` arm) and 0.83 with a fox packet in the prompt (`packet` arm); F1 rose by
-  0.33. Twelve runs per arm is a small sample: read it as a direction, not a size.
-- **Haiku and Sonnet.** No accuracy gain from fox-db: both find the callers with grep.
+  0.33. The sample was small, with twelve runs per arm.
+- **Haiku and Sonnet.** Haiku showed no meaningful accuracy gain (F1 +0.02). Sonnet
+  showed no accuracy gain.
 - **Kernel impact questions.** Strong models answered them about 5-10% cheaper with fox-db, at
   the same accuracy.
-- **Qwen3-8B.** A replication is pending.
+- **Qwen3-8B Q4.** Scored 0 on every arm (`grep`, `fox-cli`, and `packet`) on 6
+  compiler-oracle C caller tasks.
 
 To reproduce, build the oracle tasks, serve the model, then run the three arms (`grep`, `fox-cli`,
 `packet`; `--harness local` runs all three). Use a scratch `--fox-home`, never your live store.
@@ -96,8 +98,8 @@ fox labelled certain that the compiler says is wrong. Each extra hop halves the 
 localization [9], so depth is the axis to stratify on; RepoReason [10] and CGRizz [11] are related
 work. Details in `bench/oracle/README.md`.
 
-`--harness local` asks whether fox-db helps a small local model, where frontier models already find
-every caller with grep. It drives `bench/local_agent.py`, a one-command-per-turn bash loop after
+`--harness local` measures how fox-db affects a model's caller-task results.
+It drives `bench/local_agent.py`, a one-command-per-turn bash loop after
 SWE-agent [5] and mini-swe-agent [6], against
 an OpenAI-compatible server such as llama.cpp's `llama-server` (`--local-url`, temperature 0), with
 three arms: `grep` (bash only), `fox-cli` (bash plus the `fox` CLI on the scratch store) and

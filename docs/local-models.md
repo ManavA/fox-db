@@ -1,8 +1,11 @@
 # fox-db with local models
 
-fox-db helps small models most: they lose track in long grep output, and a short fox answer with
-`certain` and `guess` labels keeps them on the right code. See
-[benchmarks](benchmarks.md#local-models) for the measured result and its limits.
+In the C caller benchmark, Inkling-2-Mini improved from a 0.42 pass rate with grep
+to 0.75 with the `fox` CLI and 0.83 with a fox packet. Qwen3-8B Q4 scored 0 on all
+three arms across 6 C caller tasks. Haiku showed no meaningful accuracy gain
+(F1 +0.02). See the [benchmark results](benchmarks.md#local-models).
+
+Use a model that can already make tool calls reliably.
 
 Every config below starts the same stdio MCP server: `<home>/.foxdb/bin/fox mcp`. Use the
 absolute path to `fox`; write your own home in place of `/path/to/home`. Index each project first
@@ -126,7 +129,6 @@ Continue also reads a Cline-style JSON file placed in `.continue/mcpServers/`. D
 
 ## Without MCP
 
-Some small models call MCP tools badly but run shell commands well. Then put `fox` on PATH and
-tell the model to use `fox find WORDS`, `fox code NAME --rel callers` and
-`fox code NAME --rel impact`; the benchmark's `fox-cli` arm
+If your model can run shell commands reliably, put `fox` on PATH and tell it to use
+`fox find WORDS`, `fox code NAME --rel callers` and `fox code NAME --rel impact`; the benchmark's `fox-cli` arm
 works this way.
