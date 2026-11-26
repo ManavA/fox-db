@@ -29,18 +29,20 @@ odds of localization (https://arxiv.org/abs/2610.33958).
 ## Fox's own label for each item
 
 At task-build time `oracle.py` asks fox, on the scratch `--fox-home`, the same question:
-`fox code X --rel callers` for depth-1 callers, `--rel refs` minus calls for stores, and
-`--rel impact --depth 2` for depth 2. Every expected item gets `fox`:
+`fox code X --rel callers` for depth-1 callers and `--rel refs` minus calls for stores. For
+depth 2 it asks for X's callers, then for the callers of each one by its handle. A second-hop row
+counts as a guess when its own site or its first hop is a guess. `--rel impact` is not used,
+because it also follows value uses (a callback argument, a vtable field), which the direct-call
+question leaves out. Every expected item gets `fox`:
 
 - `certain`: fox lists it, with at least one site it does not mark as a guess;
 - `guess`: fox lists it only with sites it marks as guesses (name matches it could not resolve);
 - `missing`: fox does not list it.
 
-`fox_extra` lists what fox answers that the oracle says is wrong, with fox's label. `via = true`
-marks an impact row fox reached through a function value (a vtable field, say). Fox does not mark
-those rows as guesses, but they fall outside the direct-call question. Fox rows in code the build
-leaves out (files it does not compile, inactive `#if` branches, cfg'd-off Rust items) are dropped
-from both lists.
+`fox_extra` lists what fox answers that the oracle says is wrong, with fox's label. Fox rows in
+code the build leaves out (files it does not compile, inactive `#if` branches, cfg'd-off Rust
+items) are dropped from both lists. `--relabel` redoes the labels from `oracle.json` with the
+current fox, so a new fox build can be labelled without compiling again.
 
 ## Report
 
@@ -54,7 +56,7 @@ comparison:
   arm's answers name. Compare the two rates to see whether wrong answers come from guess rows;
 - `wrong-certain`: answers that name a wrong item fox labelled certain.
 
-Rows written before depth and answers were recorded can take them from the task files:
+Rows written before depth was recorded can take it, and the labels, from the task files:
 `ab.py report RESULTS.jsonl --tasks c.toml --tasks go.toml`. Without answers the label lines read
 `no answers recorded`. Grading matches names only, so a `fox_extra` row that shares its name
 with an expected item is left out of the counts.

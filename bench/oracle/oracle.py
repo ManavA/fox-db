@@ -27,8 +27,10 @@ the fn item type inferred) are invisible to the oracle.
 With --depth 2 (the default) it also changes every direct caller of each target and builds
 two-hop impact tasks: the direct callers plus their own direct callers, each item tagged with its
 hop. Every expected item records fox's own label for it (certain, guess or missing, from `fox code
---rel callers|refs|impact` on the scratch store), and each task lists in `fox_extra` what fox
-answers that the oracle says is wrong; bench/ab.py report reads both. See bench/oracle/README.md.
+--rel callers|refs` on the scratch store; for depth 2, fox's callers of each of its callers), and
+each task lists in `fox_extra` what fox answers that the oracle says is wrong; bench/ab.py report
+reads both. --relabel redoes the labels and comparison.txt from --out/oracle.json with the
+current fox, without compiling. See bench/oracle/README.md.
 
 Outputs in --out: tasks.toml (callers, stores and impact tasks with `depth` and `expect`), oracle.json (every
 site), comparison.txt (fox callers and non-call refs against the oracle, per kind, plus fox's
@@ -748,17 +750,16 @@ def compare(results, fox, be, files: set, off: dict, config: str, defstat) -> st
 
 # ---------- fox's own labels ----------
 
-def label_items(gold: set, said: list, via: set = frozenset()) -> tuple[dict, list]:
+def label_items(gold: set, said: list) -> tuple[dict, list]:
     """Fox's label for each gold (path, func): `certain` when fox lists it with at least one
     non-guess site, `guess` when only with guesses, else `missing`. `said` holds fox's
-    (path, func, guess) rows; the functions fox lists that are not gold come back as extras,
-    flagged `via` when fox reached them only through a function value."""
+    (path, func, guess) rows; the functions fox lists that are not gold come back as extras."""
     best = {}
     for path, func, guess in said:
         if func != "(top)":
             best[(path, func)] = best.get((path, func), True) and guess
     labels = {k: ("guess" if best[k] else "certain") if k in best else "missing" for k in gold}
-    extra = [{"path": p, "func": f, "fox": "guess" if g else "certain", "via": (p, f) in via}
+    extra = [{"path": p, "func": f, "fox": "guess" if g else "certain"}
              for (p, f), g in sorted(best.items()) if (p, f) not in gold]
     return labels, extra
 
@@ -767,10 +768,30 @@ def _built(path: str, line: int, files: set, off: dict) -> bool:
     return path in files and line not in off.get(path, ())
 
 
-def fox_labels(fox, be, results: list, impacts: list, files: set, off: dict, log=print) -> dict:
-    """task id -> (gold labels, extras) from fox's callers, refs and two-hop impact answers.
-    Fox rows in code the build leaves out are neither gold nor wrong, so they are dropped."""
+def fox_two_hops(root, callers_of, keep) -> list:
+    """Fox's two-hop answer from its own callers answers: the target's caller rows, then the
+    caller rows of each calling function (asked by handle once). A second-hop row is a guess when
+    its own site or the first hop is. `keep(path, line)` drops rows in code the build leaves out."""
+    first = [s for s in root.sites if keep(s.path, s.line)]
+    said = [(s.path, s.who, s.guess) for s in first]
+    hop = {}
+    for s in first:
+        if s.handle and s.who != "(top)":
+            hop[s.handle] = hop.get(s.handle, True) and s.guess
+    for handle, guessed in hop.items():
+        said += [(s.path, s.who, guessed or s.guess) for s in callers_of(handle).sites if keep(s.path, s.line)]
+    return said
+
+
+def fox_labels(fox, be, results: list, impacts: list, files: set, off: dict) -> dict:
+    """task id -> (gold labels, extras) from fox's callers and refs answers; for depth 2, fox's
+    callers of each of its callers. Fox rows in code the build leaves out are neither gold nor
+    wrong, so they are dropped."""
     out = {}
+
+    def keep(path, line):
+        return _built(path, line, files, off)
+
     for r in results:
         fs = fox_sites(fox, be, r)
         other = {(s["path"], s["line"]) for s in r["sites"] if s["kind"] == "other"}
@@ -779,16 +800,12 @@ def fox_labels(fox, be, results: list, impacts: list, files: set, off: dict, log
             if not gold:
                 continue
             said = [(p, who, g) for (p, ln), (who, g) in rows.items()
-                    if _built(p, ln, files, off) and (kind == "call" or (p, ln) not in other)]
+                    if keep(p, ln) and (kind == "call" or (p, ln) not in other)]
             out[f"oracle-{task}-{r['name']}"] = label_items(gold, said)
     for t in impacts:
-        imp = fox.impact(t["name"], 2)
-        if imp.target != f"{t['path']}:{t['line']}":
-            log(f"WARNING: fox impact of {t['name']} resolved {imp.target or 'nothing'}, not {t['path']}:{t['line']}")
-        rows = [x for x in imp.rows if x.depth <= 2 and _built(x.path, x.line, files, off)]
-        out[f"oracle-impact2-{t['name']}"] = label_items(
-            {(h["path"], h["func"]) for h in t["hops"]}, [(x.path, x.who, x.guess) for x in rows],
-            {(x.path, x.who) for x in rows if x.via})
+        said = fox_two_hops(fox.graph(t["name"], "callers"), lambda h: fox.graph(h, "callers"), keep)
+        said = [x for x in said if x[:2] != (t["path"], t["name"])]
+        out[f"oracle-impact2-{t['name']}"] = label_items({(h["path"], h["func"]) for h in t["hops"]}, said)
     return out
 
 
@@ -807,8 +824,8 @@ def _items(gold: list, kind: str, labels: dict | None) -> str:
 
 
 def _extra(extra: list) -> list:
-    return ["fox_extra = [" + ", ".join(f"{{name = {q(e['func'])}, file = {q(e['path'])}, fox = {q(e['fox'])}, "
-                                        f"via = {str(e['via']).lower()}}}" for e in extra) + "]"]
+    return ["fox_extra = [" + ", ".join(f"{{name = {q(e['func'])}, file = {q(e['path'])}, fox = {q(e['fox'])}}}"
+                                        for e in extra) + "]"]
 
 
 def tasks_toml(results, repo: str, config: str, impacts=(), labels: dict | None = None) -> str:
@@ -850,7 +867,7 @@ def tasks_toml(results, repo: str, config: str, impacts=(), labels: dict | None 
                     "directly calls it, and every function that directly calls one of those callers. Count call "
                     "expressions only, including a call written through a macro (name the function where the macro "
                     "is used). Do not follow function pointers, callbacks, tables or interface dispatch. "
-                    f"{where} Answer with one line per function: file path and function name. Do not edit files.",
+                    f"Leave out `{t['name']}` itself. {where} Answer with one line per function: file path and function name. Do not edit files.",
                     [(h["func"], h["path"], h["hop"]) for h in t["hops"]], "call")
     return "\n".join(out)
 
@@ -890,6 +907,8 @@ def main():
     ap.add_argument("--depth", type=int, choices=[1, 2], default=2, help="2 adds two-hop impact tasks")
     ap.add_argument("--depth2-max-callers", type=int, default=10, help="depth 2: most direct callers to follow")
     ap.add_argument("--depth2-max-gold", type=int, default=40, help="depth 2: most functions in one task")
+    ap.add_argument("--relabel", action="store_true",
+                    help="reuse --out/oracle.json: redo fox labels, tasks.toml and comparison.txt only")
     ap.add_argument("--jobs", type=int, default=os.cpu_count() or 4)
     ap.add_argument("--no-index", action="store_true", help="skip `fox index` (store already current)")
     a = ap.parse_args()
@@ -914,28 +933,36 @@ def main():
     fox = foxcli.Fox(a.fox, a.fox_home, str(root))
     if not a.no_index:
         log(fox.index(str(root)).strip())
-    t0 = time.time()
-    base_diags = be.compile()  # also refreshes Rust dep-info
-    base = {d.key() for d in base_diags}
-    log(f"baseline: {len(base_diags)} diagnostics in {time.time() - t0:.0f}s")
+    if a.relabel:
+        old = json.loads((a.out / "oracle.json").read_text())
+    else:
+        t0 = time.time()
+        base_diags = be.compile()  # also refreshes Rust dep-info
+        base = {d.key() for d in base_diags}
+        log(f"baseline: {len(base_diags)} diagnostics in {time.time() - t0:.0f}s")
     files, off = be.inactive()
     log(f"build: {len(files)} files, {sum(len(v) for v in off.values())} lines left out by #if/cfg")
     defs = all_defs(be)
-    if a.targets:
+    if a.relabel:
+        results, impacts = old["targets"], old.get("impacts", [])
+    elif a.targets:
         index = {d.name: (f, d) for f, ds in defs.items() for d in ds}
         picks = ([{"name": nm, "path": index[nm][0], "line": index[nm][1].line, "bare": index[nm][1].bare}
                   for nm in a.targets.split(",")], [])
     else:
         picks = candidates(be, defs, a.min_callers, a.max_callers, a.seed)
         log(f"candidates: {len(picks[0])} named as values too, {len(picks[1])} only called")
-    results = run_oracle(be, picks, a.n, a.min_callers, a.max_callers, base, log)
-    impacts = run_depth2(be, results, base, log, a.depth2_max_callers, a.depth2_max_gold) if a.depth == 2 else []
+    if not a.relabel:
+        results = run_oracle(be, picks, a.n, a.min_callers, a.max_callers, base, log)
+        impacts = run_depth2(be, results, base, log, a.depth2_max_callers, a.depth2_max_gold) if a.depth == 2 else []
     left = leftovers(root, be.exts)
     if left:
         log(f"WARNING: {MARK} left in {left}")
     meta = {"lang": a.lang, "config": config, "commit": head_commit(root), "fox": fox.run("--version").strip()}
+    if a.relabel and old["meta"]["commit"] != meta["commit"]:
+        raise SystemExit(f"--relabel: the repo is at {meta['commit']}, oracle.json at {old['meta']['commit']}")
     (a.out / "oracle.json").write_text(json.dumps({"meta": meta, "targets": results, "impacts": impacts}, indent=1))
-    labels = fox_labels(fox, be, results, impacts, files, off, log)
+    labels = fox_labels(fox, be, results, impacts, files, off)
     (a.out / "tasks.toml").write_text(tasks_toml(results, a.task_repo or str(a.repo), config, impacts, labels))
     defstat = def_misses(be, fox, defs)
     text = compare(results, fox, be, files, off, f"{config}; commit {meta['commit'][:12]}; {meta['fox']}", defstat)
