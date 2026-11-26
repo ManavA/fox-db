@@ -283,6 +283,58 @@ class Stats(unittest.TestCase):
                          (5, 900, "steps", True, "m.gguf", 16384, "x"))
         self.assertEqual(ab.usage_from_local(""), {"parse_error": True})
 
+    def depth_rows(self):
+        out = []
+        for task, depth, gain in (("a", 1, 0.5), ("b", 2, 0.25)):
+            for rep in range(2):
+                for arm, f1, ok in (("fox-cli", 0.5 + gain, True), ("grep", 0.5, False)):
+                    out.append({"task": task, "harness": "local", "foxdb": arm, "rep": rep, "f1": f1, "pass": ok,
+                                "depth": depth})
+        return out
+
+    def test_report_breaks_f1_and_pass_down_by_depth(self):
+        text = ab.report(self.depth_rows(), seed=0, draws=100)
+        lines = {" ".join(ln.split()[:2]): ln for ln in text.splitlines() if ln.split()[:1] == ["depth"]}
+        self.assertIn("tasks 1", lines["depth 1"])
+        self.assertIn("f1 +0.500 [+0.500, +0.500]", lines["depth 1"])
+        self.assertIn("f1 +0.250", lines["depth 2"])
+        self.assertIn("pass +1.00", lines["depth 2"])
+
+    def test_report_takes_depth_from_the_task_file(self):
+        rows = [{k: v for k, v in r.items() if k != "depth"} for r in self.depth_rows()]
+        self.assertNotIn("depth 1", ab.report(rows, seed=0, draws=100))
+        text = ab.report(rows, seed=0, draws=100, tasks={"a": {"id": "a", "depth": 1}, "b": {"id": "b", "depth": 2}})
+        self.assertIn("depth 2", text)
+
+    LABELLED = {"id": "a", "depth": 1,
+                "expect": [{"name": "keep_one", "kind": "call", "fox": "certain"},
+                           {"name": "keep_two", "kind": "call", "fox": "guess"},
+                           {"name": "keep_three", "kind": "call", "fox": "missing"}],
+                "fox_extra": [{"name": "wrong_sure", "fox": "certain"}, {"name": "wrong_guess", "fox": "guess"},
+                              {"name": "wrong_other", "fox": "guess"}, {"name": "keep_one", "fox": "certain"}]}
+
+    def test_fox_rows_split_named_items_by_fox_label(self):
+        got = ab.fox_rows("keep_one in a.c, keep_three, `wrong_sure` and wrong_guess", self.LABELLED)
+        self.assertEqual(got["wrong"], {"certain": [1, 1], "guess": [1, 2]})
+        self.assertEqual(got["gold"], {"certain": [1, 1], "guess": [0, 1], "missing": [1, 1]})
+        self.assertEqual(ab.fox_rows("", {"id": "x", "expect": ["f"]}), None)
+
+    def test_report_counts_wrong_certain_answers(self):
+        rows = [{"task": "a", "harness": "local", "foxdb": arm, "rep": 0, "f1": 0.5, "pass": False, "answer": ans}
+                for arm, ans in (("fox-cli", "keep_one, wrong_sure, wrong_guess"), ("grep", "keep_two wrong_other"))]
+        text = ab.report(rows, seed=0, draws=100, tasks={"a": self.LABELLED})
+        wrong = next(ln for ln in text.splitlines() if "wrong" in ln and ln.split()[:1] == ["depth"])
+        self.assertIn("fox-cli certain 1/1 guess 1/2", wrong)
+        self.assertIn("grep certain 0/1 guess 1/2", wrong)
+        self.assertIn("wrong-certain fox-cli 1 grep 0", text)
+        gold = next(ln for ln in text.splitlines() if "gold" in ln and ln.split()[:1] == ["depth"])
+        self.assertIn("grep certain 0/1 guess 1/1 missing 0/1", gold)
+
+    def test_report_without_answers_says_so(self):
+        rows = [dict(r, task="a") for r in self.depth_rows() if r["task"] == "a"]
+        text = ab.report(rows, seed=0, draws=100, tasks={"a": self.LABELLED})
+        self.assertIn("no answers recorded", text)
+
     def test_report_handles_old_rows(self):
         rows = [{"task": "a", "harness": "codex", "foxdb": arm, "rep": 0, "headroom": "headroom-off",
                  "turns": 3, "pass": None} for arm in ("on", "off")]
