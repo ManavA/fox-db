@@ -24,7 +24,13 @@ the fn item type inferred) are invisible to the oracle.
     python3 bench/oracle/oracle.py rust --repo /scratch/crate --fox-home ... --out ...
     python3 bench/oracle/oracle.py go --repo /scratch/module --fox-home ... --out ...
 
-Outputs in --out: tasks.toml (callers-only and stores tasks with `expect`), oracle.json (every
+With --depth 2 (the default) it also changes every direct caller of each target and builds
+two-hop impact tasks: the direct callers plus their own direct callers, each item tagged with its
+hop. Every expected item records fox's own label for it (certain, guess or missing, from `fox code
+--rel callers|refs|impact` on the scratch store), and each task lists in `fox_extra` what fox
+answers that the oracle says is wrong; bench/ab.py report reads both. See bench/oracle/README.md.
+
+Outputs in --out: tasks.toml (callers, stores and impact tasks with `depth` and `expect`), oracle.json (every
 site), comparison.txt (fox callers and non-call refs against the oracle, per kind, plus fox's
 misses on definitions).
 """
@@ -557,6 +563,78 @@ def run_oracle(be, picks, n: int, lo: int, hi: int, base: set, log) -> list:
     return results
 
 
+# ---------- depth 2: callers of the callers ----------
+
+def hop1_defs(be, r: dict, max_callers: int) -> list:
+    """The definition of each function that calls the target, as run_one targets. Skip when one
+    has no single definition in its file or (Rust) a trait fixes its signature, so a changed
+    parameter list would not break its callers."""
+    callers = sorted({(s["path"], s["func"]) for s in r["sites"] if s["kind"] == "call"})
+    if len(callers) > max_callers:
+        raise Skip(f"{len(callers)} callers, over {max_callers}")
+    out = []
+    for path, func in callers:
+        ds = [d for d in be.defs_in(path) if d.name == func]
+        if len(ds) != 1:
+            raise Skip(f"caller {path} {func}: {len(ds)} definitions")
+        if be.lang == "rust" and ds[0].trait:
+            raise Skip(f"caller {path} {func}: trait method")
+        out.append({"name": func, "path": path, "line": ds[0].line, "bare": ds[0].bare})
+    return out
+
+
+def impact_gold(r: dict, callers: dict) -> list:
+    """Functions within two hops of direct calls of the target, each at its nearest hop.
+    `callers` maps each hop-1 (path, func) to its own oracle sites."""
+    hop = {(s["path"], s["func"]): 1 for s in r["sites"] if s["kind"] == "call"}
+    for sites in callers.values():
+        for s in sites:
+            if s["kind"] == "call":
+                hop.setdefault((s["path"], s["func"]), 2)
+    hop.pop((r["path"], r["name"]), None)
+    return [{"func": f, "path": p, "hop": h} for (p, f), h in sorted(hop.items(), key=lambda kv: (kv[1], kv[0]))]
+
+
+def depth2_skip(hops: list, max_gold: int) -> str | None:
+    if not any(h["hop"] == 2 for h in hops):
+        return "no function two hops out"
+    if len(hops) > max_gold:
+        return f"{len(hops)} functions, over {max_gold}"
+    first = {}
+    for h in hops:
+        if h["func"] in first:
+            return f"{first[h['func']]} and {h['path']} both define {h['func']}; grading by name cannot tell them apart"
+        first[h["func"]] = h["path"]
+    return None
+
+
+def run_depth2(be, results: list, base: set, log, max_callers: int, max_gold: int) -> list:
+    """Two-hop impact ground truth: the oracle on every caller of each depth-1 target."""
+    cache, out = {}, []
+    for r in results:
+        try:
+            defs = hop1_defs(be, r, max_callers)
+            callers = {}
+            for t in defs:
+                k = (t["path"], t["name"])
+                if k not in cache:
+                    cache[k] = run_one(be, t, base, log)
+                if cache[k] is None:
+                    raise Skip(f"caller {t['path']} {t['name']} could not be changed")
+                callers[k] = cache[k]["sites"]
+        except Skip as e:
+            log(f"skip depth 2 {r['name']}: {e}")
+            continue
+        hops = impact_gold(r, callers)
+        why = depth2_skip(hops, max_gold)
+        if why:
+            log(f"skip depth 2 {r['name']}: {why}")
+        else:
+            out.append({k: r[k] for k in ("name", "path", "line", "bare")} | {"hops": hops})
+            log(f"depth 2 {r['name']}: {sum(h['hop'] == 1 for h in hops)} + {sum(h['hop'] == 2 for h in hops)} functions")
+    return out
+
+
 # ---------- fox vs oracle ----------
 
 def fox_sites(fox, be, r) -> dict:
@@ -668,35 +746,112 @@ def compare(results, fox, be, files: set, off: dict, config: str, defstat) -> st
     return "\n".join(out) + "\n"
 
 
+# ---------- fox's own labels ----------
+
+def label_items(gold: set, said: list, via: set = frozenset()) -> tuple[dict, list]:
+    """Fox's label for each gold (path, func): `certain` when fox lists it with at least one
+    non-guess site, `guess` when only with guesses, else `missing`. `said` holds fox's
+    (path, func, guess) rows; the functions fox lists that are not gold come back as extras,
+    flagged `via` when fox reached them only through a function value."""
+    best = {}
+    for path, func, guess in said:
+        if func != "(top)":
+            best[(path, func)] = best.get((path, func), True) and guess
+    labels = {k: ("guess" if best[k] else "certain") if k in best else "missing" for k in gold}
+    extra = [{"path": p, "func": f, "fox": "guess" if g else "certain", "via": (p, f) in via}
+             for (p, f), g in sorted(best.items()) if (p, f) not in gold]
+    return labels, extra
+
+
+def _built(path: str, line: int, files: set, off: dict) -> bool:
+    return path in files and line not in off.get(path, ())
+
+
+def fox_labels(fox, be, results: list, impacts: list, files: set, off: dict, log=print) -> dict:
+    """task id -> (gold labels, extras) from fox's callers, refs and two-hop impact answers.
+    Fox rows in code the build leaves out are neither gold nor wrong, so they are dropped."""
+    out = {}
+    for r in results:
+        fs = fox_sites(fox, be, r)
+        other = {(s["path"], s["line"]) for s in r["sites"] if s["kind"] == "other"}
+        for kind, task, rows in (("call", "callers", fs["calls"]), ("store", "stores", fs["values"])):
+            gold = {(s["path"], s["func"]) for s in r["sites"] if s["kind"] == kind}
+            if not gold:
+                continue
+            said = [(p, who, g) for (p, ln), (who, g) in rows.items()
+                    if _built(p, ln, files, off) and (kind == "call" or (p, ln) not in other)]
+            out[f"oracle-{task}-{r['name']}"] = label_items(gold, said)
+    for t in impacts:
+        imp = fox.impact(t["name"], 2)
+        if imp.target != f"{t['path']}:{t['line']}":
+            log(f"WARNING: fox impact of {t['name']} resolved {imp.target or 'nothing'}, not {t['path']}:{t['line']}")
+        rows = [x for x in imp.rows if x.depth <= 2 and _built(x.path, x.line, files, off)]
+        out[f"oracle-impact2-{t['name']}"] = label_items(
+            {(h["path"], h["func"]) for h in t["hops"]}, [(x.path, x.who, x.guess) for x in rows],
+            {(x.path, x.who) for x in rows if x.via})
+    return out
+
+
 # ---------- tasks ----------
 
 def q(s: str) -> str:
     return json.dumps(s, ensure_ascii=False)
 
 
-def tasks_toml(results, repo: str, config: str) -> str:
+def _items(gold: list, kind: str, labels: dict | None) -> str:
+    """gold: (func, path, hop) triples."""
+    def one(n, p, h):
+        fox = f", fox = {q(labels.get((p, n), 'missing'))}" if labels is not None else ""
+        return f"{{name = {q(n)}, file = {q(p)}, kind = {q(kind)}, hop = {h}{fox}}}"
+    return "expect = [" + ", ".join(one(*g) for g in gold) + "]"
+
+
+def _extra(extra: list) -> list:
+    return ["fox_extra = [" + ", ".join(f"{{name = {q(e['func'])}, file = {q(e['path'])}, fox = {q(e['fox'])}, "
+                                        f"via = {str(e['via']).lower()}}}" for e in extra) + "]"]
+
+
+def tasks_toml(results, repo: str, config: str, impacts=(), labels: dict | None = None) -> str:
+    """Depth-1 callers and stores tasks, then depth-2 impact tasks. With `labels` (fox_labels),
+    each expected item carries fox's label and each task lists fox's other answers in fox_extra."""
     where = f"Only code compiled in this build counts ({config}); ignore code the build does not compile."
-    out = [f"# Compiler-oracle tasks generated by bench/oracle/oracle.py. {where}", f"repo = {q(repo)}", ""]
+    out = [f"# Compiler-oracle tasks generated by bench/oracle/oracle.py. {where}",
+           "# depth: hops of direct calls from the target; hop: each item's nearest hop; fox: fox's own label",
+           "# for the item (certain, guess, missing); fox_extra: what fox answers that the oracle says is wrong.",
+           f"repo = {q(repo)}", ""]
+
+    def task(tid, depth, prompt, gold, kind):
+        lab = labels.get(tid) if labels is not None else None
+        return (["[[task]]", f"id = {q(tid)}", f"depth = {depth}", "prompt = " + q(prompt),
+                 _items(gold, kind, lab[0] if lab else None)] + (_extra(lab[1]) if lab else []) + [""])
+
     for r in results:
-        calls = sorted({(s["func"], s["path"]) for s in r["sites"] if s["kind"] == "call"})
-        stores = sorted({(s["func"], s["path"]) for s in r["sites"] if s["kind"] == "store"})
+        calls = sorted({(s["func"], s["path"], 1) for s in r["sites"] if s["kind"] == "call"})
+        stores = sorted({(s["func"], s["path"], 1) for s in r["sites"] if s["kind"] == "store"})
         at = f"`{r['name']}` (defined at {r['path']}:{r['line']})"
         if calls:
-            out += ["[[task]]", f"id = {q('oracle-callers-' + r['name'])}",
-                    "prompt = " + q(f"List every function in this repo that directly calls {at}. Count call expressions only, "
-                                    "including a call written through a macro (name the function where the macro is used). "
-                                    "Do not count places that store it in a function pointer, pass it as a callback, or put it "
-                                    f"in a table. {where} Answer with one line per caller: file path and function name. "
-                                    "Do not edit files."),
-                    "expect = [" + ", ".join(f"{{name = {q(n)}, file = {q(p)}, kind = \"call\"}}" for n, p in calls) + "]", ""]
+            out += task("oracle-callers-" + r["name"], 1,
+                        f"List every function in this repo that directly calls {at}. Count call expressions only, "
+                        "including a call written through a macro (name the function where the macro is used). "
+                        "Do not count places that store it in a function pointer, pass it as a callback, or put it "
+                        f"in a table. {where} Answer with one line per caller: file path and function name. "
+                        "Do not edit files.", calls, "call")
         if stores:
-            out += ["[[task]]", f"id = {q('oracle-stores-' + r['name'])}",
-                    "prompt = " + q(f"List every place in this repo that uses {at} as a value without calling it: stores it "
-                                    "in a variable or struct field, puts it in a table initializer, passes it as a callback "
-                                    "argument, or returns it. Direct calls do not count. Name the enclosing function, or the "
-                                    f"variable for a file-scope initializer. {where} Answer with one line per place: file path "
-                                    "and function or variable name. Do not edit files."),
-                    "expect = [" + ", ".join(f"{{name = {q(n)}, file = {q(p)}, kind = \"store\"}}" for n, p in stores) + "]", ""]
+            out += task("oracle-stores-" + r["name"], 1,
+                        f"List every place in this repo that uses {at} as a value without calling it: stores it "
+                        "in a variable or struct field, puts it in a table initializer, passes it as a callback "
+                        "argument, or returns it. Direct calls do not count. Name the enclosing function, or the "
+                        f"variable for a file-scope initializer. {where} Answer with one line per place: file path "
+                        "and function or variable name. Do not edit files.", stores, "store")
+    for t in impacts:
+        at = f"`{t['name']}` (defined at {t['path']}:{t['line']})"
+        out += task("oracle-impact2-" + t["name"], 2,
+                    f"List every function in this repo within two hops of direct calls of {at}: every function that "
+                    "directly calls it, and every function that directly calls one of those callers. Count call "
+                    "expressions only, including a call written through a macro (name the function where the macro "
+                    "is used). Do not follow function pointers, callbacks, tables or interface dispatch. "
+                    f"{where} Answer with one line per function: file path and function name. Do not edit files.",
+                    [(h["func"], h["path"], h["hop"]) for h in t["hops"]], "call")
     return "\n".join(out)
 
 
@@ -732,6 +887,9 @@ def main():
     ap.add_argument("--seed", type=int, default=1)
     ap.add_argument("--min-callers", type=int, default=3)
     ap.add_argument("--max-callers", type=int, default=40)
+    ap.add_argument("--depth", type=int, choices=[1, 2], default=2, help="2 adds two-hop impact tasks")
+    ap.add_argument("--depth2-max-callers", type=int, default=10, help="depth 2: most direct callers to follow")
+    ap.add_argument("--depth2-max-gold", type=int, default=40, help="depth 2: most functions in one task")
     ap.add_argument("--jobs", type=int, default=os.cpu_count() or 4)
     ap.add_argument("--no-index", action="store_true", help="skip `fox index` (store already current)")
     a = ap.parse_args()
@@ -771,12 +929,14 @@ def main():
         picks = candidates(be, defs, a.min_callers, a.max_callers, a.seed)
         log(f"candidates: {len(picks[0])} named as values too, {len(picks[1])} only called")
     results = run_oracle(be, picks, a.n, a.min_callers, a.max_callers, base, log)
+    impacts = run_depth2(be, results, base, log, a.depth2_max_callers, a.depth2_max_gold) if a.depth == 2 else []
     left = leftovers(root, be.exts)
     if left:
         log(f"WARNING: {MARK} left in {left}")
     meta = {"lang": a.lang, "config": config, "commit": head_commit(root), "fox": fox.run("--version").strip()}
-    (a.out / "oracle.json").write_text(json.dumps({"meta": meta, "targets": results}, indent=1))
-    (a.out / "tasks.toml").write_text(tasks_toml(results, a.task_repo or str(a.repo), config))
+    (a.out / "oracle.json").write_text(json.dumps({"meta": meta, "targets": results, "impacts": impacts}, indent=1))
+    labels = fox_labels(fox, be, results, impacts, files, off, log)
+    (a.out / "tasks.toml").write_text(tasks_toml(results, a.task_repo or str(a.repo), config, impacts, labels))
     defstat = def_misses(be, fox, defs)
     text = compare(results, fox, be, files, off, f"{config}; commit {meta['commit'][:12]}; {meta['fox']}", defstat)
     (a.out / "comparison.txt").write_text(text)

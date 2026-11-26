@@ -9,6 +9,8 @@ HEAD = re.compile(r"^(callers|refs) of (\S+) (\S+) (.+?)\s+(\S+):(\d+)\s*$")
 ROW = re.compile(r"^  :(?P<lines>\d+(?:,\d+)*) (?P<who>.+?)(?: \| .*)?$")
 WHO = re.compile(r"^(?P<name>\(top\)|\S+?)(?: c:[0-9a-f]+)?(?P<guess> guess.*)?$")
 CUT = re.compile(r"^\+\d+ more \(answer cut\) · cursor=(\d+)\s*$", re.M)
+IMPACT_HEAD = re.compile(r"^impact of (\S+) (\S+) (.+?)\s+(\S+):(\d+):")
+IMPACT_ROW = re.compile(r"^  :(?P<line>\d+) (?P<who>\(top\)|\S+)(?P<rest>[^|]*)")
 OUTLINE = re.compile(r"^(?P<ind> *)(?P<line>\d+) (?P<kind>\S+) (?P<name>.+?) c:[0-9a-f]+(?: \.\.(?P<end>\d+))?\s*$")
 
 
@@ -55,6 +57,9 @@ class Fox:
     def graph(self, sym: str, rel: str) -> Graph:
         return parse_graph(self.code_all(sym, "--rel", rel))
 
+    def impact(self, sym: str, depth: int) -> "Impact":
+        return parse_impact(self.code_all(sym, "--rel", "impact", "--depth", str(depth)))
+
     def outline(self, path: str) -> list:
         return parse_outline(self.code_all(path, "--rel", "outline"))
 
@@ -90,6 +95,47 @@ def parse_graph(text: str) -> Graph:
         if raw.endswith("/") and not raw.startswith(" "):
             cur_dir = raw
     return Graph(target, sites, text)
+
+
+@dataclass
+class ImpactRow:
+    depth: int
+    path: str
+    line: int  # line of the definition fox lists
+    who: str
+    guess: bool
+    via: bool  # reached through a function value (pointer, vtable, interface), not a call of the name
+
+
+@dataclass
+class Impact:
+    target: str
+    rows: list
+    raw: str
+
+
+def parse_impact(text: str) -> Impact:
+    """Rows of `fox code X --rel impact --depth N`, grouped under `dK` and file lines."""
+    target, rows, depth, path = "", [], 0, None
+    for raw in text.splitlines():
+        m = IMPACT_HEAD.match(raw)
+        if m:
+            target = f"{m[4]}:{m[5]}"
+            continue
+        if re.fullmatch(r"d\d+", raw):
+            depth = int(raw[1:])
+            continue
+        if not depth:
+            continue
+        if not raw.startswith(" "):
+            break
+        m = IMPACT_ROW.match(raw)
+        if m and path:
+            rest = m["rest"]
+            rows.append(ImpactRow(depth, path, int(m["line"]), m["who"], " guess" in rest, " via " in rest))
+        elif raw.startswith(" ") and not raw.startswith("  "):
+            path = raw.strip()
+    return Impact(target, rows, text)
 
 
 @dataclass

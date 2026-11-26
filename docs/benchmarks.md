@@ -52,6 +52,12 @@ turns, cache reads and writes, scores, the headroom and store modes, seed, model
 fox binary sha256 and git commits. `bench/ab.py report RESULTS.jsonl` prints paired on-off
 differences per task and overall with bootstrap 95% CIs [7], pass^k (the chance that all k
 repeats pass, estimated as in τ-bench [1]) and p90 cost [3], one block per run.
+Compiler-oracle tasks (`bench/oracle/`) record a hop `depth` (1 for direct callers, 2 for callers
+of callers) and fox's own label for each expected item (certain, guess or missing). On those tasks
+the report adds F1 and pass differences per depth and a wrong-certain count: answers naming an item
+fox labelled certain that the compiler says is wrong. Each extra hop halves the odds of
+localization [9], so depth is the axis to stratify on; RepoReason [10] and CGRizz [11] are related
+work. Details in `bench/oracle/README.md`.
 
 `--harness local` asks whether fox-db helps a small local model, where frontier models already find
 every caller with grep. It drives `bench/local_agent.py`, a one-command-per-turn bash loop after
@@ -342,3 +348,6 @@ the SWE-bench guest lecture (real-repository tasks).
 6. mini-swe-agent. https://github.com/SWE-agent/mini-swe-agent
 7. Efron, B. (1979). Bootstrap Methods: Another Look at the Jackknife. The Annals of Statistics 7(1). https://doi.org/10.1214/aos/1176344552
 8. Grace, M., Hadfield, J., Olivares, R., De Jonghe, J. (2026). Demystifying evals for AI agents. Anthropic. https://www.anthropic.com/engineering/demystifying-evals-for-ai-agents
+9. arXiv:2610.33958. https://arxiv.org/abs/2610.33958
+10. RepoReason. arXiv:2601.03731. https://arxiv.org/abs/2601.03731
+11. CGRizz. arXiv:2611.29745. https://arxiv.org/abs/2611.29745

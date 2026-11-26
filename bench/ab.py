@@ -50,6 +50,11 @@ and an oracle padded with 50 decoys (precision must fall below 0.5), and runs no
 
     ab.py report RESULTS.jsonl     paired on-off differences per task and overall, bootstrap CIs,
                                    pass^k and p90 cost, one block per run (seed, model, harness version)
+    ab.py report RESULTS.jsonl --tasks TASKS.toml
+                                   also per hop depth (F1 and pass differences) and, for tasks whose items
+                                   carry fox's label, gold found and wrong answers named per label and the
+                                   wrong-certain count (bench/oracle/README.md); --tasks supplies depth and
+                                   labels, rows supply the answer
 
 --harness local runs bench/local_agent.py against an OpenAI-compatible server (--local-url, e.g.
 llama.cpp llama-server) with three arms instead of on/off: grep (bash only), fox-cli (bash plus the
@@ -494,41 +499,119 @@ def comparisons(arms: set) -> list:
     return [(x, base) for x in sorted(arms) if x != base]
 
 
-def report(rows: list, seed: int = 0, draws: int = 10000) -> str:
+LABELS = ("certain", "guess", "missing")
+
+
+def fox_rows(answer: str, task: dict) -> dict | None:
+    """Per fox label, [named, offered] for the gold items (`expect` rows with a `fox` label) and for
+    `fox_extra` (what fox answers that the oracle says is wrong). An extra whose name a gold item
+    shares cannot be told apart by name and is left out. None when the task has no fox labels."""
+    items = [it for it in task.get("expect", []) if isinstance(it, dict) and "fox" in it]
+    if not items:
+        return None
+    gold = {it["name"] for it in items}
+    extra = [e for e in task.get("fox_extra", []) if e["name"] not in gold]
+    uni = gold | {e["name"] for e in extra} | set(task.get("universe", []))
+    toks = named_tokens(answer)
+    named = {n for n in uni if any(hits(t, n, uni) for t in toks)}
+    out = {"gold": {}, "wrong": {}}
+    for part, rows in (("gold", items), ("wrong", extra)):
+        for r in rows:
+            c = out[part].setdefault(r["fox"], [0, 0])
+            c[0] += r["name"] in named
+            c[1] += 1
+    return out
+
+
+def _depth(row: dict, tasks: dict):
+    d = row.get("depth")
+    return d if d is not None else tasks.get(row["task"], {}).get("depth")
+
+
+def _counts(counts: dict, labels) -> str:
+    return " ".join(f"{k} {counts[k][0]}/{counts[k][1]}" for k in labels if k in counts)
+
+
+def _label_lines(depth, by_task: dict, tasks: dict, arms: tuple) -> list:
+    """Gold found and wrong answers named, per fox label, summed over each arm's rows."""
+    tot = {arm: {"gold": {}, "wrong": {}} for arm in arms}
+    seen = {arm: 0 for arm in arms}
+    labelled = False
+    for tid, by_arm in by_task.items():
+        if tid not in tasks:
+            continue
+        for arm in arms:
+            for r in by_arm.get(arm, {}).values():
+                if "answer" not in r:
+                    labelled = labelled or fox_rows("", tasks[tid]) is not None
+                    continue
+                got = fox_rows(r["answer"] or "", tasks[tid])
+                if got is None:
+                    continue
+                seen[arm] += 1
+                for part in ("gold", "wrong"):
+                    for k, (n, m) in got[part].items():
+                        c = tot[arm][part].setdefault(k, [0, 0])
+                        c[0] += n
+                        c[1] += m
+    tag = f"depth {depth}"
+    if not any(seen.values()):
+        return [f"  {tag} fox labels: no answers recorded"] if labelled else []
+    on = [arm for arm in arms if seen[arm]]
+    return [f"  {tag} gold found, by fox label · " + " · ".join(f"{arm} {_counts(tot[arm]['gold'], LABELS)}" for arm in on),
+            f"  {tag} wrong answers fox also gave, named/offered by fox label · "
+            + " · ".join(f"{arm} {_counts(tot[arm]['wrong'], LABELS[:2])}" for arm in on),
+            f"  {tag} wrong-certain " + " ".join(f"{arm} {tot[arm]['wrong'].get('certain', [0, 0])[0]}" for arm in on)
+            + f" (answers over {', '.join(f'{seen[arm]} {arm}' for arm in on)} rows)"]
+
+
+def report(rows: list, seed: int = 0, draws: int = 10000, tasks: dict | None = None) -> str:
+    tasks = tasks or {}
     groups = defaultdict(lambda: defaultdict(lambda: defaultdict(dict)))
+    depths = {}
     for r in rows:
         key = (r["harness"], r.get("headroom", "unknown"), r.get("store", "unknown"), str(r.get("seed", "unknown")),
                r.get("model_requested", r.get("model")) or "unknown", r.get("harness_version") or "unknown")
         groups[key][r["task"]][r["foxdb"]][r.get("rep", 0)] = r
+        if _depth(r, tasks) is not None:
+            depths[r["task"]] = _depth(r, tasks)
     lines = ["differences are on minus off (local harness: each arm minus grep); brackets are bootstrap 95% CIs"
-             " (per task over reps, overall over tasks)"]
-    for (h, hr, store, seed_, model, ver), tasks in sorted(groups.items()):
-        for x, b in comparisons({arm for t in tasks.values() for arm in t}):
+             " (per task over reps, overall and per depth over tasks); depth = hops of direct calls from the target"]
+    for (h, hr, store, seed_, model, ver), by_task in sorted(groups.items()):
+        for x, b in comparisons({arm for t in by_task.values() for arm in t}):
             label = "" if (x, b) == ("on", "off") else f" · {x} minus {b}"
             lines.append(f"\n{h} · {hr} · store {store} · seed {seed_} · model {model} · {ver}{label}")
-            task_means = defaultdict(list)
-            judged = []
-            for tid, arms in sorted(tasks.items()):
+            task_means = defaultdict(dict)
+            judged = {}
+            for tid, arms in sorted(by_task.items()):
                 reps = sorted(set(arms[x]) & set(arms[b]))
                 parts = [f"{tid:<24} n {len(reps)}"]
                 for name, key, fmt in METRICS:
                     xs = [_num(arms[x][i], key) - _num(arms[b][i], key) for i in reps
                           if _num(arms[x][i], key) is not None and _num(arms[b][i], key) is not None]
                     if xs:
-                        task_means[name].append(sum(xs) / len(xs))
+                        task_means[name][tid] = sum(xs) / len(xs)
                     parts.append(_diff_text(name, fmt, xs, seed, draws))
                 passes = {arm: [r["pass"] for r in arms[arm].values() if isinstance(r.get("pass"), bool)]
                           for arm in (x, b)}
                 if passes[x] and passes[b]:
-                    judged.append(passes)
+                    judged[tid] = passes
                     parts.append(_pass_text([passes], x, b))
                 parts.append(_p90_text({arm: list(arms[arm].values()) for arm in (x, b)}, x, b))
                 lines.append("  ".join(p for p in parts if p))
-            parts = [f"{'ALL':<24} tasks {len(tasks)}"]
-            parts += [_diff_text(name, fmt, task_means[name], seed, draws) for name, _, fmt in METRICS]
-            parts.append(_pass_text(judged, x, b))
-            parts.append(_p90_text({arm: [r for t in tasks.values() for r in t[arm].values()] for arm in (x, b)}, x, b))
+            parts = [f"{'ALL':<24} tasks {len(by_task)}"]
+            parts += [_diff_text(name, fmt, list(task_means[name].values()), seed, draws) for name, _, fmt in METRICS]
+            parts.append(_pass_text(list(judged.values()), x, b))
+            parts.append(_p90_text({arm: [r for t in by_task.values() for r in t[arm].values()] for arm in (x, b)}, x, b))
             lines.append("  ".join(p for p in parts if p))
+            for d in sorted({depths[t] for t in by_task if t in depths}):
+                mine = [t for t in by_task if depths.get(t) == d]
+                parts = [f"depth {d:<18} tasks {len(mine)}"]
+                parts += [_diff_text(name, fmt, [task_means[name][t] for t in mine if t in task_means[name]], seed,
+                                     draws) for name, _, fmt in METRICS if name in ("f1", "pass")]
+                parts.append(_pass_text([judged[t] for t in mine if t in judged], x, b))
+                lines.append("  ".join(p for p in parts if p))
+                lines += _label_lines(d, {t: by_task[t] for t in mine}, tasks, (x, b))
     return "\n".join(lines)
 
 
@@ -563,9 +646,12 @@ def report_main(argv: list) -> int:
     ap.add_argument("results", type=Path)
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--draws", type=int, default=10000)
+    ap.add_argument("--tasks", type=Path, action="append", default=[],
+                    help="task file(s) giving depth and fox labels, for rows that do not carry them")
     a = ap.parse_args(argv)
     rows = [json.loads(ln) for ln in a.results.read_text().splitlines() if ln.strip()]
-    print(report(rows, a.seed, a.draws))
+    tasks = {t["id"]: t for f in a.tasks for t in tomllib.loads(f.read_text()).get("task", [])}
+    print(report(rows, a.seed, a.draws, tasks))
     return 0
 
 
@@ -669,9 +755,9 @@ def main(argv: list | None = None) -> int:
             u = usage_from_local(p.stdout)
         ans = u.pop("answer", "") or ""
         model = u.pop("model", None) or a.model or "default"
-        row = {"task": t["id"], "harness": h, "foxdb": arm, "rep": rep, "slot": slot, "headroom": mode,
+        row = {"task": t["id"], "depth": t.get("depth"), "harness": h, "foxdb": arm, "rep": rep, "slot": slot, "headroom": mode,
                "exit": p.returncode, "secs": round(secs, 1), **u, **grade(ans, t, universe), "model": model,
-               "harness_version": versions.get(h), **prov}
+               "harness_version": versions.get(h), "answer": ans, **prov}
         out.write(json.dumps(row) + "\n")
         out.flush()
         print(json.dumps(row))
