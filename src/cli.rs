@@ -37,6 +37,8 @@ multi-agent:
   fox handoff create [--goal G] [--state S] [--next N] [--question Q] [--parent h:ID] [--agent A] [--transcript PATH]
   fox handoff render h:ID [--for claude|codex|t3|plain] [--budget TOKENS]     fox handoff take h:ID [--by A] [--lease SECS]
   fox swarm run <plan.toml> [--no-wait] [--timeout SECS]    fox swarm status <swarm>
+  fox crew up <plan.toml|N> [--harness claude|codex] [--backend herdr|tmux] [--model M]   native sessions in worktrees and panes
+  fox crew ls | attach <name> | down [<name>] [--prune]
   fox switch --to codex|claude|--for t3 [--from H] [--handoff h:ID] [--agent A] [--session ID] [--transcript PATH] [--inline] [--exec]
   fox mem post <text> [--topic T]          fox mem read --since me|h:ID [--topic T]   (me: new to $FOXDB_AGENT)";
 
@@ -664,6 +666,12 @@ pub fn swarm(a: &Args, _cwd: &Path) -> anyhow::Result<String> {
         }
         _ => anyhow::bail!("usage: fox swarm run <plan.toml> [--no-wait] [--timeout SECS] | fox swarm status <swarm>"),
     }
+}
+
+/// `fox crew up|ls|attach|down`: native interactive sessions, one per worktree and pane (crew.rs).
+pub fn crew(a: &Args, cwd: &Path) -> anyhow::Result<String> {
+    let backend = a.opt.get("backend").map(String::as_str);
+    crate::crew::run(&a.pos, &a.harness, backend, a.opt.get("model").map(String::as_str), cwd)
 }
 
 /// `fox swarm run`.

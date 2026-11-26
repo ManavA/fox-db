@@ -358,7 +358,7 @@ pub fn live(c: &Connection) -> Result<String> {
 
 /// The lease key for a directory: its project root.
 pub fn repo_key(dir: &Path) -> String {
-    project::locate(dir).root.to_string_lossy().into_owned()
+    project::locate(dir).repo_root().to_string_lossy().into_owned()
 }
 
 /// A lease holder is live while its process, or (for a dispatched writer) its harness child, runs.

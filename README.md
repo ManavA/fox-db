@@ -248,6 +248,7 @@ Measured trade-offs and open targets, and the agent A/B harness [9]-[13]: [docs/
 - [docs/usage.md](docs/usage.md): CLI and MCP reference, configuration, supported languages, hooks
 - [docs/multi-agent.md](docs/multi-agent.md): board, packets, dispatch, wait, switching
 - [docs/swarm.md](docs/swarm.md): many workers from one plan, with a review panel
+- [docs/crew.md](docs/crew.md): native interactive Claude Code and Codex sessions, one per worktree, in herdr or tmux panes
 - [docs/t3code.md](docs/t3code.md): fox-db under T3 Code
 - [docs/architecture.md](docs/architecture.md): storage, search pipeline, daemon, caching, and why not Postgres, a graph database or Qdrant yet
 - [docs/search-quality.md](docs/search-quality.md): the search backend seam and the retrieval eval
