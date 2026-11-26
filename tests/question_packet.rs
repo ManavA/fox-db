@@ -228,3 +228,39 @@ fn full_spaced_location_beats_the_overlapping_suffix() {
     let out = packet(&p, "Who calls `helper` at src/with spaces/tool.c:1?", 800);
     assert!(out.lines().any(|l| l.starts_with("def ") && l.contains("src/with spaces/tool.c:1")), "{out}");
 }
+
+#[test]
+fn review_packet_wrong_line_does_not_select_a_definition() {
+    let _g = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    let (_home, _repo, p) =
+        inline_project(&[("a.c", "static int helper(void) { return 1; }\n"), ("b.c", "static int helper(void) { return 2; }\n")]);
+    let out = packet(&p, "Who calls `helper` at a.c:99?", 800);
+    assert!(out.contains("ambiguous: helper") && !out.contains("== helper"), "{out}");
+}
+
+#[test]
+fn review_packet_resolves_method_with_source_extension() {
+    let _g = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    let (_home, _repo, p) = inline_project(&[("a.go", "package example\ntype A struct{}\nfunc (A) c() {}\n")]);
+    let out = packet(&p, "Who calls `A.c`?", 800);
+    assert!(out.contains("== A.c") && out.contains("a.go:3"), "{out}");
+}
+
+#[test]
+fn review_packet_handle_respects_project_ownership() {
+    let _g = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    let (_home, _repo, owner) = inline_project(CHAIN);
+    let mut c = db::open_rw().unwrap();
+    let leaf = foxdb::tscode::resolve(&c, owner.id, "leaf").unwrap().remove(0);
+    let caller_repo = tempfile::tempdir().unwrap();
+    std::fs::write(caller_repo.path().join("other.c"), "int other(void) { return 0; }\n").unwrap();
+    let caller = project::ensure(&c, &project::locate(caller_repo.path())).unwrap();
+    inventory::index_project(&mut c, &caller).unwrap();
+    tsindex::index_project(&mut c, &caller).unwrap();
+    assert_ne!(caller.id, owner.id);
+    let q = format!("Who calls `{}`?", leaf.h());
+    assert!(packet(&owner, &q, 800).contains("lib/core.c:1"));
+    let out = qpacket::run(&c, &caller, &q, 800).unwrap();
+    assert!(out.starts_with("no name in the question resolves"), "{out}");
+    assert!(!out.contains("lib/core.c") && !out.contains(" mid c:"), "{out}");
+}

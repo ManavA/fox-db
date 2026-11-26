@@ -12,7 +12,7 @@ use crate::project::Project;
 use crate::query::{self, FindOpts, clip};
 use anyhow::Result;
 use regex::Regex;
-use rusqlite::Connection;
+use rusqlite::{Connection, OptionalExtension};
 use std::sync::LazyLock;
 
 /// Default packet budget in tokens (about 4 characters each).
@@ -35,16 +35,26 @@ static CODE_NAME: LazyLock<Regex> = LazyLock::new(|| {
 });
 static PATH_HINT: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"`([^`]+):(\d+)`|`([^`]+)`:(\d+)|([\w./-]+\.\w+):(\d+)").unwrap());
 
-/// A source file name (`diff.c`, `src/a.rs`) is a path, not a symbol.
-fn is_path(s: &str) -> bool {
-    s.contains('/') || crate::lang::for_path(s).is_some()
+fn location_captures(question: &str) -> impl Iterator<Item = regex::Captures<'_>> {
+    // A quoted handle such as `c:4` also fits the quoted path:line pattern.
+    PATH_HINT.captures_iter(question).filter(|m| m.get(1).is_none_or(|path| !matches!(path.as_str(), "c" | "s")))
+}
+
+/// Whether the token looks like a source file.
+fn looks_like_source_file(s: &str) -> bool {
+    crate::lang::for_path(s).is_some()
 }
 
 /// Candidate symbol names in the question, in order: backticked names, `a::b` and `a.b` paths,
 /// snake_case and camelCase words.
 pub fn names(question: &str) -> Vec<Name> {
     let mut out: Vec<Name> = vec![];
+    let locations: Vec<_> = location_captures(question).filter_map(|m| m.get(0)).collect();
     for m in CODE_NAME.captures_iter(question) {
+        let span = m.get(0).unwrap();
+        if locations.iter().any(|loc| loc.start() < span.end() && span.start() < loc.end()) {
+            continue;
+        }
         let (raw, explicit) = match (m.get(1), m.get(2)) {
             (Some(b), _) => (b.as_str(), true),
             (_, Some(w)) => (w.as_str(), w.as_str().contains("::") || w.as_str().contains('.')),
@@ -53,7 +63,12 @@ pub fn names(question: &str) -> Vec<Name> {
         let text = raw.trim_end_matches("()").trim_matches(|c: char| ".,;:()".contains(c));
         // `e.g` and `i.e` are prose.
         let prose = m.get(1).is_none() && matches!(text, "e.g" | "i.e" | "a.m" | "p.m");
-        if text.is_empty() || prose || is_path(text) || !text.chars().all(|c| c.is_alphanumeric() || "_:.".contains(c)) {
+        if text.is_empty()
+            || prose
+            || text.contains('/')
+            || (m.get(1).is_none() && looks_like_source_file(text))
+            || !text.chars().all(|c| c.is_alphanumeric() || "_:.".contains(c))
+        {
             continue;
         }
         if !out.iter().any(|n| n.text == text) {
@@ -65,8 +80,7 @@ pub fn names(question: &str) -> Vec<Name> {
 
 /// `path:line` mentions in the question (`defined at diff.c:360`).
 fn hints(question: &str, candidates: &[Target]) -> Vec<(String, i64)> {
-    PATH_HINT
-        .captures_iter(question)
+    location_captures(question)
         .filter_map(|m| {
             let (path, line) = [(1, 2), (3, 4), (5, 6)].into_iter().find_map(|(p, l)| Some((m.get(p)?, m.get(l)?)))?;
             let mut full_path = path.as_str().trim_start_matches("./");
@@ -100,9 +114,24 @@ enum Resolution {
     Missing,
 }
 
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+enum LocationMatch {
+    ExactLine,
+    SuffixLine,
+    WrongLine,
+    NoMatch,
+}
+
 /// A location hint can break a tie among indexed definitions.
 fn resolve(c: &Connection, p: &Project, name: &str, question: &str) -> Result<Resolution> {
     let q = name.replace("::", ".");
+    if let Some((prefix, hex)) = q.split_once(':')
+        && matches!(prefix, "c" | "s")
+        && let Ok(id) = i64::from_str_radix(hex, 16)
+        && c.query_row("SELECT project_id FROM node WHERE id = ?1", [id], |row| row.get::<_, i64>(0)).optional()? != Some(p.id)
+    {
+        return Ok(Resolution::Missing);
+    }
     let mut cands: Vec<Target> = vec![];
     if crate::swiftimport::has_symbols(c, p.id) {
         // The graph resolver only checks the final qualifier component. Check the whole name
@@ -137,24 +166,40 @@ fn resolve(c: &Connection, p: &Project, name: &str, question: &str) -> Result<Re
     }
     let hints = hints(question, &cands);
     let in_file = |t: &Target, f: &str| t.path == f || t.path.ends_with(&format!("/{f}"));
+    let hints: Vec<_> = hints
+        .into_iter()
+        .map(|(file, line)| {
+            let exact = cands.iter().any(|t| t.path == file);
+            (file, line, exact)
+        })
+        .collect();
     let fit = |t: &Target| {
-        if hints.iter().any(|(f, l)| t.path == *f && t.line == *l) {
-            0
-        } else if hints.iter().any(|(f, l)| in_file(t, f) && t.line == *l) {
-            1
-        } else if hints.iter().any(|(f, _)| t.path == *f) {
-            2
-        } else if hints.iter().any(|(f, _)| in_file(t, f)) {
-            3
-        } else {
-            4
-        }
+        hints
+            .iter()
+            .map(|(file, line, exact)| {
+                if t.path != *file && (*exact || !in_file(t, file)) {
+                    LocationMatch::NoMatch
+                } else if t.line != *line {
+                    LocationMatch::WrongLine
+                } else if *exact {
+                    LocationMatch::ExactLine
+                } else {
+                    LocationMatch::SuffixLine
+                }
+            })
+            .min()
+            .unwrap_or(LocationMatch::NoMatch)
     };
-    cands.sort_by_key(fit);
-    if cands.len() > 1 && fit(&cands[0]) == fit(&cands[1]) {
+    let mut ranked: Vec<_> = cands.into_iter().map(|t| (fit(&t), t)).collect();
+    ranked.sort_unstable_by_key(|(rank, _)| *rank);
+    let mut ranked = ranked.into_iter();
+    let Some((best, target)) = ranked.next() else {
+        return Ok(Resolution::Missing);
+    };
+    if best == LocationMatch::WrongLine || ranked.next().is_some_and(|(second, _)| second == best) {
         return Ok(Resolution::Ambiguous);
     }
-    Ok(cands.into_iter().next().map_or(Resolution::Missing, Resolution::Unique))
+    Ok(Resolution::Unique(target))
 }
 
 /// What a line of a `fox code` answer is, for trimming.
@@ -367,7 +412,7 @@ fn file_heading(l: &str) -> Option<&str> {
     {
         return Some(f);
     }
-    (l.starts_with(' ') && is_path(t)).then_some(t)
+    (l.starts_with(' ') && (t.contains('/') || looks_like_source_file(t))).then_some(t)
 }
 
 /// Characters kept for the note saying what the trim left out.
@@ -477,7 +522,7 @@ pub fn run(c: &Connection, p: &Project, question: &str, budget: usize) -> Result
         match resolve(c, p, &n.text, question)? {
             Resolution::Unique(t) if !targets.iter().any(|(_, x)| x.handle == t.handle) => targets.push((n.text, t)),
             Resolution::Ambiguous => ambiguous.push(n.text),
-            Resolution::Missing if n.explicit => missing.push(n.text),
+            Resolution::Missing if n.explicit && !looks_like_source_file(&n.text) => missing.push(n.text),
             _ => {}
         }
     }
@@ -567,11 +612,11 @@ mod tests {
 
     #[test]
     fn names_come_from_backticks_paths_and_code_words() {
-        let got: Vec<String> = names("Who calls `set_helper_option` (defined at transport-helper.c:331), db::open_ro, Graph.walk and getUser? See `diff.c`, e.g. A plain word stays out; so does x.")
+        let got: Vec<String> = names("Who calls `set_helper_option` (defined at transport-helper.c:331), db::open_ro, Graph.walk and getUser? See `diff.c`, `c:4`, `s:8`, e.g. A plain word stays out; so does x.")
             .into_iter()
             .map(|n| n.text)
             .collect();
-        assert_eq!(got, ["set_helper_option", "db::open_ro", "Graph.walk", "getUser"]);
+        assert_eq!(got, ["set_helper_option", "db::open_ro", "Graph.walk", "getUser", "diff.c", "c:4", "s:8"]);
         assert_eq!(
             hints("defined at transport-helper.c:331 and ./src/a.rs:9", &[]),
             [("transport-helper.c".into(), 331), ("src/a.rs".into(), 9)]
