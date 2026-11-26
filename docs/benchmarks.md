@@ -2,6 +2,43 @@
 
 Read these numbers with their conditions. Every run below was taken on a shared development host, not a quiet machine, and the conditions are given with each table. Targets that are not yet met are listed as open, not as passed.
 
+## Local models
+
+Headline: fox-db helps small local models most, and strong models little.
+
+- **Small local model.** Inkling-2-Mini (IQ4_NL, llama.cpp, temperature 0) on 6 compiler-oracle
+  caller tasks in a C project, 2 reps each: pass rate 0.42 with bash and grep, 0.75 with the `fox`
+  CLI added (`fox-cli` arm) and 0.83 with a fox packet in the prompt (`packet` arm); F1 rose by
+  0.33. Twelve runs per arm is a small sample: read it as a direction, not a size.
+- **Haiku and Sonnet.** No accuracy gain from fox-db: both find the callers with grep.
+- **Kernel impact questions.** Strong models answered them about 5-10% cheaper with fox-db, at
+  the same accuracy.
+- **Qwen3-8B.** A replication is pending.
+
+To reproduce, build the oracle tasks, serve the model, then run the three arms (`grep`, `fox-cli`,
+`packet`; `--harness local` runs all three). Use a scratch `--fox-home`, never your live store.
+
+```sh
+# 1. Tasks from the compiler (C: record the build's compile commands once).
+make -j CC=$PWD/bench/oracle/cc_log.py ORACLE_COMPDB=/scratch/compdb.jsonl ORACLE_REAL_CC=gcc
+python3 bench/oracle/oracle.py c --repo /scratch/repo --compdb /scratch/compdb.jsonl \
+    --fox-home /scratch/foxhome --out bench/private/oracle/repo --config "default make, gcc, Linux"
+
+# 2. The model behind an OpenAI-compatible endpoint (bench/local_agent.py talks to it).
+llama-server -m Inkling-2-Mini-IQ4_NL.gguf -c 16384 --fit on -ub 16 -b 16 --jinja -np 1 \
+    --temp 0 --port 18431
+
+# 3. The A/B run and its report.
+python3 bench/ab.py bench/private/oracle/repo/tasks.toml --harness local \
+    --local-url http://127.0.0.1:18431 --seed 7 --repeat 2 --out local.jsonl --run
+python3 bench/ab.py report local.jsonl
+```
+
+Without `--run`, `ab.py` prints the commands it would run. `bench/local_agent.py` can also run one
+task by hand (`--prompt`, `--arm`, `--cwd`, `--scratch`, `--url`). On llama.cpp b12627 the default
+micro-batch broke Inkling-2-Mini, hence `-ub 16 -b 16`. Client setup for Ollama and llama.cpp is in
+[local-models.md](local-models.md).
+
 ## Status of the targets
 
 | Target | Status |

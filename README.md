@@ -1,14 +1,27 @@
 # fox-db
 
-fox-db is a local code graph and index for coding agents. One SQLite db 
-holds every project you work in: files, directories, Markdown doc
-sections, milestone logs, Claude Code memory notes, code symbols and their call graph
-(Swift from Xcode's index store, 18 more languages through built-in tree-sitter [1]). Agents
-reach it through a small CLI (`fox`), an optional daemon (`foxd`) and an MCP server with four
-tools, and get short, budgeted answers that end in `path:line` instead of reading whole files.
-It also keeps a handoff board, so several agents in Claude Code, Codex, opencode or T3 Code
-can share findings, hand work over and run as a supervised swarm. Everything stays on your
-machine; nothing is written into your repositories.
+A local code graph that makes small models find the right code, and tells any agent when an
+answer is proven or a guess.
+
+- **Four tools, one binary.** `fox` is the CLI and an MCP server with four tools; `foxd` is an
+  optional daemon.
+- **No cloud, no language servers.** One SQLite db on your machine indexes code (Swift from
+  Xcode's index store, 18 more languages through built-in tree-sitter [1]), Markdown docs,
+  milestone logs and agent memory. Nothing is written into your repositories.
+- **Certain or guess.** Call graph rows say whether a link is resolved or name-guessed
+  (`guess 1 of N`), so an agent knows when to check.
+- **Short answers.** Budgeted rows that end in `path:line`, not whole files.
+
+What it buys you depends on the model. A small local model gains the most: on 6 compiler-checked
+C caller tasks (2 reps each, a small sample), Inkling-2-Mini passed 0.42 with grep alone, 0.75
+with the `fox` CLI and 0.83 with a pre-built fox packet (F1 up 0.33). Strong models that already
+grep well gain little: kernel impact questions cost about 5-10% less, and Haiku and Sonnet showed
+no accuracy gain. Details and the reproduce commands are in
+[docs/benchmarks.md](docs/benchmarks.md); setup for OpenCode, Goose, Cline and Continue with
+Ollama or llama.cpp is in [docs/local-models.md](docs/local-models.md).
+
+It also keeps a handoff board for several agents; see
+[Multi-agent work](#multi-agent-work) below.
 
 **AI agents:** to set fox-db up, read [AGENTS-SETUP.md](AGENTS-SETUP.md).
 
@@ -47,7 +60,6 @@ the tools and hooks run twice.
 - **Search**: ranked search over symbols, files, doc sections, milestones and memory in milliseconds; plain questions also search doc comments and function bodies.
 - **Call graph**: callers, callees, references, overrides, conformances and transitive impact of a change, plus outlines and source of one symbol. Name-guessed links are labelled `guess 1 of N`.
 - **Docs, milestones and memory**: Markdown sections and milestone logs as searchable rows, Claude Code memory notes, read-only digests of past Claude Code and Codex sessions, and `fox drift` / `fox pack` for docs that cite code.
-- **Multi-agent handoff and orchestration**: a shared board, handoff packets, leased takes, writer leases, `fox dispatch` / `fox wait` for Codex and Claude workers, `fox switch` across harnesses, and `fox swarm` for a whole plan with dependencies and a review panel ([docs/swarm.md](docs/swarm.md)). Works under [T3 Code](docs/t3code.md) too.
 - **Token sparing**: answers are budgeted rows with handles instead of file dumps, repeated reads come back as one-line references, and every hook output is capped and stable so it stays in the prompt cache.
 - **Scales up when you need it**: shared stores of many projects, trees the size of Kubernetes and Linux, and three opt-in extras that change nothing until you turn them on (see Scaling).
 
@@ -242,9 +254,19 @@ Three opt-in extras change nothing until you turn them on:
 Measured trade-offs and open targets, and the agent A/B harness [9]-[13]: [docs/benchmarks.md](docs/benchmarks.md),
 [docs/architecture.md](docs/architecture.md).
 
+## Multi-agent work
+
+fox-db keeps a handoff board, so several agents in Claude Code, Codex, opencode or T3 Code can
+share findings, hand work over and run as a supervised swarm: a shared board, handoff packets,
+leased takes, writer leases, `fox dispatch` / `fox wait` for Codex and Claude workers, `fox switch`
+across harnesses, and `fox swarm` for a whole plan with dependencies and a review panel
+([docs/swarm.md](docs/swarm.md)). Works under [T3 Code](docs/t3code.md) too; see
+[docs/multi-agent.md](docs/multi-agent.md).
+
 ## Docs
 
 - [AGENTS-SETUP.md](AGENTS-SETUP.md): full setup for every harness, verification, uninstall, and an agent cheat-sheet
+- [docs/local-models.md](docs/local-models.md): fox-db with Ollama or llama.cpp in OpenCode, Goose, Cline and Continue
 - [docs/usage.md](docs/usage.md): CLI and MCP reference, configuration, supported languages, hooks
 - [docs/multi-agent.md](docs/multi-agent.md): board, packets, dispatch, wait, switching
 - [docs/swarm.md](docs/swarm.md): many workers from one plan, with a review panel
