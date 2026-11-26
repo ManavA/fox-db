@@ -1,0 +1,12 @@
+{
+  "$schema": "https://static.modelcontextprotocol.io/schemas/2025-12-11/server.schema.json",
+  "name": "io.github.ManavA/fox-db",
+  "title": "fox-db",
+  "description": "Search local code and docs, trace callers, and see which call graph links are guesses.",
+  "repository": {
+    "url": "https://github.com/ManavA/fox-db",
+    "source": "github"
+  },
+  "websiteUrl": "https://github.com/ManavA/fox-db/blob/main/docs/registries.md",
+  "version": "0.2.6"
+}
