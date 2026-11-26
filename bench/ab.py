@@ -548,7 +548,7 @@ def _depth(row: dict, tasks: dict):
 
 
 def _counts(counts: dict, labels) -> str:
-    return " ".join(f"{k} {counts[k][0]}/{counts[k][1]}" for k in labels if k in counts)
+    return " ".join(f"{k} {counts[k][0]}/{counts[k][1]}" for k in labels if k in counts) or "none offered"
 
 
 def _label_lines(depth, by_task: dict, tasks: dict, arms: tuple) -> list:
@@ -624,7 +624,7 @@ def report(rows: list, seed: int = 0, draws: int = 10000, tasks: dict | None = N
             parts.append(_p90_text({arm: [r for t in by_task.values() for r in t[arm].values()] for arm in (x, b)}, x, b))
             lines.append("  ".join(p for p in parts if p))
             for d in sorted({depths[t] for t in by_task if t in depths}):
-                mine = [t for t in by_task if depths.get(t) == d]
+                mine = sorted(t for t in by_task if depths.get(t) == d)
                 parts = [f"depth {d:<18} tasks {len(mine)}"]
                 parts += [_diff_text(name, fmt, [task_means[name][t] for t in mine if t in task_means[name]], seed,
                                      draws) for name, _, fmt in METRICS if name in ("f1", "pass")]

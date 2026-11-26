@@ -11,38 +11,40 @@ import oracle  # noqa: E402
 import scan  # noqa: E402
 from oracle import Skip  # noqa: E402
 
-IMPACT = """22 lines name `opt`: 21 uses (d1), 1 definition
-impact of ~c:8357 function opt  th.c:331: 5 symbols, 1 files at top level; per depth 3/2
-d1
- th.c
-  :371 standard_options c:8358 | :376 opt(t, "progress");
-  :720 fetch_refs c:8368 guess 1 of 5 | :760 opt(transport, "cloning");
-  :1346 (top) | .set_option	= opt,
- transport.c
-  :1319 transport_set_option c:83dd via transport_vtable.set_option | int transport_set_option(
-d2
- builtin/clone.c
-  :917 cmd_clone c:1c97 guess (via a guessed caller) | int cmd_clone(int argc,
-unresolved mentions:
-th.c:9 guessed elsewhere | opt()
-~ tree-sitter, name-resolved
-"""
-
-
 def site(path, line, func, kind="call"):
     return {"path": path, "line": line, "kind": kind, "func": func, "msg": "", "code": ""}
 
 
-class Impact(unittest.TestCase):
-    def test_rows_carry_depth_guess_and_pointer_hops(self):
-        g = foxcli.parse_impact(IMPACT)
-        self.assertEqual(g.target, "th.c:331")
-        self.assertEqual([(r.depth, r.path, r.line, r.who, r.guess, r.via) for r in g.rows], [
-            (1, "th.c", 371, "standard_options", False, False),
-            (1, "th.c", 720, "fetch_refs", True, False),
-            (1, "th.c", 1346, "(top)", False, False),
-            (1, "transport.c", 1319, "transport_set_option", False, True),
-            (2, "builtin/clone.c", 917, "cmd_clone", True, False)])
+class CallerRows(unittest.TestCase):
+    def test_rows_keep_the_handle_and_drop_a_via_macro_tail(self):
+        g = foxcli.parse_graph(
+            "callers of ~c:1 function x  a.c:5\n2 call sites in 1 files\na.c (2)\n"
+            "  :12 add_one c:265b via macro wrap\n  :20 two c:2f guess 1 of 5 | x();\n~ tree-sitter\n")
+        self.assertEqual([(s.who, s.handle, s.guess) for s in g.sites],
+                         [("add_one", "c:265b", False), ("two", "c:2f", True)])
+
+
+def graph(*rows):
+    return foxcli.Graph("", [foxcli.Site(*r) for r in rows], "")
+
+
+class TwoHops(unittest.TestCase):
+    def test_callers_of_callers_inherit_a_guessed_first_hop(self):
+        root = graph(("a.c", 3, "f", False, "c:f"), ("a.c", 4, "f", False, "c:f"), ("b.c", 9, "g", True, "c:g"),
+                     ("z.c", 1, "off", False, "c:off"), ("a.c", 7, "(top)", False, ""))
+        callers = {"c:f": graph(("c.c", 2, "h", False, "c:h")),
+                   "c:g": graph(("c.c", 5, "h", False, "c:h"), ("d.c", 1, "m", False, "c:m")),
+                   "c:off": graph(("e.c", 1, "never", False, "c:n"))}
+        asked = []
+
+        def ask(handle):
+            asked.append(handle)
+            return callers[handle]
+
+        said = oracle.fox_two_hops(root, ask, lambda p, ln: p != "z.c")
+        self.assertEqual(asked, ["c:f", "c:g"])
+        self.assertEqual(said, [("a.c", "f", False), ("a.c", "f", False), ("b.c", "g", True), ("a.c", "(top)", False),
+                                ("c.c", "h", False), ("c.c", "h", True), ("d.c", "m", True)])
 
 
 class Labels(unittest.TestCase):
@@ -50,11 +52,10 @@ class Labels(unittest.TestCase):
         gold = {("a.c", "f"), ("a.c", "g"), ("b.c", "h")}
         said = [("a.c", "f", True), ("a.c", "f", False), ("a.c", "g", True), ("c.c", "x", False),
                 ("c.c", "y", True), ("d.c", "z", False)]
-        labels, extra = oracle.label_items(gold, said, via={("d.c", "z")})
+        labels, extra = oracle.label_items(gold, said)
         self.assertEqual(labels, {("a.c", "f"): "certain", ("a.c", "g"): "guess", ("b.c", "h"): "missing"})
-        self.assertEqual(extra, [{"path": "c.c", "func": "x", "fox": "certain", "via": False},
-                                 {"path": "c.c", "func": "y", "fox": "guess", "via": False},
-                                 {"path": "d.c", "func": "z", "fox": "certain", "via": True}])
+        self.assertEqual(extra, [{"path": "c.c", "func": "x", "fox": "certain"}, {"path": "c.c", "func": "y", "fox": "guess"},
+                                 {"path": "d.c", "func": "z", "fox": "certain"}])
 
     def test_top_level_rows_are_not_functions(self):
         labels, extra = oracle.label_items(set(), [("a.c", "(top)", False)])
@@ -121,7 +122,7 @@ class Tasks(unittest.TestCase):
         imp = {"name": "t", "path": "a.c", "line": 1, "bare": "t",
                "hops": [{"func": "f", "path": "a.c", "hop": 1}, {"func": "h", "path": "c.c", "hop": 2}]}
         labels = {"oracle-callers-t": ({("a.c", "f"): "certain", ("b.c", "g"): "guess"},
-                                       [{"path": "z.c", "func": "zz", "fox": "certain", "via": False}]),
+                                       [{"path": "z.c", "func": "zz", "fox": "certain"}]),
                   "oracle-impact2-t": ({("a.c", "f"): "certain", ("c.c", "h"): "missing"}, [])}
         spec = tomllib.loads(oracle.tasks_toml([r], "~/src/x", "cfg", [imp], labels))
         by = {t["id"]: t for t in spec["task"]}
@@ -130,11 +131,12 @@ class Tasks(unittest.TestCase):
         self.assertEqual(by["oracle-callers-t"]["expect"], [
             {"name": "f", "file": "a.c", "kind": "call", "hop": 1, "fox": "certain"},
             {"name": "g", "file": "b.c", "kind": "call", "hop": 1, "fox": "guess"}])
-        self.assertEqual(by["oracle-callers-t"]["fox_extra"], [{"name": "zz", "file": "z.c", "fox": "certain", "via": False}])
+        self.assertEqual(by["oracle-callers-t"]["fox_extra"], [{"name": "zz", "file": "z.c", "fox": "certain"}])
         self.assertEqual(by["oracle-impact2-t"]["expect"], [
             {"name": "f", "file": "a.c", "kind": "call", "hop": 1, "fox": "certain"},
             {"name": "h", "file": "c.c", "kind": "call", "hop": 2, "fox": "missing"}])
         self.assertIn("calls one of those callers", by["oracle-impact2-t"]["prompt"])
+        self.assertIn("Leave out `t` itself.", by["oracle-impact2-t"]["prompt"])
         self.assertNotIn("fox", by["oracle-stores-t"]["expect"][0])
 
 

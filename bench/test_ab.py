@@ -330,6 +330,14 @@ class Stats(unittest.TestCase):
         gold = next(ln for ln in text.splitlines() if "gold" in ln and ln.split()[:1] == ["depth"])
         self.assertIn("grep certain 0/1 guess 1/1 missing 0/1", gold)
 
+    def test_report_says_when_fox_offered_nothing_wrong(self):
+        clean = {k: v for k, v in self.LABELLED.items() if k != "fox_extra"}
+        rows = [{"task": "a", "harness": "local", "foxdb": arm, "rep": 0, "f1": 1.0, "pass": True, "answer": "keep_one"}
+                for arm in ("fox-cli", "grep")]
+        wrong = next(ln for ln in ab.report(rows, seed=0, draws=100, tasks={"a": clean}).splitlines()
+                     if "wrong answers" in ln)
+        self.assertIn("fox-cli none offered · grep none offered", wrong)
+
     def test_report_without_answers_says_so(self):
         rows = [dict(r, task="a") for r in self.depth_rows() if r["task"] == "a"]
         text = ab.report(rows, seed=0, draws=100, tasks={"a": self.LABELLED})
