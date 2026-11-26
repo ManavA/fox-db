@@ -92,7 +92,8 @@ herdr plugin action invoke foxdb.crew.new-fox-session
   `HERDR_PLUGIN_CONTEXT_JSON` and starts one bare session there (`fox crew up 1 --backend herdr`).
 - The event runs `fox crew herdr worktree-created`. It reads the worktree path from
   `HERDR_PLUGIN_EVENT_JSON` and runs `fox index` on it, so worktrees you make with
-  `herdr worktree create` are indexed too.
+  `herdr worktree create` are indexed too. The hook stops the index command and reports
+  an error if it exceeds five seconds.
 
 Both commands need `fox` on the PATH that herdr's server inherits.
 

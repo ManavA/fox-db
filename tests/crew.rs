@@ -35,7 +35,8 @@ case "$1" in
     p=$(echo "$4" | tr -d %)
     [ -f "$SHIM_LOG/pane-$p" ] || { echo "can't find pane: $4" >&2; exit 1; }
     case "$5" in
-      *pane_start_path*) cat "$SHIM_LOG/pane-$p" ;;
+      *window_name*) cat "$SHIM_LOG/pane-$p" ;;
+      *pane_start_path*) printf '%s\t' "$4"; cut -f1,3- "$SHIM_LOG/pane-$p" ;;
       *) echo "live claude" ;;
     esac ;;
   kill-pane)
@@ -89,11 +90,10 @@ fn setup(shims: &[(&str, &str)]) -> Env {
     e
 }
 
-fn fox(e: &Env, args: &[&str]) -> (i32, String) {
+fn fox_command(e: &Env, binary: impl AsRef<std::ffi::OsStr>) -> Command {
     let path = format!("{}:/usr/bin:/bin", e.bin.path().display());
-    let o = Command::new(FOX)
-        .args(args)
-        .current_dir(e.repo.path())
+    let mut cmd = Command::new(binary);
+    cmd.current_dir(e.repo.path())
         .env("PATH", path)
         .env("HOME", e.home.path())
         .env("FOXDB_HOME", e.home.path().join("fx"))
@@ -110,9 +110,16 @@ fn fox(e: &Env, args: &[&str]) -> (i32, String) {
         .env_remove("FOXDB_CLAUDE_BIN")
         .env_remove("FOXDB_CODEX_BIN")
         .env_remove("HERDR_BIN_PATH")
-        .env_remove("TMUX")
-        .output()
-        .unwrap();
+        .env_remove("TMUX");
+    cmd
+}
+
+fn fox(e: &Env, args: &[&str]) -> (i32, String) {
+    fox_output(fox_command(e, FOX).args(args))
+}
+
+fn fox_output(cmd: &mut Command) -> (i32, String) {
+    let o = cmd.output().unwrap();
     (o.status.code().unwrap_or(-1), format!("{}{}", String::from_utf8_lossy(&o.stdout), String::from_utf8_lossy(&o.stderr)))
 }
 
@@ -323,4 +330,155 @@ fn herdr_plugin_manifest_declares_the_action_and_the_event() {
     let events = m["events"].as_array().unwrap();
     assert_eq!(events[0]["on"].as_str(), Some("worktree.created"));
     assert_eq!(cmd(&events[0]), ["fox", "crew", "herdr", "worktree-created"]);
+}
+
+#[test]
+fn open_herdr_pane_keeps_an_idle_writers_lease() {
+    let herdr = HERDR.replace(
+        r#""pane get")"#,
+        r#""pane get")
+          [ ! -f "$SHIM_LOG/backend-unavailable" ] || { echo 'connection failed' >&2; exit 1; }
+          [ ! -f "$SHIM_LOG/pane-gone" ] || { echo '{"error":{"code":"pane_not_found"}}' >&2; exit 1; };"#,
+    );
+    let e = setup(&[("herdr", &herdr)]);
+    fs::write(e.repo.path().join("plan.toml"), "[[session]]\nname = \"api\"\nwriter = true\n").unwrap();
+    let (c, out) = fox(&e, &["crew", "up", "plan.toml"]);
+    assert_eq!(c, 0, "{out}");
+
+    let expired = |args: &[&str]| fox_output(fox_command(&e, FOX).args(args).env("FOXDB_STALE_SECS", "-1"));
+    let (c, out) = expired(&["lease", "list"]);
+    assert_eq!(c, 0, "{out}");
+    assert!(out.contains("writer cl-1"), "{out}");
+    let (c, out) = expired(&["lease", "take", "--agent", "challenger"]);
+    assert_ne!(c, 0, "{out}");
+    assert!(out.contains("held by cl-1"), "{out}");
+
+    let unavailable = e.log.path().join("backend-unavailable");
+    fs::write(&unavailable, "").unwrap();
+    let (c, out) = expired(&["crew", "ls"]);
+    assert_eq!(c, 0, "{out}");
+    assert!(out.contains("herdr w7:p1 unknown"), "{out}");
+    let (c, out) = expired(&["lease", "list"]);
+    assert_eq!(c, 0, "{out}");
+    assert!(out.contains("writer cl-1") && out.contains("(unverified)"), "{out}");
+    fs::remove_file(unavailable).unwrap();
+
+    let (c, out) = expired(&["crew", "ls"]);
+    assert_eq!(c, 0, "{out}");
+    assert!(out.contains("herdr w7:p1 idle") && out.contains("writer running"), "{out}");
+
+    fs::write(e.log.path().join("pane-gone"), "").unwrap();
+    let (c, out) = expired(&["lease", "list"]);
+    assert_eq!(c, 0, "{out}");
+    assert_eq!(out, "no writer leases\n");
+}
+
+#[test]
+fn tmux_window_title_can_change_while_the_pane_stays_owned() {
+    let e = setup(&[("tmux", TMUX)]);
+    let (c, out) = fox(&e, &["crew", "up", "1", "--backend", "tmux"]);
+    assert_eq!(c, 0, "{out}");
+
+    let pane = e.log.path().join("pane-0");
+    let identity = fs::read_to_string(&pane).unwrap().replace("\ts1\t", "\trenamed\t");
+    fs::write(pane, identity).unwrap();
+    let (c, out) = fox(&e, &["crew", "ls"]);
+    assert_eq!(c, 0, "{out}");
+    assert!(out.contains("tmux %0 live claude"), "{out}");
+    let (c, out) = fox(&e, &["crew", "down", "s1"]);
+    assert_eq!(c, 0, "{out}");
+    assert!(out.contains("pane closed"), "{out}");
+}
+
+#[test]
+fn herdr_index_hook_prefers_worktree_cwd_to_workspace_path() {
+    let e = setup(&[]);
+    let ev = serde_json::json!({
+        "event": "worktree.created",
+        "workspace": { "path": e.home.path() },
+        "worktree": { "cwd": e.repo.path() }
+    });
+    let (c, out) =
+        fox_output(fox_command(&e, FOX).args(["crew", "herdr", "worktree-created"]).env("HERDR_PLUGIN_EVENT_JSON", ev.to_string()));
+    assert_eq!(c, 0, "{out}");
+    assert_eq!(out.trim(), format!("indexed {}", e.repo.path().display()));
+    let (_, out) = fox(&e, &["status"]);
+    assert!(out.contains("indexed ") && !out.contains("not indexed"), "{out}");
+}
+
+#[test]
+fn herdr_index_hook_has_a_deadline() {
+    use std::time::{Duration, Instant};
+
+    let e = setup(&[("fox", "#!/bin/sh\nsleep 8\n")]);
+    let hook = e.bin.path().join("hook");
+    fs::hard_link(FOX, &hook).or_else(|_| fs::copy(FOX, &hook).map(|_| ())).unwrap();
+    let ev = serde_json::json!({ "worktree": { "path": e.repo.path() } });
+    let start = Instant::now();
+    let (c, out) =
+        fox_output(fox_command(&e, hook).args(["crew", "herdr", "worktree-created"]).env("HERDR_PLUGIN_EVENT_JSON", ev.to_string()));
+    assert!(start.elapsed() < Duration::from_secs(7), "{out}");
+    assert_ne!(c, 0, "{out}");
+    assert!(out.contains("timed out"), "{out}");
+}
+
+#[test]
+fn launch_failure_keeps_the_prompt_out_of_diagnostics() {
+    let herdr = HERDR.replace(
+        r#""pane get")"#,
+        r#""pane run") printf 'mock refused to submit: %s\n' "$4" >&2; exit 1 ;;
+"pane get")"#,
+    );
+    let tmux = TMUX.replace(
+        "new-session|new-window)",
+        r#"new-session|new-window) printf 'mock refused to start: %s\n' "$@" >&2; exit 1 ;;
+unused)"#,
+    );
+    for (backend, shim) in [("herdr", &herdr), ("tmux", &tmux)] {
+        let e = setup(&[(backend, shim)]);
+        fs::write(e.repo.path().join("plan.toml"), PLAN).unwrap();
+        let (c, out) = fox(&e, &["crew", "up", "plan.toml", "--backend", backend]);
+        assert_ne!(c, 0, "{out}");
+        assert!(out.contains(backend) && out.contains("failed"), "{out}");
+        assert!(!out.contains("Add a /health route"), "{out}");
+    }
+}
+
+#[test]
+fn lease_take_checks_a_crew_pane_without_holding_a_database_write_lock() {
+    use std::process::Stdio;
+    use std::time::{Duration, Instant};
+
+    let herdr = HERDR.replace(
+        r#""pane get")"#,
+        r#""pane get")
+          touch "$SHIM_LOG/probing"
+          while [ ! -f "$SHIM_LOG/reply" ]; do sleep 0.02; done;"#,
+    );
+    let e = setup(&[("herdr", &herdr)]);
+    fs::write(e.repo.path().join("plan.toml"), "[[session]]\nname = \"api\"\nwriter = true\n").unwrap();
+    let (c, out) = fox(&e, &["crew", "up", "plan.toml"]);
+    assert_eq!(c, 0, "{out}");
+
+    let child = fox_command(&e, FOX)
+        .args(["lease", "take", "--agent", "challenger"])
+        .env("FOXDB_STALE_SECS", "-1")
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let start = Instant::now();
+    while !e.log.path().join("probing").exists() && start.elapsed() < Duration::from_secs(2) {
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    assert!(e.log.path().join("probing").exists(), "the lease take did not query its incumbent's pane");
+
+    let db = rusqlite::Connection::open(e.home.path().join("fx/fox.db")).unwrap();
+    db.busy_timeout(Duration::from_millis(200)).unwrap();
+    let write = db.execute("UPDATE agent SET task = 'unrelated write' WHERE id = 'challenger'", []);
+    fs::write(e.log.path().join("reply"), "").unwrap();
+    let out = child.wait_with_output().unwrap();
+    assert!(!out.status.success());
+    assert!(String::from_utf8_lossy(&out.stderr).contains("held by cl-1"));
+    assert_eq!(write.unwrap(), 1);
 }

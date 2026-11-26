@@ -34,8 +34,11 @@ use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::fmt::Write as _;
+use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, Output, Stdio};
+use std::sync::mpsc;
+use std::time::Duration;
 
 /// The tmux session that holds every crew window.
 pub const TMUX_SESSION: &str = "fox-crew";
@@ -431,13 +434,47 @@ pub const SESSION_MARKERS: &[&str] = &[
     "FOXDB_SESSION",
 ];
 
-fn exec(argv: &[String]) -> Result<std::process::Output> {
+fn command(argv: &[String]) -> Command {
     let mut c = Command::new(&argv[0]);
     c.args(&argv[1..]);
     for k in SESSION_MARKERS {
         c.env_remove(k);
     }
-    c.output().with_context(|| format!("cannot run {}", argv[0]))
+    c
+}
+
+fn exec(argv: &[String]) -> Result<Output> {
+    command(argv).output().with_context(|| format!("cannot run {}", argv[0]))
+}
+
+fn bounded_output(cmd: &mut Command, timeout: Duration) -> Result<Output> {
+    let child = cmd.stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped()).process_group(0).spawn()?;
+    let group = child.id() as libc::pid_t;
+    let (tx, rx) = mpsc::channel();
+    std::thread::spawn(move || {
+        let _ = tx.send(child.wait_with_output());
+    });
+    match rx.recv_timeout(timeout) {
+        Ok(out) => Ok(out?),
+        Err(mpsc::RecvTimeoutError::Timeout) => {
+            // The child leads its own process group so its descendants cannot keep the pipes open.
+            unsafe { libc::kill(-group, libc::SIGKILL) };
+            bail!("timed out after {}s", timeout.as_secs_f64());
+        }
+        Err(e) => Err(e.into()),
+    }
+}
+
+const PANE_TIMEOUT: Duration = Duration::from_secs(1);
+const HOOK_INDEX_TIMEOUT: Duration = Duration::from_secs(5);
+
+fn launch_output(argv: &[String], operation: &str) -> Result<String> {
+    let out = exec(argv).with_context(|| format!("{operation} failed"))?;
+    // The command and the backend's output can both contain the session prompt.
+    if !out.status.success() {
+        bail!("{operation} failed ({})", out.status);
+    }
+    Ok(String::from_utf8_lossy(&out.stdout).into_owned())
 }
 
 fn run_ok(argv: &[String]) -> Result<String> {
@@ -482,15 +519,18 @@ fn ensure_worktree(root: &Path, wt: &Path, branch: &str, base: Option<&str>) -> 
 
 /// One `fox index` run for the worktree, so its project is in the store before the session's
 /// SessionStart hook asks for it.
-fn index(wt: &Path) -> Result<()> {
+fn index(wt: &Path, timeout: Option<Duration>) -> Result<()> {
     let loc = project::locate(wt);
     if let Some(git_dir) = loc.git_dir.as_ref().filter(|gd| Some(*gd) != loc.common_dir.as_ref()) {
         std::fs::write(git_dir.join(project::SEPARATE_INDEX), "")?;
     }
-    let o = Command::new(orch::fox_exe())
-        .args(["index", &wt.to_string_lossy(), "--quiet", "--no-global"])
-        .output()
-        .context("cannot run fox index")?;
+    let mut cmd = Command::new(orch::fox_exe());
+    cmd.arg("index").arg(wt).args(["--quiet", "--no-global"]);
+    let o = match timeout {
+        Some(timeout) => bounded_output(&mut cmd, timeout),
+        None => cmd.output().map_err(Into::into),
+    }
+    .with_context(|| format!("fox index {} failed", wt.display()))?;
     if !o.status.success() {
         bail!("fox index {} failed: {}", wt.display(), String::from_utf8_lossy(&o.stderr).trim());
     }
@@ -519,7 +559,7 @@ pub fn up(plan: &Plan, cwd: &Path, backend: Backend) -> Result<String> {
     for s in &plan.sessions {
         let wt = worktree_path(&root, &s.name);
         let fresh = ensure_worktree(&root, &wt, &s.branch, plan.base.as_deref())?;
-        index(&wt)?;
+        index(&wt, None)?;
         let home = std::fs::canonicalize(db::home()).unwrap_or_else(|_| db::home());
         let w = db::open_rw()?;
         let p = project::ensure(&w, &project::locate(&wt))?;
@@ -556,7 +596,8 @@ pub fn up(plan: &Plan, cwd: &Path, backend: Backend) -> Result<String> {
             let argv = cli_argv(s);
             let (pane, workspace) = match backend {
                 Backend::Tmux => {
-                    let o = run_ok(&tmux_launch(tmux_session_exists(), &s.name, &wt, &env, &argv))?;
+                    let cmd = tmux_launch(tmux_session_exists(), &s.name, &wt, &env, &argv);
+                    let o = launch_output(&cmd, "tmux pane launch")?;
                     let id = o.trim();
                     if id.is_empty() {
                         bail!("tmux did not report the pane id for {}", s.name);
@@ -589,7 +630,7 @@ pub fn up(plan: &Plan, cwd: &Path, backend: Backend) -> Result<String> {
                 return Err(e);
             }
             if backend == Backend::Herdr {
-                run_ok(&herdr_run(&r.pane, &argv))
+                launch_output(&herdr_run(&r.pane, &argv), "herdr pane run")
                     .with_context(|| format!("session start failed; use fox crew down {} to close its workspace", r.name))?;
             }
             Ok(r)
@@ -624,25 +665,57 @@ fn rel(root: &Path, p: &Path) -> String {
     p.strip_prefix(root).unwrap_or(p).to_string_lossy().into_owned()
 }
 
-/// The pane's state: `closed` when the multiplexer no longer has it.
-fn pane_state(r: &Record) -> String {
-    if r.backend == Backend::Tmux {
-        match tmux_owns_pane(r) {
-            Ok(true) => {}
-            Ok(false) => return "closed".into(),
-            Err(_) => return "unknown".into(),
-        }
+/// A missing pane is distinct from a multiplexer we could not query.
+fn pane_state(r: &Record) -> Result<Option<String>> {
+    if r.backend == Backend::Tmux && !tmux_owns_pane(r)? {
+        return Ok(None);
     }
-    match exec(&status_cmd(r)) {
-        Ok(o) if o.status.success() => {
-            let s = String::from_utf8_lossy(&o.stdout);
-            match r.backend {
-                Backend::Tmux => s.trim().to_string(),
-                Backend::Herdr => herdr_status(&s),
+    let out = bounded_output(&mut command(&status_cmd(r)), PANE_TIMEOUT)?;
+    if !out.status.success() {
+        if (r.backend == Backend::Herdr && herdr_error(&out, "pane_not_found"))
+            || (r.backend == Backend::Tmux && tmux_pane_missing(&out, &r.pane))
+        {
+            return Ok(None);
+        }
+        bail!("{} could not query pane {}", r.backend.name(), r.pane);
+    }
+    let output = String::from_utf8_lossy(&out.stdout);
+    match r.backend {
+        Backend::Tmux => {
+            let state = output.trim();
+            if state == "dead" || state.starts_with("dead ") {
+                return Ok(None);
             }
+            if state != "live" && !state.starts_with("live ") {
+                bail!("tmux did not report a state for pane {}", r.pane);
+            }
+            Ok(Some(state.to_string()))
         }
-        _ => "unknown".into(),
+        Backend::Herdr => {
+            let v: Value = serde_json::from_str(&output)?;
+            if find_obj(&v, "pane").and_then(|p| p.get("pane_id")).and_then(Value::as_str) != Some(r.pane.as_str()) {
+                bail!("herdr did not identify pane {}", r.pane);
+            }
+            Ok(Some(herdr_status(&output)))
+        }
     }
+}
+
+/// Consult the pane only after the agent's heartbeat and process evidence have expired.
+pub(crate) fn pane_liveness(label: Option<&str>, agent: &str) -> Option<bool> {
+    let Some(name) = label.and_then(|label| label.strip_prefix("crew:")) else { return Some(false) };
+    if !valid_name(name) {
+        return Some(false);
+    }
+    let r = match find(name) {
+        Ok(r) => r,
+        Err(e) if e.downcast_ref::<std::io::Error>().is_some_and(|e| e.kind() == std::io::ErrorKind::NotFound) => return Some(false),
+        Err(_) => return None,
+    };
+    if r.agent != agent {
+        return Some(false);
+    }
+    pane_state(&r).ok().map(|state| state.is_some())
 }
 
 /// `fox crew ls`: each session with its pane's state, then `fox agents --tree`.
@@ -653,6 +726,7 @@ pub fn ls() -> Result<String> {
         out.push_str("no crew sessions (fox crew up <plan.toml|N>)\n");
     }
     for r in &rs {
+        let state = pane_state(r).map(|state| state.unwrap_or_else(|| "closed".into())).unwrap_or_else(|_| "unknown".into());
         let _ = writeln!(
             out,
             "{} {} {} [{}] {} {} {}  {}",
@@ -662,7 +736,7 @@ pub fn ls() -> Result<String> {
             r.crew,
             r.backend.name(),
             r.pane,
-            pane_state(r),
+            state,
             rel(Path::new(&r.repo), Path::new(&r.worktree))
         );
     }
@@ -702,27 +776,36 @@ pub fn attach(name: &str) -> Result<String> {
     Ok(format!("{} focused", r.name))
 }
 
-const TMUX_IDENTITY: &str = "#{session_name}\t#{window_name}\t#{pane_start_path}";
+const TMUX_IDENTITY: &str = "#{pane_id}\t#{session_name}\t#{pane_start_path}";
 
 fn tmux_owns_pane(r: &Record) -> Result<bool> {
     let cmd = ["tmux", "display-message", "-p", "-t", &r.pane, TMUX_IDENTITY].map(String::from);
-    let out = exec(&cmd)?;
-    let identity = format!("{TMUX_SESSION}\t{}\t{}", r.name, r.worktree);
+    let out = bounded_output(&mut command(&cmd), PANE_TIMEOUT)?;
+    let identity = format!("{}\t{TMUX_SESSION}\t{}", r.pane, r.worktree);
     if !out.status.success() {
-        let err = String::from_utf8_lossy(&out.stderr);
-        if err.trim() == format!("can't find pane: {}", r.pane)
-            || err.starts_with("no server running on ")
-            || (err.starts_with("error connecting to ") && err.contains("No such file or directory"))
-        {
+        if tmux_pane_missing(&out, &r.pane) {
             return Ok(false);
         }
-        bail!("tmux could not identify pane {}: {}", r.pane, err.trim());
+        bail!("tmux could not identify pane {}: {}", r.pane, String::from_utf8_lossy(&out.stderr).trim());
     }
     let actual = String::from_utf8_lossy(&out.stdout);
     if actual.trim_end_matches('\n') != identity {
         bail!("tmux pane {} does not match session {} and worktree {}", r.pane, r.name, r.worktree);
     }
     Ok(true)
+}
+
+fn tmux_pane_missing(out: &Output, pane: &str) -> bool {
+    let err = String::from_utf8_lossy(&out.stderr);
+    err.trim() == format!("can't find pane: {pane}")
+        || err.starts_with("no server running on ")
+        || (err.starts_with("error connecting to ") && err.contains("No such file or directory"))
+}
+
+fn herdr_error(out: &Output, code: &str) -> bool {
+    [&out.stderr, &out.stdout].into_iter().any(|stream| {
+        serde_json::from_slice::<Value>(stream).ok().is_some_and(|v| v.pointer("/error/code").and_then(Value::as_str) == Some(code))
+    })
 }
 
 fn close(r: &Record) -> Result<bool> {
@@ -734,13 +817,7 @@ fn close(r: &Record) -> Result<bool> {
     if o.status.success() {
         return Ok(true);
     }
-    if r.backend == Backend::Herdr
-        && [&o.stderr, &o.stdout].into_iter().any(|stream| {
-            serde_json::from_slice::<Value>(stream)
-                .ok()
-                .is_some_and(|v| v.pointer("/error/code").and_then(Value::as_str) == Some("workspace_not_found"))
-        })
-    {
+    if r.backend == Backend::Herdr && herdr_error(&o, "workspace_not_found") {
         return Ok(false);
     }
     bail!("{} failed: {}", shell_line(&cmd), String::from_utf8_lossy(&o.stderr).trim());
@@ -801,11 +878,13 @@ pub fn herdr_hook(what: &str, harness: &str) -> Result<String> {
         }
         "worktree-created" => {
             let ev: Value = serde_json::from_str(&std::env::var("HERDR_PLUGIN_EVENT_JSON").unwrap_or_default()).unwrap_or(Value::Null);
-            let path = find_str(&ev, Some("worktree"), "path")
-                .or_else(|| find_str(&ev, Some("worktree"), "cwd"))
+            let path = find_obj(&ev, "worktree")
+                .and_then(|worktree| {
+                    ["path", "cwd"].iter().find_map(|key| worktree.get(key).and_then(Value::as_str).filter(|s| !s.is_empty()))
+                })
                 .map(PathBuf::from)
                 .context("HERDR_PLUGIN_EVENT_JSON names no worktree path")?;
-            index(&path)?;
+            index(&path, Some(HOOK_INDEX_TIMEOUT))?;
             Ok(format!("indexed {}", path.display()))
         }
         _ => bail!("usage: fox crew herdr new|worktree-created"),
