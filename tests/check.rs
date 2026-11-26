@@ -443,3 +443,62 @@ fn maps_a_removed_functions_caller_before_an_insertion() {
     let report = run(repo.path());
     assert_eq!(sites(&report.missed), ["src/lib.rs:4"], "{}", check::render(&report));
 }
+
+#[test]
+fn spacing_around_python_parameters_does_not_change_the_signature() {
+    let _g = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    let (_home, repo) = setup(&[("api.py", "def leaf(x):\n    return x\n\nleaf(1)\n")]);
+    edit(repo.path(), "api.py", "leaf(x)", "leaf( x )");
+    let report = run(repo.path());
+    assert!(report.changed.is_empty(), "{}", check::render(&report));
+    edit(repo.path(), "api.py", "leaf( x )", "leaf(\n    x  # Parameter comment.\n)");
+    let report = run(repo.path());
+    assert!(report.changed.is_empty(), "{}", check::render(&report));
+}
+
+#[test]
+fn spacing_inside_a_python_default_still_changes_the_signature() {
+    let _g = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    let (_home, repo) = setup(&[("api.py", "def leaf(x='a b'):\n    return x\n\nleaf()\n")]);
+    edit(repo.path(), "api.py", "'a b'", "'ab'");
+    let report = run(repo.path());
+    assert_eq!(sites(&report.missed), ["api.py:4"], "{}", check::render(&report));
+}
+
+#[test]
+fn a_diff_attribute_cannot_hide_a_caller_update() {
+    let _g = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    let (_home, repo) = setup(&[
+        (".gitattributes", "*.py -diff\n"),
+        ("api.py", "def leaf(x):\n    return x\n"),
+        ("caller.py", "from api import leaf\n\nleaf(1)\n"),
+    ]);
+    edit(repo.path(), "api.py", "leaf(x)", "leaf(x, y)");
+    edit(repo.path(), "caller.py", "leaf(1)", "leaf(1, 0)");
+    let report = run(repo.path());
+    assert_eq!(report.certain, 1, "{}", check::render(&report));
+    assert!(!report.blocks(), "{}", check::render(&report));
+}
+
+#[test]
+fn an_external_import_rebind_does_not_leave_a_certain_caller_of_the_removed_definition() {
+    let _g = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    let (_home, repo) = setup(&[("api.py", "def leaf(x):\n    return x\n"), ("caller.py", "from api import leaf\n\nleaf(1)\n")]);
+    fs::remove_file(repo.path().join("api.py")).unwrap();
+    edit(repo.path(), "caller.py", "from api", "from external_package");
+    let report = run(repo.path());
+    assert_eq!(report.certain, 0, "{}", check::render(&report));
+}
+
+#[test]
+fn a_cached_check_reports_untouched_callers_of_a_removed_definition() {
+    let _g = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    let (_home, repo) = setup(&[("api.py", "def leaf(x):\n    return x\n"), ("caller.py", "from api import leaf\n\nleaf(1)\n")]);
+    fs::remove_file(repo.path().join("api.py")).unwrap();
+    let mut c = db::open_rw().unwrap();
+    let p = project::find(&c, &project::locate(repo.path())).unwrap().unwrap();
+    let cached = check::run(&mut c, &p, repo.path(), false).unwrap();
+    let fresh = check::run(&mut c, &p, repo.path(), true).unwrap();
+    assert_eq!(sites(&fresh.missed), ["caller.py:3"], "{}", check::render(&fresh));
+    assert_eq!(sites(&cached.missed), sites(&fresh.missed), "{}", check::render(&cached));
+}

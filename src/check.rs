@@ -127,10 +127,20 @@ fn diff(root: &Path, head: &str) -> Result<BTreeMap<String, FileDiff>> {
             continue;
         }
         // Git selects the literal path, so patch headers need no filename decoding.
-        let patch = git(
-            root,
-            &["--literal-pathspecs", "diff", "-U0", "--no-color", "--no-ext-diff", "--no-textconv", "--no-renames", head, "--", path],
-        )?;
+        let patch = git_output(Command::new("git").arg("-C").arg(root).args([
+            "--literal-pathspecs",
+            "diff",
+            "-U0",
+            "--text",
+            "--no-color",
+            "--no-ext-diff",
+            "--no-textconv",
+            "--no-renames",
+            head,
+            "--",
+            path,
+        ]))?;
+        let patch = String::from_utf8_lossy(&patch);
         let mut hunks = Vec::new();
         for line in patch.lines().filter_map(|line| line.strip_prefix("@@ ")) {
             let range = |word: &str, sign| -> Result<(i64, i64)> {
@@ -204,6 +214,40 @@ fn signatures<'a>(path: &str, text: &'a str) -> Vec<Signature<'a>> {
         .collect()
 }
 
+fn same_signature(path: &str, old: &str, new: &str) -> bool {
+    if old == new {
+        return true;
+    }
+    let Some(lang) = crate::lang::for_path(path).filter(|lang| lang.name == "python") else { return false };
+    let mut parser = tree_sitter::Parser::new();
+    if parser.set_language(&lang.language()).is_err() {
+        return false;
+    }
+    fn tokens<'a>(parser: &mut tree_sitter::Parser, source: &'a str) -> Option<Vec<(u16, &'a str)>> {
+        let tree = parser.parse(source, None)?;
+        let root = tree.root_node();
+        if root.has_error() {
+            return None;
+        }
+        let mut tokens = Vec::new();
+        let mut pending = vec![root];
+        while let Some(node) = pending.pop() {
+            if node.child_count() == 0 || node.kind() == "string" {
+                let text = source.get(node.byte_range())?;
+                if node.kind() != "comment" || text.trim_start_matches('#').trim_start().starts_with("type:") {
+                    tokens.push((node.kind_id(), text));
+                }
+            } else {
+                pending.extend((0..node.child_count()).rev().filter_map(|i| node.child(i)));
+            }
+        }
+        Some(tokens)
+    }
+    let old = format!("{old}\n    pass\n");
+    let new = format!("{new}\n    pass\n");
+    tokens(&mut parser, &old).is_some_and(|old| tokens(&mut parser, &new).as_ref() == Some(&old))
+}
+
 #[derive(Default)]
 struct Definitions {
     current: Vec<(String, String, i64)>,
@@ -240,7 +284,9 @@ fn changed_definitions(root: &Path, head: &str, files: &BTreeMap<String, FileDif
         let old_defs = signatures(path, &old);
         let new_defs = signatures(path, &current);
         for new in &new_defs {
-            if new.text.is_some() && !old_defs.iter().any(|old| old.name == new.name && (old.text.is_none() || old.text == new.text)) {
+            if new.text.is_some_and(|header| {
+                !old_defs.iter().any(|old| old.name == new.name && old.text.is_none_or(|old| same_signature(path, old, header)))
+            }) {
                 out.current.push((path.clone(), new.name.clone(), new.line));
             }
         }
@@ -290,6 +336,41 @@ fn index(c: &mut Connection, p: &Project) -> Result<()> {
     let st = crate::inventory::index_project(c, p)?;
     crate::tsindex::index_project_with(c, p, st.delta.as_ref())?;
     Ok(())
+}
+
+fn caller_context_matches(root: &Path, head: &str, path: &str) -> bool {
+    let Some(lang) = crate::lang::for_path(path) else { return false };
+    let (Ok(old), Ok(new)) = (git(root, &["show", &format!("{head}:{path}")]), std::fs::read_to_string(root.join(path))) else {
+        return false;
+    };
+    if old == new {
+        return true;
+    }
+    if old.len().max(new.len()) as u64 > crate::tsindex::MAX_FILE {
+        return false;
+    }
+    // A same-file rename can move the call without changing the surrounding bindings.
+    let context = |text: &str| {
+        let parsed = crate::tsindex::extract(lang, text.as_bytes());
+        let mut callable_lines = vec![false; text.lines().count()];
+        for def in &parsed.defs {
+            if def.container.is_none() && crate::tsindex::is_callable_kind(&def.kind) {
+                let start = def.signature(text).map_or(i64::from(def.line), |(_, start)| start);
+                if let Some(lines) = callable_lines.get_mut((start as usize).saturating_sub(1)..def.end_line as usize) {
+                    lines.fill(true);
+                }
+            }
+        }
+        let outside = text
+            .lines()
+            .zip(callable_lines)
+            .filter(|(line, callable)| !*callable && !line.trim().is_empty())
+            .map(|(line, _)| line.to_owned())
+            .collect::<Vec<_>>();
+        let imports = parsed.refs.into_iter().filter(|r| r.kind == "import").map(|r| (r.name, r.via)).collect::<Vec<_>>();
+        (outside, imports)
+    };
+    context(&old) == context(&new)
 }
 
 #[derive(Default)]
@@ -427,23 +508,69 @@ pub fn run(c: &mut Connection, p: &Project, cwd: &Path, fresh: bool) -> Result<R
         let (_scratch, baseline, at_head) = head_index(&p.root, head, &p.name)?;
         let old_sites = collect_sites(&baseline, &at_head, &p.root, &files, &defs.removed, true, head)?;
         let mut live_calls = c.prepare(
-            "SELECT r.name, r.dst, r.amb, f.hash FROM ts_ref r
+            "SELECT r.name, r.dst, f.hash, d.path, d.line, d.name, json_extract(d.meta,'$.parent'), t.hash FROM ts_ref r
              JOIN ts_file f ON f.project_id = r.project_id AND f.path = r.path
+             LEFT JOIN node d ON d.id = r.dst
+             LEFT JOIN ts_file t ON t.project_id = d.project_id AND t.path = d.path
              WHERE r.project_id = ?1 AND r.path = ?2 AND r.line = ?3 AND r.kind = 'call'",
         )?;
+        // A cached edge into a deleted file can stand in for a fresh unresolved edge
+        // only when this diff could not have introduced a different binding.
+        let mut removed = HashMap::new();
+        if !fresh
+            && files
+                .keys()
+                .filter(|path| crate::lang::for_path(path).is_some())
+                .all(|path| std::fs::symlink_metadata(p.root.join(path)).is_err_and(|e| e.kind() == std::io::ErrorKind::NotFound))
+        {
+            let mut head_hash = baseline.prepare("SELECT hash FROM ts_file WHERE project_id = ?1 AND path = ?2")?;
+            let mut alternate =
+                c.prepare("SELECT EXISTS(SELECT 1 FROM node WHERE project_id = ?1 AND kind = 'symbol' AND name = ?2 AND path <> ?3)")?;
+            for (path, name, line) in &defs.removed {
+                let short = name.rsplit('.').next().unwrap_or(name);
+                if !alternate.query_row(rusqlite::params![p.id, short, path], |r| r.get::<_, bool>(0))?
+                    && let Ok(hash) = head_hash.query_row(rusqlite::params![at_head.id, path], |r| r.get::<_, String>(0))
+                {
+                    removed.insert((path.as_str(), name.as_str(), *line), hash);
+                }
+            }
+        }
         let mut hashes = HashMap::new();
+        let mut unchanged_context = HashMap::new();
         for (key, (site, hit)) in old_sites.certain {
+            if files.contains_key(&site.path)
+                && !*unchanged_context.entry(site.path.clone()).or_insert_with(|| caller_context_matches(&p.root, head, &site.path))
+            {
+                continue;
+            }
             let hash = hashes
                 .entry(site.path.clone())
                 .or_insert_with(|| std::fs::read(p.root.join(&site.path)).ok().map(|bytes| crate::tsindex::content_hash(&bytes)));
             let calls = live_calls.query_map(rusqlite::params![p.id, site.path, site.line], |r| {
-                Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?, r.get::<_, i64>(2)?, r.get::<_, String>(3)?))
+                Ok((
+                    r.get::<_, String>(0)?,
+                    r.get::<_, i64>(1)?,
+                    r.get::<_, String>(2)?,
+                    r.get::<_, Option<String>>(3)?,
+                    r.get::<_, Option<i64>>(4)?,
+                    r.get::<_, Option<String>>(5)?,
+                    r.get::<_, Option<String>>(6)?,
+                    r.get::<_, Option<String>>(7)?,
+                ))
             })?;
             let mut calls_by_name = HashMap::new();
             for call in calls {
-                let (name, dst, amb, indexed) = call?;
+                let (name, dst, indexed, target_path, target_line, target_name, target_parent, target_hash) = call?;
                 if hash.as_ref() == Some(&indexed) {
-                    calls_by_name.entry(name).and_modify(|single| *single = false).or_insert(dst == 0 || amb > 0);
+                    let cached_removal = match (target_path, target_line, target_name, target_hash) {
+                        (Some(path), Some(line), Some(name), Some(hash)) => {
+                            let name =
+                                target_parent.filter(|parent| !parent.is_empty()).map_or(name.clone(), |parent| format!("{parent}.{name}"));
+                            removed.get(&(path.as_str(), name.as_str(), line)) == Some(&hash)
+                        }
+                        _ => false,
+                    };
+                    calls_by_name.entry(name).and_modify(|single| *single = false).or_insert(dst == 0 || cached_removal);
                 }
             }
             let remaining = site.target.split(", ").filter(|name| calls_by_name.get(*name) == Some(&true)).collect::<Vec<_>>();
