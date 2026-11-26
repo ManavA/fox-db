@@ -310,6 +310,31 @@ class DryRun(unittest.TestCase):
             self.assertIn("grader.home", text)
             self.assertFalse(out.exists())
 
+    def test_subagent_dry_run_runs_one_delegating_arm(self):
+        with tempfile.TemporaryDirectory() as d:
+            tasks = Path(d) / "t.toml"
+            tasks.write_text('repo = "/r"\n[[task]]\nid = "a"\nprompt = "q"\n')
+            buf = io.StringIO()
+            with contextlib.redirect_stdout(buf):
+                ab.main([str(tasks), "--harness", "claude", "--seed", "5", "--repeat", "1", "--work",
+                         str(Path(d) / "w"), "--fox", "/nonexistent/fox", "--subagent", "lean"])
+            text = buf.getvalue()
+            self.assertIn("a-claude-lean-0", text)
+            self.assertNotIn("-off-", text)
+            self.assertIn("subagent_type lean", text)
+
+    def test_claude_cache_counts_subagents_through_model_usage(self):
+        out = json.dumps({"usage": {"cache_read_input_tokens": 1, "cache_creation_input_tokens": 1},
+                          "modelUsage": {"m1": {"cacheReadInputTokens": 10, "cacheCreationInputTokens": 20},
+                                         "m2": {"cacheReadInputTokens": 5, "cacheCreationInputTokens": 0}}})
+        u = ab.usage_from_claude(out)
+        self.assertEqual((u["cache_read"], u["cache_write"]), (15, 20))
+
+    def test_delegate_prompt_carries_packet_only_when_given(self):
+        self.assertIn("subagent_type general-purpose", ab.delegate_prompt("q", "general", ""))
+        self.assertNotIn("Context", ab.delegate_prompt("q", "lean", ""))
+        self.assertIn("PKT", ab.delegate_prompt("q", "lean", "PKT"))
+
     def test_local_dry_run_indexes_only_fox_arms(self):
         with tempfile.TemporaryDirectory() as d:
             tasks = Path(d) / "t.toml"

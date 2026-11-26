@@ -94,7 +94,15 @@ LIVE_HOME = Path.home() / ".foxdb"
 SOURCE_EXTS = {"rs", "py", "md", "toml", "json", "ts", "tsx", "js", "go", "c", "h", "cc", "cpp", "hpp", "kt",
                "swift", "java", "rb", "sh", "yml", "yaml", "txt", "sql", "proto"}
 ARMS = {"claude": ["on", "off"], "codex": ["on", "off"], "local": local_agent.ARMS}
-INDEXED_ARMS = {"on", "fox-cli", "packet"}
+INDEXED_ARMS = {"on", "fox-cli", "packet", "general", "lean", "lean-packet"}
+SUBAGENT_TYPES = {"general": "general-purpose", "lean": "lean", "lean-packet": "lean"}
+LEAN_AGENT = """---
+name: lean
+description: Lean worker with shell, file reading and editing only.
+tools: Bash, Read, Edit, Write
+---
+You are a focused worker. Do the task in the prompt and return a concise factual answer.
+"""
 BASELINES = ("off", "grep")
 DECOY_WORDS = ["inner", "impl", "v2", "old", "cached", "raw", "unchecked", "try", "with", "legacy", "async",
                "batch", "ext", "util", "helper", "core", "local", "tmp", "fast", "safe"]
@@ -344,6 +352,12 @@ def mcp_config_json(fox: str, on: bool, store_env: dict) -> dict:
     return {"mcpServers": {"foxdb": server}}
 
 
+def delegate_prompt(prompt: str, arm: str, packet: str) -> str:
+    brief = prompt + (f"\n\nContext from the code index:\n{packet}" if packet else "")
+    return (f"Delegate this whole task to one subagent with the Agent tool, subagent_type {SUBAGENT_TYPES[arm]},"
+            f" passing it this brief verbatim, then return its answer.\n\nBrief:\n{brief}")
+
+
 def claude_cmd(prompt: str, cfg: Path, max_usd: float, model) -> list:
     cmd = ["claude", "-p", prompt, "--output-format", "json", "--strict-mcp-config", "--mcp-config", str(cfg),
            "--no-session-persistence", "--max-budget-usd", str(max_usd),
@@ -395,8 +409,13 @@ def usage_from_claude(stdout: str) -> dict:
     except json.JSONDecodeError:
         return {"parse_error": True}
     u = j.get("usage", {})
+    models = j.get("modelUsage") or {}
+    cache_read = sum(m.get("cacheReadInputTokens", 0) for m in models.values()) if models \
+        else u.get("cache_read_input_tokens")
+    cache_write = sum(m.get("cacheCreationInputTokens", 0) for m in models.values()) if models \
+        else u.get("cache_creation_input_tokens")
     return {"cost_usd": j.get("total_cost_usd"), "turns": j.get("num_turns"), "input": u.get("input_tokens"),
-            "cache_read": u.get("cache_read_input_tokens"), "cache_write": u.get("cache_creation_input_tokens"),
+            "cache_read": cache_read, "cache_write": cache_write,
             "output": u.get("output_tokens"), "model": ",".join(sorted(j.get("modelUsage", {}))) or None,
             "answer": j.get("result", "")}
 
@@ -551,6 +570,8 @@ def run_parser() -> argparse.ArgumentParser:
     ap.add_argument("--local-steps", type=int, default=20, help="turn cap for local (one last answer turn after)")
     ap.add_argument("--local-token-cap", type=int, default=200_000, help="prompt plus completion tokens, all turns")
     ap.add_argument("--local-effort", default="low", help="reasoning_effort chat template kwarg; '' for default")
+    ap.add_argument("--subagent", choices=sorted(SUBAGENT_TYPES), default=None,
+                    help="claude: one arm, fox MCP on, task delegated to this subagent setup")
     ap.add_argument("--out", type=Path, default=Path("ab-results.jsonl"))
     ap.add_argument("--grader-selftest", action="store_true", help="check the grader on each task and exit")
     ap.add_argument("--run", action="store_true", help="actually run (default: dry-run, print commands)")
@@ -602,6 +623,8 @@ def main(argv: list | None = None) -> int:
     work.mkdir(parents=True, exist_ok=True)
     mode = f"headroom-{a.headroom}"
     fox_sha = sha256_file(a.fox)
+    if a.subagent:
+        ARMS["claude"] = [a.subagent]
     arms = sorted({arm for h in harnesses for arm in ARMS[h]})
     print(f"# {len(tasks)} tasks x {harnesses} x {arms} x {a.repeat} · {mode} · store {a.store} · seed {seed}"
           f" · fox {fox_sha or 'missing'} · work {work}" + ("" if a.run else " · DRY RUN"))
@@ -635,8 +658,10 @@ def main(argv: list | None = None) -> int:
         last = work / f"{name}.last.txt"
         plan = store_plan(a.store, a.fox, cwd, work / f"{name}.home")
         cfg = work / f"{name}.mcp.json"
+        prompt = delegate_prompt(t["prompt"], arm, "<packet>" if arm == "lean-packet" else "") \
+            if arm in SUBAGENT_TYPES else t["prompt"]
         if h == "claude":
-            cmd = claude_cmd(t["prompt"], cfg, a.max_usd, a.model)
+            cmd = claude_cmd(prompt, cfg, a.max_usd, a.model)
         elif h == "codex":
             cmd = codex_cmd(t["prompt"], cwd, a.fox, arm == "on", last, plan["env"], a.model)
         else:
@@ -651,12 +676,17 @@ def main(argv: list | None = None) -> int:
             print(f"(cd {shlex.quote(str(cwd))} && {shlex.join(cmd)})")
             continue
         if h != "local":
-            cfg.write_text(json.dumps(mcp_config_json(a.fox, arm == "on", plan["env"])))
+            cfg.write_text(json.dumps(mcp_config_json(a.fox, arm == "on" or arm in SUBAGENT_TYPES, plan["env"])))
         fresh_clone(clone, cwd, repo, [a.tasks, repo / "bench" / "tasks", repo / "bench" / "private"])
         env = env_for(a.headroom, plan["env"])
         if index:
             fresh_home(work / f"{name}.home")
             subprocess.run(index, env=env, check=True)
+        if arm in SUBAGENT_TYPES:
+            (cwd / ".claude" / "agents").mkdir(parents=True, exist_ok=True)
+            (cwd / ".claude" / "agents" / "lean.md").write_text(LEAN_AGENT)
+            packet = local_agent.build_packet(t["prompt"], a.fox, cwd, env) if arm == "lean-packet" else ""
+            cmd[2] = delegate_prompt(t["prompt"], arm, packet)
         t0 = time.monotonic()
         p = subprocess.run(cmd, cwd=cwd, env=env, capture_output=True, text=True,
                            timeout=7200 if h == "local" else 1800)
