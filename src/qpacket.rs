@@ -4,8 +4,7 @@
 //! 2-hop `impact`, as `fox code` prints them (accounting line and verdict included).
 //!
 //! Rows resolved only by a guess by name move under a `guesses by name` heading after the certain
-//! rows of their answer. Over the budget, rows go deepest first and guesses before certain rows
-//! (code first, then the rows themselves). A question naming no indexed symbol gets `fox find`
+//! rows of their answer. Over the budget, guesses go first, then deeper rows, then code and direct rows. A question naming no indexed symbol gets `fox find`
 //! results instead, and the packet says so.
 
 use crate::code::{self, CodeOpts};
@@ -34,7 +33,7 @@ static CODE_NAME: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(r"`([^`\s]+)`|\b([A-Za-z_]\w*(?:(?:::|\.)[A-Za-z_]\w*)+|[a-z]\w*_\w+|[A-Z][a-z0-9]+[A-Z]\w*|[a-z][a-z0-9]+[A-Z]\w*)\b")
         .unwrap()
 });
-static PATH_HINT: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"([\w./-]+\.\w+):(\d+)").unwrap());
+static PATH_HINT: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"`([^`]+):(\d+)`|`([^`]+)`:(\d+)|([\w./-]+\.\w+):(\d+)").unwrap());
 
 /// A source file name (`diff.c`, `src/a.rs`) is a path, not a symbol.
 fn is_path(s: &str) -> bool {
@@ -53,7 +52,7 @@ pub fn names(question: &str) -> Vec<Name> {
         };
         let text = raw.trim_end_matches("()").trim_matches(|c: char| ".,;:()".contains(c));
         // `e.g` and `i.e` are prose.
-        let prose = text.split([':', '.']).filter(|s| !s.is_empty()).all(|s| s.len() == 1);
+        let prose = m.get(1).is_none() && matches!(text, "e.g" | "i.e" | "a.m" | "p.m");
         if text.is_empty() || prose || is_path(text) || !text.chars().all(|c| c.is_alphanumeric() || "_:.".contains(c)) {
             continue;
         }
@@ -65,8 +64,27 @@ pub fn names(question: &str) -> Vec<Name> {
 }
 
 /// `path:line` mentions in the question (`defined at diff.c:360`).
-fn hints(question: &str) -> Vec<(String, i64)> {
-    PATH_HINT.captures_iter(question).filter_map(|m| Some((m[1].trim_start_matches("./").to_string(), m[2].parse().ok()?))).collect()
+fn hints(question: &str, candidates: &[Target]) -> Vec<(String, i64)> {
+    PATH_HINT
+        .captures_iter(question)
+        .filter_map(|m| {
+            let (path, line) = [(1, 2), (3, 4), (5, 6)].into_iter().find_map(|(p, l)| Some((m.get(p)?, m.get(l)?)))?;
+            let mut full_path = path.as_str().trim_start_matches("./");
+            if m.get(5).is_some() {
+                // An unquoted path with spaces may have matched only its final word.
+                let prefix = &question[..path.end()];
+                for candidate in candidates.iter().filter(|t| t.path.contains(' ')) {
+                    if candidate.path.len() > full_path.len()
+                        && let Some(before) = prefix.strip_suffix(&candidate.path)
+                        && !before.ends_with(|c: char| c.is_alphanumeric() || "_./-".contains(c))
+                    {
+                        full_path = &candidate.path;
+                    }
+                }
+            }
+            Some((full_path.to_string(), line.as_str().parse().ok()?))
+        })
+        .collect()
 }
 
 struct Target {
@@ -76,27 +94,48 @@ struct Target {
     line: i64,
 }
 
-/// Best definition for `name`: one at a `path:line` the question gives, else one in a file it
-/// names, else the index's own pick.
-fn resolve(c: &Connection, p: &Project, name: &str, hints: &[(String, i64)]) -> Result<Option<Target>> {
+enum Resolution {
+    Unique(Target),
+    Ambiguous,
+    Missing,
+}
+
+/// A location hint can break a tie among indexed definitions.
+fn resolve(c: &Connection, p: &Project, name: &str, question: &str) -> Result<Resolution> {
+    let q = name.replace("::", ".");
     let mut cands: Vec<Target> = vec![];
-    for q in dedup([name.replace("::", "."), name.rsplit(['.', ':']).next().unwrap_or(name).to_string()]) {
-        if crate::swiftimport::has_symbols(c, p.id) {
-            cands = code::resolve(c, p.id, &q)?
-                .into_iter()
-                .filter_map(|s| Some(Target { handle: s.h(), row: s.row(), line: s.line, path: s.path.clone()? }))
-                .collect();
-        }
-        if cands.is_empty() && crate::tsindex::has_symbols(c, p.id) {
-            cands = crate::tscode::resolve(c, p.id, &q)?
-                .into_iter()
-                .map(|s| Target { handle: s.h(), row: s.row(), path: s.path.clone(), line: s.line })
-                .collect();
-        }
-        if !cands.is_empty() {
-            break;
-        }
+    if crate::swiftimport::has_symbols(c, p.id) {
+        // The graph resolver only checks the final qualifier component. Check the whole name
+        // against the indexed container and module before using a graph answer as evidence.
+        let base = q.rsplit('.').next().unwrap_or(&q);
+        cands = code::resolve(c, p.id, base)?
+            .into_iter()
+            .filter(|s| {
+                !q.contains('.')
+                    || s.qname().eq_ignore_ascii_case(&q)
+                    || (!s.module.is_empty() && format!("{}.{}", s.module, s.qname()).eq_ignore_ascii_case(&q))
+            })
+            .filter_map(|s| Some(Target { handle: s.h(), row: s.row(), line: s.line, path: s.path.clone()? }))
+            .collect();
     }
+    if crate::tsindex::has_symbols(c, p.id) {
+        let mut is_definition = c.prepare_cached("SELECT json_extract(meta, '$.d') IS NULL FROM node WHERE id = ?1")?;
+        let mut tree_defs = Vec::new();
+        for s in crate::tscode::resolve(c, p.id, &q)? {
+            if is_definition.query_row([s.id], |row| row.get::<_, bool>(0))? {
+                tree_defs.push(Target { handle: s.h(), row: s.row(), path: s.path, line: s.line });
+            }
+        }
+        let same_location = |a: &Target, b: &Target| a.path == b.path && a.line == b.line;
+        let additional: Vec<_> = tree_defs
+            .iter()
+            .enumerate()
+            .filter(|(_, t)| !cands.iter().any(|s| same_location(s, t)) || tree_defs.iter().filter(|s| same_location(s, t)).count() > 1)
+            .map(|(i, _)| i)
+            .collect();
+        cands.extend(tree_defs.into_iter().enumerate().filter_map(|(i, t)| additional.contains(&i).then_some(t)));
+    }
+    let hints = hints(question, &cands);
     let in_file = |t: &Target, f: &str| t.path == f || t.path.ends_with(&format!("/{f}"));
     let fit = |t: &Target| {
         if hints.iter().any(|(f, l)| t.path == *f && t.line == *l) {
@@ -111,18 +150,11 @@ fn resolve(c: &Connection, p: &Project, name: &str, hints: &[(String, i64)]) -> 
             4
         }
     };
-    let best = cands.iter().enumerate().min_by_key(|(i, t)| (fit(t), *i)).map(|(i, _)| i);
-    Ok(best.map(|i| cands.swap_remove(i)))
-}
-
-fn dedup<const N: usize>(v: [String; N]) -> Vec<String> {
-    let mut out: Vec<String> = vec![];
-    for s in v {
-        if !out.contains(&s) {
-            out.push(s);
-        }
+    cands.sort_by_key(fit);
+    if cands.len() > 1 && fit(&cands[0]) == fit(&cands[1]) {
+        return Ok(Resolution::Ambiguous);
     }
-    out
+    Ok(cands.into_iter().next().map_or(Resolution::Missing, Resolution::Unique))
 }
 
 /// What a line of a `fox code` answer is, for trimming.
@@ -133,7 +165,12 @@ enum Part {
     /// A directory, file, depth or group heading: kept while a row under it is.
     Head,
     /// A row; `rank` orders dropping (lowest first).
-    Row { rank: u8 },
+    Row {
+        rank: u8,
+    },
+    Guess {
+        rank: u8,
+    },
     /// A code line under the row before it.
     Code,
 }
@@ -161,9 +198,7 @@ fn is_guess(row: &str) -> bool {
     head.contains(" guess 1 of ") || head.contains(" guess by name") || head.contains(" guess (via")
 }
 
-/// Drop rank of a row (lowest goes first): d2+ guesses, d2+ rows, aside groups, impact d1
-/// guesses, caller guesses and unsure mentions, the ledger's certain non-call uses (impact d1
-/// names their functions), then certain callers and impact d1 rows.
+/// Rank certain rows by depth and ledger group. The trimmer handles marked guesses first.
 fn rank(impact: bool, depth: usize, guess: bool, group: Option<&str>) -> u8 {
     match group {
         Some(g) if ASIDE_GROUPS.iter().any(|a| g.starts_with(a)) => return 2,
@@ -250,7 +285,7 @@ fn parse(answer: &str, impact: bool, callers: &[String], lines: &mut Vec<Line>) 
             } else if guess {
                 let at = rest.strip_prefix(':').map_or(rest.to_string(), |r| format!("{file}:{r}"));
                 let d = if impact { format!("d{depth} ") } else { String::new() };
-                guessed.push(Line { text: format!("  {d}{at}"), part: Part::Row { rank: r }, heads: vec![], code, kept: true });
+                guessed.push(Line { text: format!("  {d}{at}"), part: Part::Guess { rank: r }, heads: vec![], code, kept: true });
             } else {
                 handles.extend(h.map(String::from));
                 certain.push(Line { text, part: Part::Row { rank: r }, heads, code, kept: true });
@@ -259,7 +294,12 @@ fn parse(answer: &str, impact: bool, callers: &[String], lines: &mut Vec<Line>) 
         }
         last = Dest::Certain;
         let t = l.trim_start();
-        if let Some(d) = l.strip_prefix('d').and_then(|d| d.parse::<usize>().ok()) {
+        if let Some(d) = l
+            .strip_prefix("depth ")
+            .and_then(|s| s.split_once(':').map(|(d, _)| d))
+            .or_else(|| l.strip_prefix('d'))
+            .and_then(|d| d.parse::<usize>().ok())
+        {
             depth = d;
             (dir, file, group, h_dir, h_file, h_group) = (String::new(), String::new(), None, None, None, None);
             h_depth = push_head(&mut certain, text, vec![]);
@@ -269,7 +309,7 @@ fn parse(answer: &str, impact: bool, callers: &[String], lines: &mut Vec<Line>) 
         } else if [ASIDE_GROUPS, UNSURE_GROUPS, USE_GROUPS].concat().iter().any(|g| t.starts_with(g)) && !l.starts_with(' ') {
             (depth, group, h_depth, h_dir, h_file) = (1, Some(t.to_string()), None, None, None);
             h_group = push_head(&mut certain, text, vec![]);
-        } else if !l.starts_with("  ") && t.ends_with('/') && !t.contains(' ') {
+        } else if !l.starts_with("  ") && t.ends_with('/') {
             (dir, file) = (t.to_string(), String::new());
             h_dir = push_head(&mut certain, text, h_depth.into_iter().collect());
             h_file = None;
@@ -323,17 +363,17 @@ fn file_heading(l: &str) -> Option<&str> {
     }
     if let Some((f, n)) = t.rsplit_once(" (")
         && n.strip_suffix(')').is_some_and(|n| n.parse::<usize>().is_ok())
-        && !f.contains(' ')
+        && !f.is_empty()
     {
         return Some(f);
     }
-    (l.starts_with(' ') && !t.contains(' ') && is_path(t)).then_some(t)
+    (l.starts_with(' ') && is_path(t)).then_some(t)
 }
 
 /// Characters kept for the note saying what the trim left out.
 const NOTE_ROOM: usize = 170;
 
-/// Drop rows (deepest and guesses first; code before rows from d1 on) until `lines` fit `room`
+/// Drop guesses, then deeper rows, then code and direct rows until `lines` fit `room`
 /// characters with the note. Headings left with no row go too. Returns (rows dropped, rows whose
 /// code was dropped).
 fn trim(lines: &mut [Line], room: usize) -> (usize, usize) {
@@ -347,16 +387,23 @@ fn trim(lines: &mut [Line], room: usize) -> (usize, usize) {
             alive[h] += 1;
         }
     }
-    let mut order: Vec<(u8, usize)> =
-        lines.iter().enumerate().filter_map(|(i, l)| if let Part::Row { rank } = l.part { Some((rank, i)) } else { None }).collect();
-    order.sort_by_key(|&(r, i)| (r, std::cmp::Reverse(i)));
-    let deep = order.iter().take_while(|(r, _)| *r < 3).count();
-    let steps: Vec<(usize, bool)> = order[..deep]
+    let mut order: Vec<_> = lines
         .iter()
-        .map(|&(_, i)| (i, true))
-        .chain(order[deep..].iter().filter(|(_, i)| lines[*i].code).map(|&(_, i)| (i, false)))
-        .chain(order[deep..].iter().map(|&(_, i)| (i, true)))
+        .enumerate()
+        .filter_map(|(i, l)| match l.part {
+            Part::Guess { rank } => Some((false, rank, i)),
+            Part::Row { rank } => Some((true, rank, i)),
+            _ => None,
+        })
         .collect();
+    order.sort_by_key(|&(certain, rank, i)| (certain, rank, std::cmp::Reverse(i)));
+    let deep = order.iter().take_while(|(certain, rank, _)| !certain || *rank < 3).count();
+    let steps = order[..deep]
+        .iter()
+        .map(|&(_, _, i)| (i, true))
+        .chain(order[deep..].iter().filter(|(_, _, i)| lines[*i].code).map(|&(_, _, i)| (i, false)))
+        .chain(order[deep..].iter().map(|&(_, _, i)| (i, true)))
+        .collect::<Vec<_>>();
     let (mut dropped, mut stripped) = (0, 0);
     let mut drop = |lines: &mut [Line], i: usize, size: &mut usize| {
         lines[i].kept = false;
@@ -416,28 +463,34 @@ fn prune(lines: &mut [Line]) {
 
 /// The packet for `question` in project `p`, at most `budget` tokens.
 pub fn run(c: &Connection, p: &Project, question: &str, budget: usize) -> Result<String> {
-    let room = budget.max(64) * 4;
-    let hints = hints(question);
+    let room = budget.saturating_mul(4);
+    if room == 0 {
+        return Ok(String::new());
+    }
     let mut targets: Vec<(String, Target)> = vec![];
     let mut missing: Vec<String> = vec![];
+    let mut ambiguous: Vec<String> = vec![];
     for n in names(question) {
         if targets.len() == MAX_TARGETS {
             break;
         }
-        match resolve(c, p, &n.text, &hints)? {
-            Some(t) if !targets.iter().any(|(_, x)| x.handle == t.handle) => targets.push((n.text, t)),
-            Some(_) => {}
-            None if n.explicit => missing.push(n.text),
-            None => {}
+        match resolve(c, p, &n.text, question)? {
+            Resolution::Unique(t) if !targets.iter().any(|(_, x)| x.handle == t.handle) => targets.push((n.text, t)),
+            Resolution::Ambiguous => ambiguous.push(n.text),
+            Resolution::Missing if n.explicit => missing.push(n.text),
+            _ => {}
         }
     }
     if targets.is_empty() {
-        return fallback(c, p, question, budget, &missing);
+        return fallback(c, p, question, room, &missing, &ambiguous);
     }
     let mut lines: Vec<Line> = vec![];
     let note = |text: String| Line { text, part: Part::Note, heads: vec![], code: false, kept: true };
     let names: Vec<&str> = targets.iter().map(|(n, _)| n.as_str()).collect();
     lines.push(note(format!("fox packet: definition, callers and 2-hop impact of {}", names.join(", "))));
+    if !ambiguous.is_empty() {
+        lines.push(note(format!("ambiguous: {} (give a path:line to choose a definition)", ambiguous.join(", "))));
+    }
     if !missing.is_empty() {
         lines.push(note(format!("not indexed: {}", missing.join(", "))));
     }
@@ -449,7 +502,11 @@ pub fn run(c: &Connection, p: &Project, question: &str, budget: usize) -> Result
         let mut callers: Vec<String> = vec![];
         for (rel, depth) in [("callers", 1), ("impact", 2)] {
             let o = CodeOpts { rel, depth, budget: ANSWER_BUDGET, cursor: 0, fallback: false };
-            let out = code::run(c, p, &t.handle, &o)?;
+            let out = if t.handle.starts_with("c:") {
+                crate::tscode::run(c, p, &t.handle, rel, depth, 0, ANSWER_BUDGET)?.unwrap_or_default()
+            } else {
+                code::run(c, p, &t.handle, &o)?
+            };
             callers = parse(&out, rel == "impact", &callers, &mut lines);
         }
     }
@@ -464,33 +521,44 @@ pub fn run(c: &Connection, p: &Project, question: &str, budget: usize) -> Result
         };
         out.insert(
             1,
-            format!("{what} left out to fit the budget (deepest and guesses first); a larger --budget or fox code NAME --rel callers|impact shows them"),
+            format!("{what} left out to fit the budget (guesses and deeper rows first); a larger --budget or fox code NAME --rel callers|impact shows them"),
         );
     }
-    let mut text = String::new();
-    let whole = out.iter().map(|l| l.len() + 1).sum::<usize>() <= room;
-    for l in out {
-        if !whole && text.len() + l.len() + 30 > room {
-            text.push_str("[packet cut at the budget]\n");
-            break;
+    Ok(fit_budget(out.join("\n") + "\n", room))
+}
+
+fn fit_budget(mut text: String, room: usize) -> String {
+    const CUT: &str = "[packet cut at the budget]\n";
+    if text.len() > room {
+        let end = text.floor_char_boundary(room.saturating_sub(CUT.len()));
+        if let Some(newline) = text[..end].rfind('\n') {
+            text.truncate(newline + 1);
+            text.push_str(CUT);
+        } else {
+            text.truncate(text.floor_char_boundary(room));
         }
-        text.push_str(&l);
-        text.push('\n');
     }
-    Ok(text)
+    text
 }
 
 /// No name resolves: `fox find` on the question, and a line saying so.
-fn fallback(c: &Connection, p: &Project, question: &str, budget: usize, missing: &[String]) -> Result<String> {
+fn fallback(c: &Connection, p: &Project, question: &str, room: usize, missing: &[String], ambiguous: &[String]) -> Result<String> {
     static NOISE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"(?i)\bdo not edit files\.?").unwrap());
-    let q = NOISE.replace_all(question, "");
-    let mut head = "no name in the question resolves to an indexed definition".to_string();
-    if !missing.is_empty() {
-        head += &format!(" (not indexed: {})", missing.join(", "));
+    let mut head =
+        "no name in the question resolves to a unique indexed definition; fox find results for the question instead:\n".to_string();
+    if !ambiguous.is_empty() {
+        head += &format!("ambiguous: {} (give a path:line to choose a definition)\n", ambiguous.join(", "));
     }
-    head += "; fox find results for the question instead:\n";
-    let o = FindOpts { kind: "any", all: false, budget: budget.saturating_sub(head.len() / 4 + 4).max(32), limit: 12, offset: 0 };
-    Ok(head + &query::find(c, Some(p), q.trim(), &o)?)
+    if !missing.is_empty() {
+        head += &format!("not indexed: {}\n", missing.join(", "));
+    }
+    let remaining = room.saturating_sub(head.len());
+    if remaining > 0 {
+        let q = NOISE.replace_all(question, "");
+        let o = FindOpts { kind: "any", all: false, budget: remaining / 4, limit: 12, offset: 0 };
+        head += &query::find(c, Some(p), q.trim(), &o)?;
+    }
+    Ok(fit_budget(head, room))
 }
 
 #[cfg(test)]
@@ -505,8 +573,44 @@ mod tests {
             .collect();
         assert_eq!(got, ["set_helper_option", "db::open_ro", "Graph.walk", "getUser"]);
         assert_eq!(
-            hints("defined at transport-helper.c:331 and ./src/a.rs:9"),
+            hints("defined at transport-helper.c:331 and ./src/a.rs:9", &[]),
             [("transport-helper.c".into(), 331), ("src/a.rs".into(), 9)]
         );
+    }
+}
+
+#[cfg(test)]
+mod review_regressions {
+    use super::*;
+
+    #[test]
+    fn explicit_single_character_names_are_kept() {
+        assert_eq!(names("Who calls `f` and A.b?").len(), 2);
+    }
+
+    #[test]
+    fn trimming_drops_guesses_before_certain_rows() {
+        let mut lines = vec![];
+        parse(&format!("d2\n  1 certain c:aa {}\n", "a".repeat(200)), true, &[], &mut lines);
+        parse(&format!("  1 uncertain c:bb guess by name {}\n", "b".repeat(200)), false, &[], &mut lines);
+        let room = lines.iter().map(|l| l.text.len() + 1).sum::<usize>() - 1;
+        trim(&mut lines, room);
+        assert!(lines.iter().any(|l| l.kept && l.text.contains("certain c:aa")));
+        assert!(!lines.iter().any(|l| l.kept && l.text.contains("uncertain c:bb")));
+    }
+
+    #[test]
+    fn guessed_rows_keep_paths_with_spaces() {
+        let mut lines = vec![];
+        parse("first.c (1)\n  :1 one c:aa\nfile with spaces.c (1)\n  :2 two c:bb guess by name\n", false, &[], &mut lines);
+        assert!(lines.iter().any(|l| l.text.contains("file with spaces.c:2")));
+    }
+
+    #[test]
+    fn swift_depth_and_dedup_accounting_are_preserved() {
+        let mut lines = vec![];
+        parse("depth 1: 1 symbols\n  1 caller s:aa\ndepth 2: 1 symbols\n  1 indirect s:bb\n", true, &["s:aa".into()], &mut lines);
+        assert!(lines.iter().any(|l| l.text.contains("not repeated")));
+        assert!(lines.iter().any(|l| l.text.contains("s:bb") && l.part == Part::Row { rank: 1 }));
     }
 }

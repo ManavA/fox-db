@@ -150,3 +150,81 @@ fn cli_and_mcp_serve_the_packet() {
     std::env::set_current_dir(here).unwrap();
     assert_eq!(got.unwrap().trim_end(), want.trim_end());
 }
+
+#[test]
+fn unknown_qualifier_does_not_authorize_a_bare_name_match() {
+    let _g = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    let (_home, _repo, p) = inline_project(CHAIN);
+    let out = packet(&p, "Who calls `Nonexistent.leaf`?", 800);
+    assert!(!out.contains("== Nonexistent.leaf"), "{out}");
+}
+
+#[test]
+fn missing_names_fit_the_packet_budget() {
+    let _g = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    let (_home, _repo, p) = inline_project(CHAIN);
+    let q = (0..100).map(|i| format!("`not_indexed_{i}` ")).collect::<String>();
+    let out = packet(&p, &q, 100);
+    assert!(out.len() <= 400, "{} bytes", out.len());
+}
+
+#[test]
+fn equally_plausible_definitions_are_not_presented_as_a_single_proven_target() {
+    let _g = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    let (_home, _repo, p) = inline_project(&[
+        ("a.c", "static int helper(void) { return 1; }\nint a(void) { return helper(); }\n"),
+        ("b.c", "static int helper(void) { return 2; }\nint b(void) { return helper(); }\n"),
+    ]);
+    let out = packet(&p, "Who calls `helper`?", 800);
+    let shows_both = ["a.c:1", "b.c:1"].iter().all(|&location| out.lines().any(|line| line.starts_with("def ") && line.contains(location)));
+    assert!(shows_both || out.contains("ambiguous"), "{out}");
+    assert!(!out.contains("== helper"), "{out}");
+    let out = packet(&p, "Who calls `helper` (at a.c:1 and b.c:1)?", 800);
+    assert!(out.contains("ambiguous: helper") && !out.contains("== helper"), "{out}");
+}
+
+#[test]
+fn tiny_budgets_bound_regular_and_fallback_packets() {
+    let _g = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    let (_home, _repo, p) = inline_project(CHAIN);
+    for q in ["Who calls `leaf`?", "Who calls `nonexistent`?"] {
+        for budget in [0, 1, 20] {
+            let out = packet(&p, q, budget);
+            assert!(out.len() <= 4 * budget, "{out}");
+        }
+    }
+}
+
+#[test]
+fn mixed_indexes_resolve_only_a_unique_definition() {
+    let _g = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    let (_home, _repo, p) = inline_project(CHAIN);
+    db::open_rw()
+        .unwrap()
+        .execute(
+            r#"INSERT INTO node(project_id, kind, key, name, sig, lang, tier, source, path, line, meta, updated_at)
+         VALUES (?1, 'symbol', 'swift-leaf', 'leaf', 'leaf()', 'swift', 3, 'indexstore', 'App.swift', 1,
+         '{"k":"func","parent":"A","mod":"App"}', 0)"#,
+            [p.id],
+        )
+        .unwrap();
+    let out = packet(&p, "Who calls `leaf`?", 800);
+    assert!(out.contains("ambiguous: leaf") && !out.contains("== leaf"), "{out}");
+    let out = packet(&p, "Who calls `leaf` at lib/core.c:1?", 800);
+    assert!(out.contains("def ~c:") && out.contains("lib/core.c:1"), "{out}");
+    let out = packet(&p, "Who calls `Fake.A.leaf`?", 800);
+    assert!(out.contains("not indexed: Fake.A.leaf") && !out.contains("== Fake.A.leaf"), "{out}");
+    let out = packet(&p, "Who calls `App.A.leaf`?", 800);
+    assert!(out.contains("def s:") && out.contains("App.swift:1"), "{out}");
+}
+
+#[test]
+fn full_spaced_location_beats_the_overlapping_suffix() {
+    let _g = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    let (_home, _repo, p) = inline_project(&[
+        ("src/with spaces/tool.c", "static int helper(void) { return 1; }\n"),
+        ("spaces/tool.c", "static int helper(void) { return 2; }\n"),
+    ]);
+    let out = packet(&p, "Who calls `helper` at src/with spaces/tool.c:1?", 800);
+    assert!(out.lines().any(|l| l.starts_with("def ") && l.contains("src/with spaces/tool.c:1")), "{out}");
+}
