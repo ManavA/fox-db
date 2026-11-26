@@ -363,13 +363,20 @@ fn parent_read_line(c: &Connection, p: &project::Project, transcript: &Path, roo
 
 /// Save the subagent's final report as a handoff row. Prints nothing: SubagentStop output can
 /// block the agent from stopping.
-fn subagent_stop(input: &Value, h: Harness) -> Result<String> {
+fn subagent_stop(cfg: &crate::config::Config, input: &Value, h: Harness) -> Result<String> {
     let Some(msg) = input["last_assistant_message"].as_str().filter(|m| !m.trim().is_empty()) else { return Ok(String::new()) };
-    if input["stop_hook_active"] == true {
-        return Ok(String::new());
-    }
     let cwd = cwd_of(input);
     let w = db::open_rw()?;
+    // A stop that a stop hook sent back was saved the first time, unless the stop gate (which
+    // saves nothing when it blocks) sent it back.
+    let held_back = cfg.hooks.stop_check
+        && input["agent_id"]
+            .as_str()
+            .filter(|s| !s.is_empty())
+            .is_none_or(|id| crate::agents::get(&w, id).is_none_or(|a| a.report.is_none()));
+    if input["stop_hook_active"] == true && !held_back {
+        return Ok(String::new());
+    }
     let Some(p) = project::find(&w, &project::locate(&cwd))? else { return Ok(String::new()) };
     let agent = input["agent_type"].as_str().filter(|s| !s.is_empty()).or_else(|| input["agent_id"].as_str());
     let report = crate::handoff::post(
@@ -408,6 +415,21 @@ fn subagent_stop(input: &Value, h: Harness) -> Result<String> {
         crate::agents::finish(&w, id, "done", Some(report))?;
     }
     Ok(String::new())
+}
+
+/// The opt-in stop gate (`[hooks] stop_check`): a `decision: block` whose reason lists the
+/// certain callers of changed signatures that the diff missed, else None. A stop that a stop
+/// hook already sent back (`stop_hook_active`) is never blocked again.
+fn stop_check(cfg: &crate::config::Config, input: &Value) -> Option<String> {
+    if !cfg.hooks.stop_check || input["stop_hook_active"] == true || !db::db_path().exists() {
+        return None;
+    }
+    let cwd = cwd_of(input);
+    let mut w = db::open_rw().ok()?;
+    let p = project::find(&w, &project::locate(&cwd)).ok()??;
+    let r = crate::check::run(&mut w, &p, &cwd, true).ok()?;
+    let reason = format!("{}Update these call sites, or say why each needs no change.", crate::check::render(&r));
+    r.blocks().then(|| json!({"decision": "block", "reason": reason}).to_string())
 }
 
 /// A report's opening, clipped to fit a swarm entry with the report's handle at its end.
@@ -501,7 +523,12 @@ pub fn run_with(cfg: &crate::config::Config, event: &str, stdin: &str, h: Harnes
     let r = match event {
         "session-start" => session_start(&input, h),
         "subagent-start" => subagent_start(cfg, &input, h),
-        "subagent-stop" => subagent_stop(&input, h),
+        // Opt-in (`[hooks] stop_check`): off, Stop prints nothing and SubagentStop only saves.
+        "stop" => Ok(stop_check(cfg, &input).unwrap_or_default()),
+        "subagent-stop" => match stop_check(cfg, &input) {
+            Some(block) => Ok(block),
+            None => subagent_stop(cfg, &input, h),
+        },
         "pre-compact" => pre_compact(&input, h),
         // Opt-in (`[hooks] grep_context` / `prompt_context`): off, they print nothing.
         "post-tool-use" if cfg.hooks.grep_context => crate::toolhook::grep_context(&input).map(|t| context("PostToolUse", t)),

@@ -90,6 +90,9 @@ grep_context = false
 prompt_context = false
 # Restate the swarm board protocol in SubagentStart briefs (docs/multi-agent.md).
 swarm_board = false
+# Opt-in stop gate (step 6, "Stop gate"): block a stop once while certain callers of a changed
+# signature are not in the diff.
+stop_check = false
 EOF
 cat ~/.foxdb/config.toml
 ```
@@ -257,6 +260,29 @@ fields keep the PostToolUse hook from starting for any other Bash command):
 ```
 
 The uninstall step below removes these too (their commands contain `.foxdb/bin/fox`).
+
+### Stop gate (opt-in)
+
+With `stop_check = true` under `[hooks]`, the `Stop` and `SubagentStop` hooks run `fox check`
+before the agent stops: it re-indexes the files in the git diff, finds the functions whose
+signature lines the diff changed, and lists each caller resolved with certainty whose enclosing
+function the diff does not touch. If there is one, the hook answers
+`{"decision": "block", "reason": "<the missed path:line rows>"}`, so the agent keeps working
+with that list as its next instruction. It blocks once: when the input says
+`stop_hook_active: true` (the agent is already continuing because of a stop hook) it lets the
+stop through. Callers guessed by name are listed in the reason but never block. Off, `Stop`
+prints nothing and `SubagentStop` only saves the report. It runs in the main checkout only (a
+linked worktree's files are not indexed) and allows itself 30 s, so give it a longer `timeout`.
+Offer it only when the user wants it; a block costs one extra turn.
+
+```json
+{"hooks": {
+  "Stop": [{"hooks": [
+    {"type": "command", "timeout": 30, "command": "H=\"$HOME/.foxdb/bin/fox\"; [ -x \"$H\" ] && \"$H\" hook stop --harness claude; exit 0"}]}]
+}}
+```
+
+`SubagentStop` already has its entry from the four hooks above; raise its `timeout` to 30 too.
 
 ### Codex hooks
 

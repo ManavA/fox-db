@@ -234,7 +234,9 @@ fn main() -> ExitCode {
     // Hooks fail open too: read stdin, print the hook JSON or nothing, always exit 0.
     if verb.first() == Some(&"hook") {
         let event = verb.get(1).map(|s| s.to_string()).unwrap_or_default();
-        let deadline_ms = std::env::var("FOXDB_BRIEF_DEADLINE_MS").ok().and_then(|v| v.parse().ok()).unwrap_or(1500);
+        // The stop gate re-indexes the diff first, so it gets longer than the context hooks.
+        let fallback = if matches!(event.as_str(), "stop" | "subagent-stop") { 30_000 } else { 1500 };
+        let deadline_ms = std::env::var("FOXDB_BRIEF_DEADLINE_MS").ok().and_then(|v| v.parse().ok()).unwrap_or(fallback);
         let h = hook::Harness::parse(&a.harness);
         let mut input = String::new();
         let _ = std::io::stdin().take(1 << 20).read_to_string(&mut input);
@@ -281,6 +283,19 @@ fn main() -> ExitCode {
                 } else {
                     ExitCode::SUCCESS
                 }
+            }
+            Err(e) => {
+                eprintln!("fox: {e:#}");
+                ExitCode::FAILURE
+            }
+        };
+    }
+    // `fox check` exits 3 when certain callers of a changed signature are not in the diff.
+    if verb.first() == Some(&"check") {
+        return match foxdb::check::cli(&a, &cwd()) {
+            Ok(r) => {
+                print!("{}", foxdb::check::render(&r));
+                if r.blocks() { ExitCode::from(3) } else { ExitCode::SUCCESS }
             }
             Err(e) => {
                 eprintln!("fox: {e:#}");

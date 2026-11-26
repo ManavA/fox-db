@@ -90,6 +90,10 @@ pub struct Hooks {
     /// snapshot on, post fact/failed/question with handles). Off unless set.
     #[serde(default)]
     pub swarm_board: bool,
+    /// Stop and SubagentStop: run `fox check` and block the stop once when certain callers of a
+    /// changed signature are not in the diff. Off unless set.
+    #[serde(default)]
+    pub stop_check: bool,
 }
 
 pub const DEFAULT_SKIP_AGENTS: &[&str] = &["egm-*", "*goldfish*", "*reviewer*"];

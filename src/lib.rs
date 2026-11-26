@@ -2,6 +2,7 @@
 pub mod account;
 pub mod agents;
 pub mod bg;
+pub mod check;
 pub mod cli;
 pub mod codanna;
 pub mod code;

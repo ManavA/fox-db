@@ -59,6 +59,7 @@ cd ~/src/my-app && ~/.foxdb/bin/fox index .
 | `FOXDB_CODEX_SESSIONS` | `~/.codex/sessions` | Codex rollouts for `fox ingest sessions` |
 | `[hooks] skip_agents` (config.toml) | `["egm-*", "*goldfish*", "*reviewer*"]` | Agents that get no SubagentStart brief |
 | `[hooks] swarm_board` (config.toml) | `false` | Add the swarm board protocol line to SubagentStart briefs ([multi-agent](multi-agent.md)) |
+| `[hooks] stop_check` (config.toml) | `false` | Stop and SubagentStop run `fox check` and block the stop once when certain callers of a changed signature are not in the diff ([Edit-completeness gate](#edit-completeness-gate-fox-check)) |
 | `[search] backend` (config.toml) | `fts5` | `fts5`: never use tantivy; `auto` (opt-in): a project with at least `tantivy_min_docs` rows gets a tantivy index, smaller ones keep FTS5 only; `tantivy`: every project. `[search.projects]` overrides it per project name. See [Big projects](#big-projects-tantivy-and-the-walk-record) |
 | `[search] tantivy_min_docs` (config.toml) | `1000000` | Rows a project needs before `auto` gives it a tantivy index |
 | `[search] writer_mb` (config.toml) | `64` | Indexing memory of `foxd`'s tantivy writer (one thread) |
@@ -95,6 +96,7 @@ common dir, so worktrees share one project).
 fox --version
 fox find <query> [--kind any|symbol|file|doc|milestone|dir|memory] [--all] [--limit N] [--budget TOKENS]
 fox code <symbol|handle|path> [--rel callers|callees|refs|conforms|subtypes|extensions|overrides|outline|src|impact] [--depth N] [--budget TOKENS] [--cursor N] [--fallback] [--fresh]
+fox check [--project P] [--no-fresh]
 fox watch [PATH]
 fox mcp
 fox status
@@ -108,7 +110,7 @@ fox mem post <text> [--kind finding|claim|request|decision|report] [--title T] [
 fox mem read [query|h:ID] [--kind K]
 fox mem pickup h:ID [--by NAME]
 fox mem check
-fox hook session-start|subagent-start|subagent-stop|pre-compact [--harness claude|codex]
+fox hook session-start|subagent-start|subagent-stop|stop|pre-compact [--harness claude|codex]
 fox drift [doc.md]
 fox pack <doc.md> [--budget TOKENS]
 fox scip import <index.scip> [--project P] [--trust-mtime]
@@ -295,6 +297,9 @@ Opt-in search hooks (off by default; AGENTS-SETUP.md step 6 has the settings ent
   prompt (`snake_case`, `camelCase`, `Type.member`, a backticked name, a source path) that
   resolves to exactly one indexed definition (same case) or file, adds its location, caller
   count and handle (at most 5 rows). Plain words and names with several definitions add nothing.
+- `stop` and `subagent-stop` with `[hooks] stop_check = true`: the stop gate. When certain
+  callers of a changed signature are not in the diff, it blocks the stop once with their
+  `path:line` rows as the reason ([Edit-completeness gate](#edit-completeness-gate-fox-check)).
 
 Prompt-cache safety. By default fox-db adds context only at SessionStart and SubagentStart, never from
 PreToolUse, PostToolUse or UserPromptSubmit (the opt-in search hooks above are the exception): Claude Code rewrites the cached history when a tool
@@ -336,6 +341,39 @@ To find or trace code, run `~/.foxdb/bin/fox` first, even when a grep looks quic
 `fox mem brief`, `fox mem read` / `fox mem post <finding>`. Rows start with handles and end in path:line;
 `~` rows are tree-sitter, not compiler-resolved.
 ```
+
+## Edit-completeness gate (fox check)
+
+`fox check [--project P] [--no-fresh]` asks one question of the working tree: did the diff update
+every caller of the functions whose signature it changed? It re-indexes the changed files first
+(skip with `--no-fresh`), so callers the diff itself added or moved are seen at their new lines.
+A definition counts as changed when `git diff HEAD` (plus untracked files) touches its signature
+lines, from its first line to the line that opens its body; a body-only edit changes nothing. A
+caller counts as updated when the diff touches its enclosing function, or its own line at file
+top level.
+
+```
+$ fox check
+fox check: 1 of 3 certain callers of the changed definitions are not in the diff
+changed: compute src/lib.rs:1
+  src/lib.rs:14 third c:10 calls compute
+guessed callers not in the diff (not blocking; confirm the ones that matter):
+  src/shapes.rs:17 total c:13 calls area guess 1 of 2
+```
+
+Callers resolved with certainty are the ones that block; callers resolved by a guess between
+same-name definitions get their own list and the existing `guess 1 of N` / `guess by name`
+wording. The exit code is 3 when a certain caller is missed, 0 when every one is in the diff
+(`fox check: ok; all 3 certain callers of the changed definitions are in the diff`), and 1 on an
+error. It reads the tree-sitter index only (no Swift index-store edges yet), runs in the
+checkout the project indexes (not a linked worktree), and does not follow renames or deleted
+definitions: their callers no longer resolve to anything.
+
+The opt-in Stop gate (`[hooks] stop_check = true`, hook entries in AGENTS-SETUP.md step 6) runs
+the same check from `fox hook stop` and `fox hook subagent-stop`, and blocks the stop once with
+`{"decision": "block", "reason": "<the rows above>"}`. With `stop_hook_active: true` in its
+input it lets the stop through, so it never blocks twice in a row. A SubagentStop it blocks
+saves no report; the next stop saves it.
 
 ## Docs anchored to code
 

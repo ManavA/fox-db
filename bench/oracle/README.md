@@ -59,6 +59,16 @@ Rows written before depth and answers were recorded can take them from the task 
 `no answers recorded`. Grading matches names only, so a `fox_extra` row that shares its name
 with an expected item is left out of the counts.
 
+## Edit tasks graded by the compiler (not built yet)
+
+The tasks above grade an answer. The next kind grades an edit: "add a parameter to X and fix
+every caller", passing when `cargo check` or `go build` succeeds in the run's clone afterwards,
+with the `fox check` stop gate (`[hooks] stop_check`) as a third arm. `ab.py` cannot run these
+yet: Claude Code runs without edit permission (`claude -p` with no `--permission-mode`), Codex
+runs `-s read-only`, and rows are graded from the answer alone. Adding it needs a task field
+naming the build command, an edit-permitted mode for both harnesses, and the build's exit code
+in the row.
+
 ## Related work
 
 - arXiv 2610.33958, each extra hop halves the odds of localization: https://arxiv.org/abs/2610.33958
