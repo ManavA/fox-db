@@ -174,7 +174,7 @@ const STYLE_WORDS: &[&str] = &["snake_case", "camelCase", "PascalCase", "SCREAMI
 
 /// An identifier with a code signal: `_`, `::`, `.`, `()`, or a lower-to-upper case change.
 /// All-caps names count only with the project's prefix (`FOXDB_HOME`), not other tools' (`RUST_LOG`).
-fn code_shaped(s: &str, caps_prefix: &str) -> bool {
+pub(crate) fn code_shaped(s: &str, caps_prefix: &str) -> bool {
     let t = s.strip_suffix("()").unwrap_or(s);
     if STYLE_WORDS.contains(&t) {
         return false;
@@ -502,6 +502,14 @@ fn scan_text(text: &str, n: &Needles, found: &mut Found) {
             }
         }
     }
+}
+
+/// Does `text` hold `word` as a whole word? The same test [`check`] uses to call a name gone.
+pub(crate) fn mentions(text: &str, word: &str) -> bool {
+    let n = Needles { words: HashSet::from([word.to_string()]), flags: HashSet::new() };
+    let mut found = Found::default();
+    scan_text(text, &n, &mut found);
+    !found.words.is_empty()
 }
 
 /// Which needles occur in the project's code and config text (not docs, not `skip`), and whether

@@ -282,7 +282,13 @@ Hooks. fox-db does not install these; add them to `~/.claude/settings.json` your
 - A brief cut at its budget or cap ends with `+N lines (brief cut short; fox_memory op=brief budget=2000)`; that call returns up to 2,000 tokens, so it gives back the cut lines. The hook budgets (400 tokens at SessionStart, 250 at SubagentStart) are in `context-budget.json`.
 - Every session-start also registers the session in the agent registry (only when a store exists).
 
-Opt-in search hooks (off by default; AGENTS-SETUP.md step 6 has the settings entries):
+Opt-in tool hooks (off by default; AGENTS-SETUP.md step 6 has the settings entries):
+
+- `pre-tool-use` with `[hooks] fact_gate = true` checks grounded project citations in
+  Edit, Write and Bash calls. It adds at most one line of `additionalContext` when a project
+  name or path is provably absent and there is an indexed suggestion. The tool call still
+  runs. It checks qualified Rust references, Python imports, and simple Bash read and
+  search commands. New files, changed files, and citations outside the indexed code are skipped.
 
 - `post-tool-use` with `[hooks] grep_context = true`: after a Bash `grep -n`, `rg -n` or
   `git grep -n` in an indexed project, adds `path:lines kind Name c:handle` for the definition
@@ -297,7 +303,7 @@ Opt-in search hooks (off by default; AGENTS-SETUP.md step 6 has the settings ent
   count and handle (at most 5 rows). Plain words and names with several definitions add nothing.
 
 Prompt-cache safety. By default fox-db adds context only at SessionStart and SubagentStart, never from
-PreToolUse, PostToolUse or UserPromptSubmit (the opt-in search hooks above are the exception): Claude Code rewrites the cached history when a tool
+PreToolUse, PostToolUse or UserPromptSubmit (the opt-in tool hooks above are the exception): Claude Code rewrites the cached history when a tool
 hook returns context (anthropics/claude-code#83913), and per-prompt context grows every turn. A
 test runs every hook event and fails if any other one injects. The PreCompact lines are
 summariser instructions, plain text rather than `additionalContext`, and the same test checks
