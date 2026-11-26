@@ -97,6 +97,7 @@ fox --version
 fox find <query> [--kind any|symbol|file|doc|milestone|dir|memory] [--all] [--limit N] [--budget TOKENS]
 fox code <symbol|handle|path> [--rel callers|callees|refs|conforms|subtypes|extensions|overrides|outline|src|impact] [--depth N] [--budget TOKENS] [--cursor N] [--fallback] [--fresh]
 fox check [--project P] [--no-fresh]
+fox packet "<question>" [--project P] [--budget TOKENS]
 fox watch [PATH]
 fox mcp
 fox status
@@ -188,6 +189,7 @@ top: code callers ~1800/5, code outline ~1300/3, code callees ~700/1, code impac
 - `stats` reports estimated tokens saved: each answer is compared with a ranged read of 30 lines around each line it cites, never more than the whole file (about 4 characters per token). A coarse weekly line ends the session brief; tool answers never carry a note, so identical answers stay byte-identical.
 - `watch` keeps a project fresh with inotify/FSEvents (skip-listed dirs such as `node_modules` are not watched).
 - `mem brief` is fail-open: it never prints errors and always exits 0, so it is safe in hooks.
+- `packet "<question>"` computes a question's answer context up front, for a model that will not chain graph calls itself. It takes the names the question mentions (backticked names, `a::b` and `a.b` paths, snake_case and camelCase words), resolves each to a unique indexed definition (a `path:line` in the question, such as `defined at diff.c:360`, can pick among same-name definitions) and prints, for up to 4 of them, the definition line, `callers` and 2-hop `impact` as `fox code` prints them, accounting line and verdict included. Ambiguous names are reported with a request for a location. Impact d1 rows that repeat a caller are counted on one `(N more d1 dependents are the callers listed above, not repeated)` line. Rows resolved only by a guess by name move under `guesses by name (not certain; ...)` after the certain rows of their answer, with their full path. The default budget is 800 tokens, estimated at four bytes per token. To fit the budget, the packet drops guessed rows first, then deeper rows and ancillary ledger groups, then source excerpts and direct rows. A line near the top counts what was left out. If there is no unique definition to expand, the packet supplies `fox find` results within the same budget. The output is deterministic. MCP: `fox_graph rel=packet target=<question>`.
 - `code --rel impact` with no target uses the working-tree git diff; in 0.1.0 this covers changed Swift files only (other languages print `no changed Swift files vs HEAD`; name a symbol instead).
 
 ## MCP tools
@@ -197,7 +199,7 @@ top: code callers ~1800/5, code outline ~1300/3, code callees ~700/1, code impac
 | Tool | Arguments | Does |
 |---|---|---|
 | `fox_find` | `q`, `kind?` (any/symbol/file/dir/doc/milestone/memory), `project?` (name or `all`), `budget?`, `cursor?` | Ranked search |
-| `fox_graph` | `target?`, `rel` (callers/callees/refs/conforms/subtypes/extensions/overrides/impact), `depth?`, `budget?`, `cursor?` | Code graph of a symbol |
+| `fox_graph` | `target?`, `rel` (callers/callees/refs/conforms/subtypes/extensions/overrides/impact/packet), `depth?`, `budget?`, `cursor?` | Code graph of a symbol; `rel=packet` takes a question as `target` (see `fox packet`) |
 | `fox_read` | `target`, `mode?` (outline/signature/body/section/context), `lines?` (`a-b`), `budget?`, `cursor?` | Read a handle or path compactly; `h:` handoffs and `x:` session digests too |
 | `fox_memory` | `op` (brief/recall/note/check/post/read/pickup/take/packet/agents/dispatch/wait), `q?`, `text?`, `kind?`, `topic?`, `since?`, `evidence?`, `next?`, `id?`, `harness?`, `writer?`, `reviewer?`, `any?`, `timeout?`, `budget?` | Session brief, recall, notes, the handoff board, packets, the agent tree, dispatch and bounded wait (see [multi-agent.md](multi-agent.md)) |
 

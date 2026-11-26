@@ -146,6 +146,7 @@ fox code UploadWorker --rel outline       # members of a type or file
 fox code upload --rel callers             # who calls it (also callees, refs, overrides, subtypes, impact)
 fox code upload --rel impact --depth 3    # everything that transitively depends on it
 fox code s:1a2 --rel src                  # the source of one symbol, budgeted
+fox packet 'who calls `upload`?'          # callers and 2-hop impact of each symbol a question names, in one answer
 ```
 
 Swift links come from Xcode's index and are exact. Other languages are linked by name; a link
