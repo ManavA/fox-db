@@ -1,5 +1,5 @@
 //! Project identity from a cwd: keyed by git common dir (so worktrees map to their main repo),
-//! or by the directory itself when it is not inside a git repo. No `git` subprocess.
+//! by the worktree git dir when explicitly indexed separately, or by a non-git directory.
 
 use anyhow::Result;
 use rusqlite::{Connection, OptionalExtension, params};
@@ -7,7 +7,7 @@ use std::path::{Path, PathBuf};
 
 #[derive(Debug, Clone)]
 pub struct Located {
-    /// Directory that gets indexed (main worktree root, or the cwd for non-git dirs).
+    /// Directory that gets indexed.
     pub root: PathBuf,
     /// Canonical git common dir, if any.
     pub common_dir: Option<PathBuf>,
@@ -24,6 +24,26 @@ pub struct Project {
     pub root: PathBuf,
     pub kind: String,
     pub indexed_at: Option<i64>,
+}
+
+impl Located {
+    pub fn repo_root(&self) -> &Path {
+        self.common_dir.as_deref().filter(|p| p.file_name().is_some_and(|name| name == ".git")).and_then(Path::parent).unwrap_or(&self.root)
+    }
+
+    fn key(&self) -> &Path {
+        self.git_dir
+            .as_deref()
+            .filter(|gd| separate_index(gd, self.common_dir.as_deref()))
+            .or(self.common_dir.as_deref())
+            .unwrap_or(&self.root)
+    }
+}
+
+pub(crate) const SEPARATE_INDEX: &str = "foxdb-separate-index";
+
+fn separate_index(git_dir: &Path, common_dir: Option<&Path>) -> bool {
+    Some(git_dir) != common_dir && git_dir.join(SEPARATE_INDEX).is_file()
 }
 
 fn canon(p: &Path) -> PathBuf {
@@ -55,7 +75,9 @@ pub fn locate(cwd: &Path) -> Located {
             if let Some(gd) = git_dir.filter(|g| g.join("HEAD").exists()) {
                 let common =
                     std::fs::read_to_string(gd.join("commondir")).ok().map(|c| canon(&gd.join(c.trim()))).unwrap_or_else(|| canon(&gd));
-                let root = if common.file_name().is_some_and(|n| n == ".git") {
+                let root = if separate_index(&gd, Some(&common)) {
+                    d.to_path_buf()
+                } else if common.file_name().is_some_and(|n| n == ".git") {
                     common.parent().map(Path::to_path_buf).unwrap_or_else(|| d.to_path_buf())
                 } else {
                     d.to_path_buf()
@@ -84,7 +106,7 @@ fn row(r: &rusqlite::Row) -> rusqlite::Result<Project> {
 const COLS: &str = "id, name, root, kind, indexed_at";
 
 pub fn find(c: &Connection, loc: &Located) -> Result<Option<Project>> {
-    let key = loc.common_dir.as_ref().unwrap_or(&loc.root).to_string_lossy().into_owned();
+    let key = loc.key().to_string_lossy().into_owned();
     Ok(c.query_row(&format!("SELECT {COLS} FROM project WHERE git_common_dir = ?1"), [key], row).optional()?)
 }
 
@@ -97,7 +119,7 @@ pub fn ensure(c: &Connection, loc: &Located) -> Result<Project> {
     if let Some(p) = find(c, loc)? {
         return Ok(p);
     }
-    let key = loc.common_dir.as_ref().unwrap_or(&loc.root).to_string_lossy().into_owned();
+    let key = loc.key().to_string_lossy().into_owned();
     let base = loc.root.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_else(|| "root".into());
     let mut name = base.clone();
     let mut i = 2;

@@ -42,7 +42,7 @@ pub fn fox_exe() -> String {
     exe.to_string_lossy().into_owned()
 }
 
-fn harness_bin(h: &str) -> String {
+pub fn harness_bin(h: &str) -> String {
     let var = if h == "codex" { "FOXDB_CODEX_BIN" } else { "FOXDB_CLAUDE_BIN" };
     std::env::var(var).ok().filter(|s| !s.is_empty()).unwrap_or_else(|| h.to_string())
 }

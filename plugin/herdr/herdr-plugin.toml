@@ -1,0 +1,19 @@
+# foxdb for herdr: start a native Claude Code or Codex session in a new worktree, and index the
+# worktrees herdr creates. Link it with `herdr plugin link <foxdb checkout>/plugin/herdr`.
+# Both commands run the `fox` on PATH as separate processes; see docs/crew.md.
+id = "foxdb.crew"
+name = "foxdb crew"
+version = "0.2.6"
+min_herdr_version = "0.7.0"
+description = "New fox session: a native claude or codex CLI in its own worktree, indexed by foxdb"
+platforms = ["linux", "macos"]
+
+[[actions]]
+id = "new-fox-session"
+title = "New fox session"
+contexts = ["workspace"]
+command = ["fox", "crew", "herdr", "new"]
+
+[[events]]
+on = "worktree.created"
+command = ["fox", "crew", "herdr", "worktree-created"]

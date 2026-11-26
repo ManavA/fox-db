@@ -13,7 +13,7 @@
 
 use crate::{db, project, query};
 use anyhow::{Result, bail};
-use rusqlite::{Connection, OptionalExtension, params};
+use rusqlite::{Connection, OptionalExtension, Transaction, TransactionBehavior, params};
 use std::fmt::Write;
 use std::path::Path;
 
@@ -215,10 +215,10 @@ fn child_alive(a: &Agent) -> bool {
     a.child_pid.is_some_and(|p| alive(p, a.child_start))
 }
 
-/// Is a `running` agent still there?
-fn is_live(a: &Agent, now: i64) -> bool {
+/// Is a `running` agent still there? An unreachable crew backend leaves it unverified.
+fn liveness(a: &Agent, now: i64) -> Option<bool> {
     if let Some(pid) = a.pid {
-        return alive(pid, a.pid_start) || child_alive(a);
+        return if alive(pid, a.pid_start) || child_alive(a) { Some(true) } else { crate::crew::pane_liveness(a.label.as_deref(), &a.id) };
     }
     let mut last = a.heartbeat_at;
     if let Some(t) = &a.transcript
@@ -227,15 +227,15 @@ fn is_live(a: &Agent, now: i64) -> bool {
     {
         last = last.max(d.as_secs() as i64);
     }
-    now - last <= stale_secs()
+    if now - last <= stale_secs() { Some(true) } else { crate::crew::pane_liveness(a.label.as_deref(), &a.id) }
 }
 
-/// How many `running` children of `parent` are alive (see `is_live`): a session with live
+/// How many `running` children of `parent` are alive: a session with live
 /// subagents shares its MCP server, and so its identity, with them.
 pub fn live_children(c: &Connection, parent: &str) -> usize {
     let now = db::now();
     let Ok(mut s) = c.prepare_cached(&format!("SELECT {COLS} FROM agent WHERE parent = ?1 AND status = 'running'")) else { return 0 };
-    s.query_map([parent], row).map(|it| it.flatten().filter(|a| is_live(a, now)).count()).unwrap_or(0)
+    s.query_map([parent], row).map(|it| it.flatten().filter(|a| liveness(a, now) == Some(true)).count()).unwrap_or(0)
 }
 
 /// Mark `running` agents whose process died (or whose heartbeat lapsed) as `stale`; free their
@@ -247,9 +247,19 @@ pub fn refresh(w: &Connection) -> Result<usize> {
         s.query_map([], row)?.flatten().collect()
     };
     let mut n = 0;
-    for a in running.iter().filter(|a| !is_live(a, now)) {
-        let k = w.execute("UPDATE agent SET status = 'stale' WHERE id = ?1 AND status = 'running'", [&a.id])?;
-        w.execute("DELETE FROM lease WHERE agent = ?1", [&a.id])?;
+    for a in running.iter().filter(|a| liveness(a, now) == Some(false)) {
+        let tx = w.unchecked_transaction()?;
+        let k = tx.execute(
+            "UPDATE agent SET status = 'stale'
+             WHERE id = ?1 AND status = 'running' AND heartbeat_at = ?2
+               AND pid IS ?3 AND pid_start IS ?4 AND child_pid IS ?5 AND child_start IS ?6
+               AND label IS ?7 AND transcript IS ?8",
+            params![a.id, a.heartbeat_at, a.pid, a.pid_start, a.child_pid, a.child_start, a.label, a.transcript],
+        )?;
+        if k > 0 {
+            tx.execute("DELETE FROM lease WHERE agent = ?1", [&a.id])?;
+        }
+        tx.commit()?;
         // A dead worker's partial work stays addressable: record where it left the tree.
         if k > 0
             && a.base_commit.is_some()
@@ -358,14 +368,24 @@ pub fn live(c: &Connection) -> Result<String> {
 
 /// The lease key for a directory: its project root.
 pub fn repo_key(dir: &Path) -> String {
-    project::locate(dir).root.to_string_lossy().into_owned()
+    project::locate(dir).repo_root().to_string_lossy().into_owned()
 }
 
 /// A lease holder is live while its process, or (for a dispatched writer) its harness child, runs.
-fn holder_live(w: &Connection, agent: &str, pid: Option<i64>, start: Option<i64>) -> bool {
-    match pid {
-        Some(p) => alive(p, start) || get(w, agent).is_some_and(|a| child_alive(&a)),
-        None => get(w, agent).is_some_and(|a| a.status == "running" && is_live(&a, db::now())),
+fn holder_liveness(w: &Connection, agent: &str, pid: Option<i64>, start: Option<i64>) -> Option<bool> {
+    if let Some(pid) = pid {
+        if alive(pid, start) {
+            return Some(true);
+        }
+        let Some(a) = get(w, agent) else { return Some(false) };
+        if child_alive(&a) {
+            return Some(true);
+        }
+        return if a.status == "running" { crate::crew::pane_liveness(a.label.as_deref(), agent) } else { Some(false) };
+    }
+    match get(w, agent) {
+        Some(a) if a.status == "running" => liveness(&a, db::now()),
+        _ => Some(false),
     }
 }
 
@@ -430,30 +450,32 @@ pub fn ambient_id(c: Option<&Connection>, prefix: &str) -> String {
 /// Take the writer lease on `repo` for `agent`. `Err(holder)` when someone else holds it and is
 /// alive. A dead holder's lease is taken over.
 pub fn lease_take(w: &Connection, repo: &str, agent: &str, pid: Option<i64>) -> Result<std::result::Result<(), String>> {
-    w.execute_batch("BEGIN IMMEDIATE")?;
-    let r = (|| -> Result<std::result::Result<(), String>> {
-        let cur: Option<(String, Option<i64>, Option<i64>)> = w
-            .query_row("SELECT agent, pid, pid_start FROM lease WHERE repo = ?1", [repo], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
-            .optional()?;
-        if let Some((h, p, s)) = cur
-            && h != agent
-            && holder_live(w, &h, p, s)
-        {
-            return Ok(Err(h));
+    type Incumbent = (String, Option<i64>, Option<i64>, i64);
+    let incumbent = |c: &Connection| -> Result<Option<Incumbent>> {
+        Ok(c.query_row("SELECT agent, pid, pid_start, taken_at FROM lease WHERE repo = ?1", [repo], |r| {
+            Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?))
+        })
+        .optional()?)
+    };
+    loop {
+        let observed = incumbent(w)?;
+        let live_holder =
+            observed.as_ref().filter(|(holder, p, start, _)| holder != agent && holder_liveness(w, holder, *p, *start) == Some(true));
+        // Pane probes can wait on IPC. Recheck the lease under the write lock.
+        let tx = Transaction::new_unchecked(w, TransactionBehavior::Immediate)?;
+        if incumbent(&tx)? != observed {
+            continue;
         }
-        w.execute(
+        if let Some((holder, _, _, _)) = live_holder {
+            return Ok(Err(holder.clone()));
+        }
+        tx.execute(
             "INSERT OR REPLACE INTO lease(repo, agent, pid, pid_start, taken_at) VALUES (?1, ?2, ?3, ?4, ?5)",
             params![repo, agent, pid, pid.and_then(proc_start), db::now()],
         )?;
-        Ok(Ok(()))
-    })();
-    match &r {
-        Ok(_) => w.execute_batch("COMMIT")?,
-        Err(_) => {
-            let _ = w.execute_batch("ROLLBACK");
-        }
+        tx.commit()?;
+        return Ok(Ok(()));
     }
-    r
 }
 
 /// Point an agent's leases at the process that now stands for it.
@@ -477,11 +499,15 @@ pub fn lease_list(w: &Connection) -> Result<String> {
     let now = db::now();
     let mut out = String::new();
     for (repo, agent, pid, start, at) in rows {
-        if !holder_live(w, &agent, pid, start) {
-            lease_release(w, &repo, Some(&agent))?;
-            continue;
-        }
-        let _ = writeln!(out, "{repo}  writer {agent}  {}", age(now, at));
+        let verified = match holder_liveness(w, &agent, pid, start) {
+            Some(true) => "",
+            Some(false) => {
+                lease_release(w, &repo, Some(&agent))?;
+                continue;
+            }
+            None => " (unverified)",
+        };
+        let _ = writeln!(out, "{repo} writer {agent} {}{verified}", age(now, at));
     }
     Ok(if out.is_empty() { "no writer leases\n".into() } else { out })
 }

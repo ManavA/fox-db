@@ -7,6 +7,7 @@ pub mod cli;
 pub mod codanna;
 pub mod code;
 pub mod config;
+pub mod crew;
 pub mod daemon;
 pub mod db;
 pub mod docref;

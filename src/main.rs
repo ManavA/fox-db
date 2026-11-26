@@ -350,6 +350,7 @@ fn main() -> ExitCode {
             Some("index") => cmd_index(&a),
             Some("eval") => cli::eval(&a, &cwd()),
             Some("swarm") => cli::swarm(&a, &cwd()),
+            Some("crew") => cli::crew(&a, &cwd()),
             Some("code") => cmd_code(&a),
             Some("mem") if matches!(a.pos.get(1).map(String::as_str), Some("post" | "read" | "pickup")) => cli::board(&a, &cwd()),
             Some("mem") if a.pos.get(1).map(String::as_str) == Some("check") => cli::mem_check(&a, &cwd()),
