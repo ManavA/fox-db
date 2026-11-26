@@ -307,8 +307,8 @@ fn main() -> ExitCode {
         };
     }
     // Short read verbs may open the store lockless in a read-only sandbox (see db::open_ro).
-    let lockless =
-        matches!(verb.first().copied(), Some("find" | "code" | "status" | "stats" | "drift" | "pack")) || verb == ["mem", "check"];
+    let lockless = matches!(verb.first().copied(), Some("find" | "code" | "packet" | "status" | "stats" | "drift" | "pack"))
+        || verb == ["mem", "check"];
     if lockless {
         db::allow_lockless_reads();
     }
@@ -336,6 +336,7 @@ fn main() -> ExitCode {
             Some("eval") => cli::eval(&a, &cwd()),
             Some("swarm") => cli::swarm(&a, &cwd()),
             Some("code") => cmd_code(&a),
+            Some("packet") => cli::question_packet(&a, &cwd()),
             Some("mem") if matches!(a.pos.get(1).map(String::as_str), Some("post" | "read" | "pickup")) => cli::board(&a, &cwd()),
             Some("mem") if a.pos.get(1).map(String::as_str) == Some("check") => cli::mem_check(&a, &cwd()),
             Some("drift" | "pack") => cli::docref(&a, &cwd()),

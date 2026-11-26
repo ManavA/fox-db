@@ -10,6 +10,7 @@ pub const USAGE: &str = "usage:
   fox --version
   fox find <query> [--kind any|symbol|file|doc|milestone|dir|memory] [--all] [--limit N] [--budget TOKENS]
   fox code <symbol|handle|path> [--rel callers|callees|refs|conforms|subtypes|extensions|overrides|outline|src|impact] [--depth N] [--budget TOKENS] [--cursor N] [--fallback] [--fresh]
+  fox packet <question> [--project P] [--budget TOKENS]   callers and 2-hop impact of the symbols a question names
   fox watch [PATH]
   fox mcp
   fox daemon status|stop        (run `foxd` to start the daemon)
@@ -622,6 +623,20 @@ pub fn code(a: &Args, cwd: &Path, served: Option<Served>) -> anyhow::Result<Stri
         _ => out,
     };
     Ok(account(&served, Some(p.id), &format!("code {}", a.rel), out))
+}
+
+/// `fox packet "<question>"`: the current project's, or `--project P`'s.
+pub fn question_packet(a: &Args, cwd: &Path) -> anyhow::Result<String> {
+    let q = a.pos[1..].join(" ");
+    if q.trim().is_empty() {
+        anyhow::bail!("packet needs a question\n{USAGE}");
+    }
+    let Some(c) = db::open_ro() else { anyhow::bail!("no store yet; run `fox index`") };
+    let p = match opt(a, "project") {
+        Some(n) => project::by_name(&c, n)?.ok_or_else(|| anyhow::anyhow!("no indexed project named {n:?}"))?,
+        None => project::find(&c, &project::locate(cwd))?.ok_or_else(|| anyhow::anyhow!("project not indexed; run `fox index`"))?,
+    };
+    crate::qpacket::run(&c, &p, &q, a.budget.unwrap_or(crate::qpacket::DEFAULT_BUDGET))
 }
 
 /// `fox eval retrieval`: score a query set against the indexed repo; `--gate` exits non-zero

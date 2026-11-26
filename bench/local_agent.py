@@ -9,8 +9,9 @@ one last turn to answer.
 Arms:
     grep     bash only
     fox-cli  bash plus a short guide to the `fox` CLI, run against the scratch FOXDB_HOME
-    packet   bash only, plus a callers/impact packet that fox computes up front for the symbols
-             the question names (or a `fox find` on the question when it names none)
+    packet   bash only, plus the `fox packet` answer context computed up front: definition, callers
+             and 2-hop impact of the symbols the question names (or a `fox find` on the question
+             when it names none). --packet-builder python uses the older builder here instead.
 
 Talks to any OpenAI-compatible /v1/chat/completions endpoint (llama.cpp `llama-server`) at
 temperature 0. Prints one JSON result line on stdout; --transcript writes every turn as JSON lines.
@@ -145,8 +146,14 @@ def _fox(fox: str, args: list, cwd: Path, env: dict) -> str:
     return p.stdout.strip() if p.returncode == 0 else ""
 
 
+def fox_packet(prompt: str, fox: str, cwd: Path, env: dict, budget: int = 800) -> str:
+    """`fox packet` on the prompt."""
+    return _fox(fox, ["packet", prompt, "--budget", str(budget)], cwd, env)
+
+
 def build_packet(prompt: str, fox: str, cwd: Path, env: dict, budget: int = 800) -> str:
-    """Callers (and impact, when callers resolve any call) for each name in the prompt, else a find."""
+    """The older Python builder, kept for comparison: callers (and impact, when callers resolve any
+    call) for each name in the prompt, else a find."""
     names = prompt_names(prompt)
     parts = []
     for name in names:
@@ -315,14 +322,19 @@ def main(argv=None) -> int:
     ap.add_argument("--max-tokens", type=int, default=2048, help="per reply, reasoning included")
     ap.add_argument("--output-cap", type=int, default=OUTPUT_CAP)
     ap.add_argument("--packet-budget", type=int, default=800, help="tokens (about 4 chars each)")
+    ap.add_argument("--packet-builder", choices=["fox", "python"], default="fox",
+                    help="fox: `fox packet`; python: the older builder in this file")
     ap.add_argument("--transcript", type=Path, default=None)
     a = ap.parse_args(argv)
     env = agent_env(a.arm, a.fox, a.scratch.resolve(), dict(os.environ))
-    packet = build_packet(a.prompt, a.fox, a.cwd, dict(os.environ), a.packet_budget) if a.arm == "packet" else ""
+    builder = fox_packet if a.packet_builder == "fox" else build_packet
+    packet = builder(a.prompt, a.fox, a.cwd, dict(os.environ), a.packet_budget) if a.arm == "packet" else ""
     res = run_agent(a.prompt, a.arm, a.cwd, env, a.url, packet=packet, steps=a.steps, token_cap=a.token_cap,
                     max_tokens=a.max_tokens, output_cap=a.output_cap, model=a.model,
                     effort=a.reasoning_effort or None, transcript=a.transcript)
     res["server"] = server_info(a.url)
+    if a.arm == "packet":
+        res["packet_builder"] = a.packet_builder
     print(json.dumps(res))
     return 0
 

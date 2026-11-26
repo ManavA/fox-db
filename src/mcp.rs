@@ -95,11 +95,11 @@ pub fn tools() -> Value {
             "project": {"type": "string", "description": "project name or 'all'"},
             "budget": budget, "cursor": cursor}}},
         {"name": "fox_graph", "_meta": always,
-         "description": "Who calls X, and what breaks if X changes? Callers, callees, refs, overrides, conformers or impact of a symbol; in tree-sitter languages callers, refs and impact rows carry the line of code. Use it before changing, renaming or deleting a function, field or type, even when a grep looks quicker: it follows qualified and aliased names. target: handle, name, Type.member or pkg.Name; impact without target = git diff.",
+         "description": "Who calls X, and what breaks if X changes? Callers, callees, refs, overrides, conformers or impact; tree-sitter callers, refs and impact rows carry the line of code. Use it before changing, renaming or deleting a function, field or type, even when a grep looks quicker: it follows qualified and aliased names. target: handle, name, Type.member or pkg.Name; impact without target = git diff; packet: target=question.",
          "annotations": ro,
          "inputSchema": {"type": "object", "properties": {
             "target": {"type": "string"},
-            "rel": {"type": "string", "enum": ["callers", "callees", "refs", "conforms", "subtypes", "extensions", "overrides", "impact"]},
+            "rel": {"type": "string", "enum": ["callers", "callees", "refs", "conforms", "subtypes", "extensions", "overrides", "impact", "packet"]},
             "depth": {"type": "integer", "description": "impact depth, default 2"},
             "budget": budget, "cursor": cursor}, "required": ["rel"]}},
         {"name": "fox_read", "_meta": always,
@@ -243,6 +243,10 @@ pub fn call_tool(name: &str, a: &Value) -> Result<String> {
             let Some(c) = ro else { bail!("no store yet; run `fox index`") };
             let Some(p) = current_project(Some(&c)) else { bail!("not in a project") };
             let rel = arg_s(a, "rel").unwrap_or("callers");
+            if rel == "packet" {
+                let b = arg_n(a, "budget").unwrap_or(crate::qpacket::DEFAULT_BUDGET).min(4000);
+                return Ok(while_indexing(Some(&p), crate::qpacket::run(&c, &p, arg_s(a, "target").unwrap_or(""), b)?));
+            }
             let o = code::CodeOpts { rel, depth: arg_n(a, "depth").unwrap_or(2), budget, cursor, fallback: false };
             Ok(while_indexing(Some(&p), code::run(&c, &p, arg_s(a, "target").unwrap_or(""), &o)?))
         }

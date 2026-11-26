@@ -26,6 +26,7 @@ pub mod outbox;
 pub mod packet;
 pub mod procinfo;
 pub mod project;
+pub mod qpacket;
 pub mod query;
 pub mod redact;
 pub mod report;

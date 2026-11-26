@@ -53,7 +53,8 @@ and an oracle padded with 50 decoys (precision must fall below 0.5), and runs no
 
 --harness local runs bench/local_agent.py against an OpenAI-compatible server (--local-url, e.g.
 llama.cpp llama-server) with three arms instead of on/off: grep (bash only), fox-cli (bash plus the
-`fox` CLI on the scratch store) and packet (bash plus a fox callers/impact packet up front). The
+`fox` CLI on the scratch store) and packet (bash plus a `fox packet` answer context up front;
+--local-packet-builder python uses local_agent.py's older builder). The
 arm goes in the row's `foxdb` field; report compares fox-cli and packet with grep. Rows add steps,
 cap, forced_final, loop and max_repeat; transcripts go to --work as NAME.transcript.jsonl.
 
@@ -368,7 +369,8 @@ def local_cmd(prompt: str, arm: str, cwd: Path, fox: str, scratch: Path, transcr
     cmd = [sys.executable, str(Path(__file__).resolve().parent / "local_agent.py"), "--prompt", prompt, "--arm", arm,
            "--cwd", str(cwd), "--scratch", str(scratch), "--fox", fox, "--url", a.local_url,
            "--steps", str(a.local_steps), "--token-cap", str(a.local_token_cap),
-           "--reasoning-effort", a.local_effort, "--transcript", str(transcript)]
+           "--reasoning-effort", a.local_effort, "--packet-builder", a.local_packet_builder,
+           "--transcript", str(transcript)]
     return cmd + (["--model", a.model] if a.model else [])
 
 
@@ -424,7 +426,7 @@ def usage_from_local(stdout: str) -> dict:
     except (json.JSONDecodeError, IndexError):
         return {"parse_error": True}
     keep = ("steps", "input", "output", "cap", "forced_final", "commands", "format_errors", "loop", "loop_commands",
-            "max_repeat", "packet_chars", "answer")
+            "max_repeat", "packet_chars", "packet_builder", "answer")
     server = j.get("server") or {}
     return {"turns": j.get("steps"), "agent_secs": j.get("secs"), "ctx": server.get("ctx"),
             "model": server.get("model"), **{k: j.get(k) for k in keep}}
@@ -551,6 +553,8 @@ def run_parser() -> argparse.ArgumentParser:
     ap.add_argument("--local-steps", type=int, default=20, help="turn cap for local (one last answer turn after)")
     ap.add_argument("--local-token-cap", type=int, default=200_000, help="prompt plus completion tokens, all turns")
     ap.add_argument("--local-effort", default="low", help="reasoning_effort chat template kwarg; '' for default")
+    ap.add_argument("--local-packet-builder", choices=["fox", "python"], default="fox",
+                    help="packet arm: `fox packet`, or local_agent.py's older Python builder")
     ap.add_argument("--out", type=Path, default=Path("ab-results.jsonl"))
     ap.add_argument("--grader-selftest", action="store_true", help="check the grader on each task and exit")
     ap.add_argument("--run", action="store_true", help="actually run (default: dry-run, print commands)")
