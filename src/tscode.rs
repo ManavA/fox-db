@@ -645,7 +645,7 @@ fn alias_macros(c: &Connection, top: &TSym) -> Result<HashMap<i64, String>> {
 
 /// ` guess 1 of N` after a site resolved by name among N same-name definitions; ` guess by
 /// name` when the only candidate was taken on its name alone (a call through a receiver).
-fn guess_note(amb: i64) -> String {
+pub(crate) fn guess_note(amb: i64) -> String {
     match amb {
         a if a > 1 => format!(" guess 1 of {a}"),
         1 => " guess by name".into(),

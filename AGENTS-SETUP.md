@@ -90,6 +90,9 @@ grep_context = false
 prompt_context = false
 # Restate the swarm board protocol in SubagentStart briefs (docs/multi-agent.md).
 swarm_board = false
+# Opt-in stop gate (step 6, "Stop gate"): block a stop once while certain callers of a changed
+# signature are not in the diff.
+stop_check = false
 EOF
 cat ~/.foxdb/config.toml
 ```
@@ -215,7 +218,7 @@ then adds the four hooks, replacing any earlier fox-db entries and keeping every
 mkdir -p ~/.claude && f=~/.claude/settings.json && { [ -f "$f" ] || echo '{}' > "$f"; }
 [ -f "$f.foxdb-backup" ] || cp "$f" "$f.foxdb-backup"
 jq '
-  def foxhook(ev): {hooks: [{type: "command", timeout: 2,
+  def foxhook(ev): {hooks: [{type: "command", timeout: (if ev == "subagent-stop" then 30 else 2 end),
     command: ("H=\"$HOME/.foxdb/bin/fox\"; [ -x \"$H\" ] && \"$H\" hook " + ev + " --harness claude; exit 0")}]};
   def notfox: all(.hooks[]?; (.command // "") | contains(".foxdb/bin/fox") | not);
   .hooks //= {}
@@ -258,6 +261,28 @@ fields keep the PostToolUse hook from starting for any other Bash command):
 
 The uninstall step below removes these too (their commands contain `.foxdb/bin/fox`).
 
+### Stop gate (opt-in)
+
+With `stop_check = true` under `[hooks]`, the `Stop` and `SubagentStop` hooks run `fox check`
+before the agent stops: it re-indexes the files in the git diff, finds the functions whose
+signature lines the diff changed, and lists each caller resolved with certainty whose enclosing
+function the diff does not touch. If there is one, the hook answers
+`{"decision": "block", "reason": "<the missed path:line rows>"}`, so the agent keeps working
+with that list as its next instruction. It blocks once: when the input says
+`stop_hook_active: true` (the agent is already continuing because of a stop hook) it lets the
+stop through. Callers guessed by name are listed in the reason but never block. Off, `Stop`
+prints nothing and `SubagentStop` only saves the report. It runs in the main checkout only (a
+linked worktree's files are not indexed). The stop hooks allow 25 s internally and use a 30 s
+harness timeout. SubagentStop saves its report before checking and updates the same report on retry.
+Offer it only when the user wants it; a block costs one extra turn.
+
+```json
+{"hooks": {
+  "Stop": [{"hooks": [
+    {"type": "command", "timeout": 30, "command": "H=\"$HOME/.foxdb/bin/fox\"; [ -x \"$H\" ] && \"$H\" hook stop --harness claude; exit 0"}]}]
+}}
+```
+
 ### Codex hooks
 
 Codex hooks take the same commands with `--harness codex` (output capped at about 2,200 tokens).
@@ -271,7 +296,7 @@ whatever `PATH` Codex sees):
 {"hooks": {
   "SessionStart": [{"hooks": [{"type": "command", "command": "/path/to/home/.foxdb/bin/fox hook session-start --harness codex"}]}],
   "SubagentStart": [{"hooks": [{"type": "command", "command": "/path/to/home/.foxdb/bin/fox hook subagent-start --harness codex"}]}],
-  "SubagentStop": [{"hooks": [{"type": "command", "command": "/path/to/home/.foxdb/bin/fox hook subagent-stop --harness codex"}]}],
+  "SubagentStop": [{"hooks": [{"type": "command", "timeout": 30, "command": "/path/to/home/.foxdb/bin/fox hook subagent-stop --harness codex"}]}],
   "PreCompact": [{"hooks": [{"type": "command", "command": "/path/to/home/.foxdb/bin/fox hook pre-compact --harness codex"}]}]
 }}
 ```

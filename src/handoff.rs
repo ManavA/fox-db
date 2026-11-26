@@ -54,6 +54,10 @@ pub fn parse_handle(h: &str) -> Option<i64> {
 }
 
 pub fn post(w: &Connection, p: &Post) -> Result<i64> {
+    post_at(w, p, None)
+}
+
+pub(crate) fn post_at(w: &Connection, p: &Post, id: Option<i64>) -> Result<i64> {
     if !KINDS.contains(&p.kind) {
         bail!("kind must be one of {}", KINDS.join("|"));
     }
@@ -70,14 +74,17 @@ pub fn post(w: &Connection, p: &Post) -> Result<i64> {
         e => e.map(redact::redact),
     };
     let topic = p.topic.map(|t| t.trim().chars().take(40).collect::<String>()).filter(|t| !t.is_empty());
-    w.execute(
-        "INSERT INTO handoff(project_id, kind, title, body, scope, harness, session, agent, evidence, created_at, topic, parent_id)
-         VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12)",
-        params![p.project_id, p.kind, title, text, p.scope, p.harness, p.session, p.agent, ev, db::now(), topic, p.parent],
+    let changed = w.execute(
+        "INSERT INTO handoff(project_id, kind, title, body, scope, harness, session, agent, evidence, created_at, topic, parent_id, id)
+         VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13)
+         ON CONFLICT(id) DO UPDATE SET title = excluded.title, body = excluded.body, evidence = excluded.evidence
+         WHERE title IS NOT excluded.title OR body IS NOT excluded.body OR evidence IS NOT excluded.evidence",
+        params![p.project_id, p.kind, title, text, p.scope, p.harness, p.session, p.agent, ev, db::now(), topic, p.parent, id],
     )?;
-    let id = w.last_insert_rowid();
-    db::bump_generation(w)?;
-    Ok(id)
+    if changed != 0 {
+        db::bump_generation(w)?;
+    }
+    Ok(id.unwrap_or_else(|| w.last_insert_rowid()))
 }
 
 /// Newest first: `h:1f request 2026-11-16 hana-impl  Title  [claimed by x]`.

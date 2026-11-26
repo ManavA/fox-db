@@ -10,6 +10,7 @@ pub const USAGE: &str = "usage:
   fox --version
   fox find <query> [--kind any|symbol|file|doc|milestone|dir|memory] [--all] [--limit N] [--budget TOKENS]
   fox code <symbol|handle|path> [--rel callers|callees|refs|conforms|subtypes|extensions|overrides|outline|src|impact] [--depth N] [--budget TOKENS] [--cursor N] [--fallback] [--fresh]
+  fox check [--project P] [--no-fresh]   certain callers of changed signatures the diff missed (exit 3)
   fox watch [PATH]
   fox mcp
   fox daemon status|stop        (run `foxd` to start the daemon)
@@ -27,7 +28,7 @@ pub const USAGE: &str = "usage:
   fox scip import <index.scip> [--project P] [--trust-mtime]   precise tier from a SCIP index your own build produced
   fox vectors setup [--yes] | build [--project P] | status   the opt-in vector arm (builds with --features vectors)
   fox ingest sessions [--since-days N] [--claude DIR] [--codex DIR]   (read-only transcript digests)
-  fox hook session-start|subagent-start|subagent-stop|pre-compact|post-tool-use|user-prompt-submit [--harness claude|codex]   (hook JSON on stdin)
+  fox hook session-start|subagent-start|subagent-stop|stop|pre-compact|post-tool-use|user-prompt-submit [--harness claude|codex]   (hook JSON on stdin)
 multi-agent:
   fox dispatch --harness codex|claude --task <text|h:ID> [--repo DIR] [--writer|--reviewer] [--label L] [--model M] [--packet h:ID]
   fox wait <agent|h:ID>... [--any|--all] [--timeout SECS]       exit 3 still running at the timeout, 4 stale/failed
@@ -106,7 +107,7 @@ pub fn parse(argv: Vec<String>) -> Result<Args, String> {
             "--fallback" => a.fallback = true,
             "--fresh" => a.fresh = true,
             "--tree" | "--any" | "--writer" | "--reviewer" | "--inline" | "--exec" | "--agents" | "--json" | "--no-wait"
-            | "--trust-mtime" | "--yes" => {
+            | "--trust-mtime" | "--yes" | "--no-fresh" => {
                 a.flags.insert(x.trim_start_matches('-').to_string());
             }
             "--title" | "--evidence" | "--by" | "--since-days" | "--claude" | "--codex" | "--goal" | "--state" | "--next"

@@ -77,7 +77,7 @@ fn hooks_are_the_four_cache_safe_events() {
         assert_eq!(hooks.len(), 1, "{event}");
         assert_eq!(hooks[0]["type"], "command");
         assert_eq!(hooks[0]["command"], format!("\"${{CLAUDE_PLUGIN_ROOT}}/scripts/hook.sh\" {arg}"), "{event}");
-        assert!(hooks[0]["timeout"].as_u64().unwrap() <= 10, "{event}");
+        assert_eq!(hooks[0]["timeout"], if event == "SubagentStop" { 30 } else { 5 }, "{event}");
     }
 }
 
@@ -217,6 +217,7 @@ fn codex_hooks_are_the_same_four_with_harness_codex() {
         let hooks = events[event][0]["hooks"].as_array().unwrap();
         assert_eq!(hooks.len(), 1, "{event}");
         assert_eq!(hooks[0]["command"], format!("\"$PLUGIN_ROOT/scripts/hook.sh\" {arg} codex"), "{event}");
+        assert_eq!(hooks[0]["timeout"], if event == "SubagentStop" { 30 } else { 5 }, "{event}");
     }
     let home = home_with_fox(0);
     let o = run("plugin/scripts/hook.sh", &["pre-compact", "codex"], home.path());

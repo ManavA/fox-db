@@ -7,7 +7,7 @@
 
 use crate::{db, project, query};
 use anyhow::Result;
-use rusqlite::Connection;
+use rusqlite::{Connection, OptionalExtension, TransactionBehavior};
 use serde_json::{Value, json};
 use std::path::{Path, PathBuf};
 
@@ -361,53 +361,103 @@ fn parent_read_line(c: &Connection, p: &project::Project, transcript: &Path, roo
     if line.len() == HEAD.len() { String::new() } else { line + "\n" }
 }
 
-/// Save the subagent's final report as a handoff row. Prints nothing: SubagentStop output can
-/// block the agent from stopping.
-fn subagent_stop(input: &Value, h: Harness) -> Result<String> {
-    let Some(msg) = input["last_assistant_message"].as_str().filter(|m| !m.trim().is_empty()) else { return Ok(String::new()) };
-    if input["stop_hook_active"] == true {
-        return Ok(String::new());
+fn save_subagent_report(input: &Value, h: Harness, agent_id: Option<&str>) -> Result<Option<(Connection, i64)>> {
+    let Some(msg) = input["last_assistant_message"].as_str().filter(|m| !m.trim().is_empty()) else { return Ok(None) };
+    let transcript = input["agent_transcript_path"].as_str().filter(|s| !s.is_empty());
+    let scope = agent_id
+        .map(|id| format!("subagent-stop:id:{id}"))
+        .or_else(|| transcript.map(|path| format!("subagent-stop:transcript:{}", crate::redact::redact(path))));
+    if input["stop_hook_active"] == true && scope.is_none() {
+        return Ok(None);
     }
-    let cwd = cwd_of(input);
-    let w = db::open_rw()?;
-    let Some(p) = project::find(&w, &project::locate(&cwd))? else { return Ok(String::new()) };
-    let agent = input["agent_type"].as_str().filter(|s| !s.is_empty()).or_else(|| input["agent_id"].as_str());
-    let report = crate::handoff::post(
-        &w,
+    let mut w = db::open_rw()?;
+    let Some(p) = project::find(&w, &project::locate(&cwd_of(input)))? else { return Ok(None) };
+    let session = input["session_id"].as_str();
+    let agent = input["agent_type"].as_str().filter(|s| !s.is_empty()).or(agent_id);
+    let tx = w.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    let existing = if let Some(scope) = scope.as_deref() {
+        tx.query_row(
+            "SELECT id FROM handoff WHERE project_id = ?1 AND kind = 'report' AND scope = ?2 AND harness = ?3 AND session IS ?4
+             ORDER BY id DESC LIMIT 1",
+            rusqlite::params![p.id, scope, h.name(), session],
+            |r| r.get(0),
+        )
+        .optional()?
+    } else {
+        None
+    };
+    if existing.is_none()
+        && input["stop_hook_active"] == true
+        && agent_id.and_then(|id| crate::agents::get(&tx, id)).is_some_and(|a| a.report.is_some())
+    {
+        return Ok(None);
+    }
+    let report = crate::handoff::post_at(
+        &tx,
         &crate::handoff::Post {
             project_id: p.id,
             kind: "report",
             text: msg,
+            scope: scope.as_deref(),
             harness: Some(h.name()),
-            session: input["session_id"].as_str(),
+            session,
             agent,
-            evidence: input["agent_transcript_path"].as_str(),
+            evidence: transcript,
             ..Default::default()
         },
+        existing,
     )?;
-    // Its gist on the board too, for siblings reading what is new: a short summary entry that
-    // links the report, with the paths and handles it cites as handles. Best effort: the report
-    // is saved and the agent finished whatever happens here.
-    let cites = crate::handoff::attachments(&w, p.id, &cited(msg), false).unwrap_or_default();
-    let _ = crate::handoff::post(
-        &w,
+    // Keep the board summary linked to the same report when an agent retries.
+    let summary = existing.and_then(|id| {
+        tx.query_row("SELECT id FROM handoff WHERE kind = 'summary' AND parent_id = ?1 ORDER BY id LIMIT 1", [id], |r| r.get(0)).ok()
+    });
+    let cites = crate::handoff::attachments(&tx, p.id, &cited(msg), false).unwrap_or_default();
+    let _ = crate::handoff::post_at(
+        &tx,
         &crate::handoff::Post {
             project_id: p.id,
             kind: "summary",
             text: &summary_of(msg, report),
             harness: Some(h.name()),
-            session: input["session_id"].as_str(),
+            session,
             // The subagent itself, not its type: siblings of one type are different posters.
-            agent: input["agent_id"].as_str().filter(|s| !s.is_empty()).or(agent),
+            agent: agent_id.or(agent),
             evidence: Some(cites.as_str()).filter(|e| !e.is_empty()),
             parent: Some(report),
             ..Default::default()
         },
+        summary,
     );
-    if let Some(id) = input["agent_id"].as_str().filter(|s| !s.is_empty()) {
+    tx.commit()?;
+    Ok(Some((w, report)))
+}
+
+fn subagent_stop(cfg: &crate::config::Config, input: &Value, h: Harness) -> Result<String> {
+    let agent_id = input["agent_id"].as_str().filter(|s| !s.is_empty());
+    // Commit the report before the check can spend the rest of the hook deadline.
+    let saved = save_subagent_report(input, h, agent_id);
+    if let Some(block) = stop_check(cfg, input) {
+        return Ok(block);
+    }
+    if let (Some((w, report)), Some(id)) = (saved?, agent_id) {
         crate::agents::finish(&w, id, "done", Some(report))?;
     }
     Ok(String::new())
+}
+
+/// The opt-in stop gate (`[hooks] stop_check`): a `decision: block` whose reason lists the
+/// certain callers of changed signatures that the diff missed, else None. A stop that a stop
+/// hook already sent back (`stop_hook_active`) is never blocked again.
+fn stop_check(cfg: &crate::config::Config, input: &Value) -> Option<String> {
+    if !cfg.hooks.stop_check || input["stop_hook_active"] == true || !db::db_path().exists() {
+        return None;
+    }
+    let cwd = cwd_of(input);
+    let mut w = db::open_rw().ok()?;
+    let p = project::find(&w, &project::locate(&cwd)).ok()??;
+    let r = crate::check::run(&mut w, &p, &cwd, true).ok()?;
+    let reason = format!("{}Update these call sites, or say why each needs no change.", crate::check::render(&r));
+    r.blocks().then(|| json!({"decision": "block", "reason": reason}).to_string())
 }
 
 /// A report's opening, clipped to fit a swarm entry with the report's handle at its end.
@@ -501,7 +551,9 @@ pub fn run_with(cfg: &crate::config::Config, event: &str, stdin: &str, h: Harnes
     let r = match event {
         "session-start" => session_start(&input, h),
         "subagent-start" => subagent_start(cfg, &input, h),
-        "subagent-stop" => subagent_stop(&input, h),
+        // Opt-in (`[hooks] stop_check`): off, Stop prints nothing and SubagentStop only saves.
+        "stop" => Ok(stop_check(cfg, &input).unwrap_or_default()),
+        "subagent-stop" => subagent_stop(cfg, &input, h),
         "pre-compact" => pre_compact(&input, h),
         // Opt-in (`[hooks] grep_context` / `prompt_context`): off, they print nothing.
         "post-tool-use" if cfg.hooks.grep_context => crate::toolhook::grep_context(&input).map(|t| context("PostToolUse", t)),
