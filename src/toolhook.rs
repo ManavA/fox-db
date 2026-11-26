@@ -1126,19 +1126,28 @@ fn fact_edit(gate: &mut FactGate<'_>, dir: &Path, tool: &str, input: &Value) -> 
     }
     let old = gate.source(&path)?.to_owned();
     let newer = if tool == "Write" {
-        input["content"].as_str()?.to_owned()
+        let content = input["content"].as_str()?;
+        if content.len() as u64 > FACT_BYTES {
+            return None;
+        }
+        content.to_owned()
     } else {
         let from = input["old_string"].as_str()?;
         let to = input["new_string"].as_str()?;
+        if from.is_empty() {
+            return None;
+        }
         let matches = old.matches(from).count();
-        if from.is_empty() || matches == 0 || (matches > 1 && input["replace_all"] != true) {
+        if matches == 0 || (matches > 1 && input["replace_all"] != true) {
+            return None;
+        }
+        let retained = old.len() - matches * from.len();
+        let size = retained.checked_add(matches.checked_mul(to.len())?)?;
+        if size as u64 > FACT_BYTES {
             return None;
         }
         old.replace(from, to)
     };
-    if newer.len() as u64 > FACT_BYTES {
-        return None;
-    }
     let old_tree = fact_tree(rel, &old)?;
     let existing = fact_citations(rel, &old, old_tree.root_node());
     let tree = fact_tree(rel, &newer)?;
@@ -1219,6 +1228,9 @@ fn fact_check_citation(
         if ["sys.path", "sys.meta_path", "sys.modules", "__import__", "importlib"].iter().any(|word| newer.contains(word)) {
             return None;
         }
+        if qualifier.starts_with('.') && ["__package__", "__spec__", "__name__"].iter().any(|name| newer.contains(name)) {
+            return None;
+        }
         let module = fact_python_target(gate, qualifier, edited)?;
         (module.clone(), vec![module])
     };
@@ -1266,7 +1278,7 @@ pub fn fact_gate(input: &Value) -> Result<String> {
         return Ok(String::new());
     }
     let Some(dir) = input["cwd"].as_str().map(PathBuf::from).map(|p| canon(&p)) else { return Ok(String::new()) };
-    let Some(db) = crate::db::open_ro() else { return Ok(String::new()) };
+    let Some(db) = crate::db::open_ro_ready() else { return Ok(String::new()) };
     let located = project::locate(&dir);
     if located.git_dir != located.common_dir {
         return Ok(String::new());
@@ -1453,7 +1465,34 @@ fn fact_grep(gate: &mut FactGate<'_>, dir: &Path, program: &str, args: &[&str]) 
     }
     let defs = gate.definitions(&paths)?;
     let def = fact_suggestion(literal, &defs, None)?;
+    if program == "rg" {
+        let candidate = gate.root.join(&def.path);
+        let source = gate.source(&candidate)?;
+        let replacement = if *pattern == literal { def.name.clone() } else { format!("{}(", def.name) };
+        if std::env::var_os("RIPGREP_CONFIG_PATH").is_some()
+            || source.contains('\0')
+            || !source.contains(&replacement)
+            || !fact_rg_searches(&scope, &candidate)?
+        {
+            return None;
+        }
+    }
     Some(format!("foxdb: `{literal}` does not exist in {scope_rel}; did you mean `{}` ({}:{})?", def.name, def.path, def.line))
+}
+
+fn fact_rg_searches(scope: &Path, candidate: &Path) -> Option<bool> {
+    let mut walk = ignore::WalkBuilder::new(scope);
+    walk.add_custom_ignore_filename(".rgignore");
+    for (index, entry) in walk.build().enumerate() {
+        let entry = entry.ok()?;
+        if index >= FACT_FILES || entry.error().is_some() {
+            return None;
+        }
+        if entry.path() == candidate {
+            return Some(true);
+        }
+    }
+    Some(false)
 }
 
 // ---------------------------------------------------------------- post-tool-use

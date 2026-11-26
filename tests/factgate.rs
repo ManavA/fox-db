@@ -25,7 +25,7 @@ const CART_PY: &str = "def checkout_cart(cart):\n    return cart\n\n\ndef reorde
 /// A scratch store and an indexed repo: a Rust crate `shopkit` and a Python package `shop`.
 fn setup() -> (tempfile::TempDir, tempfile::TempDir) {
     let home = tempfile::tempdir().unwrap();
-    let repo = tempfile::tempdir().unwrap();
+    let repo = tempfile::tempdir_in(fs::canonicalize(std::env::temp_dir()).unwrap()).unwrap();
     unsafe {
         std::env::set_var("FOXDB_HOME", home.path());
         std::env::set_var("FOXDB_CLAUDE_PROJECTS", home.path().join("no-claude"));
@@ -52,7 +52,9 @@ fn setup() -> (tempfile::TempDir, tempfile::TempDir) {
 }
 
 fn on() -> Config {
-    config::parse("[hooks]\nfact_gate = true\n")
+    let cfg = config::parse("[hooks]\nfact_gate = true\n");
+    assert!(cfg.hooks.fact_gate);
+    cfg
 }
 
 fn run(cfg: &Config, cwd: &Path, tool: &str, input: Value) -> String {
@@ -257,4 +259,70 @@ fn off_by_default() {
     let v = json!({"hook_event_name": "PreToolUse", "cwd": r, "tool_name": "Edit",
         "tool_input": {"file_path": r.join("src/util.rs"), "old_string": "crate::db::open_ro()", "new_string": "crate::db::open_db_ro()"}});
     assert_eq!(hook::run_with(&Config::default(), "pre-tool-use", &v.to_string(), hook::Harness::Claude), "");
+}
+
+#[test]
+fn relative_import_with_overridden_package_is_silent() {
+    let _g = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    let (_h, repo) = setup();
+    let r = repo.path();
+    write(r, "other/__init__.py", "");
+    write(r, "other/cart.py", "def checkout_kart(cart):\n    return cart\n");
+    let new = "__package__ = 'other'\nfrom .cart import checkout_kart";
+    assert_eq!(edit(r, &r.join("shop/views.py"), "from shop.cart import checkout_cart", new), "");
+}
+
+#[test]
+fn rg_does_not_suggest_ignored_definitions() {
+    let _g = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    let (_h, repo) = setup();
+    let r = repo.path();
+    let command = "rg -n 'checkout_kart\\(' shop";
+    assert!(bash(r, command).contains("did you mean `checkout_cart`"));
+    write(r, ".rgignore", "shop/cart.py\n");
+    assert_eq!(bash(r, command), "");
+}
+
+#[test]
+fn fact_gate_leaves_an_old_store_for_the_next_writer() {
+    let _g = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    let (_h, repo) = setup();
+    assert!(bash(repo.path(), "cat src/dbs.rs").contains("did you mean `src/db.rs`"));
+    let c = db::open_rw().unwrap();
+    c.pragma_update(None, "user_version", db::LATEST - 1).unwrap();
+    assert_eq!(bash(repo.path(), "cat src/dbs.rs"), "");
+    let version: i64 = c.pragma_query_value(None, "user_version", |row| row.get(0)).unwrap();
+    assert_eq!(version, db::LATEST - 1);
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn replace_all_is_bounded_before_allocating() {
+    if let Some(repo) = std::env::var_os("FOXDB_FACT_GATE_LIMIT_TEST_REPO") {
+        let r = Path::new(&repo);
+        assert!(bash(r, "cat src/dbs.rs").contains("did you mean `src/db.rs`"));
+        let input = json!({
+            "file_path": r.join("src/util.rs"), "old_string": "x",
+            "new_string": "y".repeat(64 * 1024), "replace_all": true
+        });
+        assert_eq!(run(&on(), r, "Edit", input), "");
+        return;
+    }
+
+    let _g = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    let (_h, repo) = setup();
+    let r = repo.path();
+    write(r, "src/util.rs", &format!("// {}\n{UTIL_RS}", "x".repeat(230_000)));
+    let mut c = db::open_rw().unwrap();
+    let p = project::find(&c, &project::locate(r)).unwrap().unwrap();
+    inventory::index_project(&mut c, &p).unwrap();
+    tsindex::index_project(&mut c, &p).unwrap();
+    let status = std::process::Command::new("bash")
+        .args(["-c", "ulimit -v 524288 && exec \"$@\"", "bash"])
+        .arg(std::env::current_exe().unwrap())
+        .args(["--exact", "replace_all_is_bounded_before_allocating"])
+        .env("FOXDB_FACT_GATE_LIMIT_TEST_REPO", r)
+        .output()
+        .unwrap();
+    assert!(status.status.success(), "{}{}", String::from_utf8_lossy(&status.stdout), String::from_utf8_lossy(&status.stderr));
 }
