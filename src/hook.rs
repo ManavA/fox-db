@@ -555,7 +555,8 @@ pub fn run_with(cfg: &crate::config::Config, event: &str, stdin: &str, h: Harnes
         "stop" => Ok(stop_check(cfg, &input).unwrap_or_default()),
         "subagent-stop" => subagent_stop(cfg, &input, h),
         "pre-compact" => pre_compact(&input, h),
-        // Opt-in (`[hooks] grep_context` / `prompt_context`): off, they print nothing.
+        // Opt-in hooks only add context when they have a result.
+        "pre-tool-use" if cfg.hooks.fact_gate => crate::toolhook::fact_gate(&input).map(|t| context("PreToolUse", t)),
         "post-tool-use" if cfg.hooks.grep_context => crate::toolhook::grep_context(&input).map(|t| context("PostToolUse", t)),
         "user-prompt-submit" if cfg.hooks.prompt_context => crate::toolhook::prompt_context(&input).map(|t| context("UserPromptSubmit", t)),
         _ => Ok(String::new()),

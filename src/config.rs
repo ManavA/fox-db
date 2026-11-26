@@ -82,6 +82,9 @@ pub struct Hooks {
     /// hit (`fox hook post-tool-use`). Off unless set.
     #[serde(default)]
     pub grep_context: bool,
+    /// PreToolUse on Edit, Write and Bash: add a correction for a proven missing citation.
+    #[serde(default)]
+    pub fact_gate: bool,
     /// UserPromptSubmit: when the prompt names an identifier or path that resolves to exactly one
     /// indexed definition or file, add its location (`fox hook user-prompt-submit`). Off unless set.
     #[serde(default)]

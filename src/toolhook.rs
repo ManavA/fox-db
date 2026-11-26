@@ -1,6 +1,8 @@
-//! Opt-in hooks that meet the model where it already searches. Both are off unless `[hooks]` in
-//! config.toml turns them on, and both prefer silence to a wrong answer.
+//! Opt-in hooks that meet the model where it already searches. Each is off unless `[hooks]` in
+//! config.toml turns it on, and each prefers silence to a wrong answer.
 //!
+//! - `pre-tool-use` (`fact_gate`): before a supported Edit, Write, or Bash command, suggest
+//!   a correction for a reference whose absence can be verified against fresh project files.
 //! - `post-tool-use` (`grep_context`): after a Bash `grep`/`rg`/`git grep` that printed
 //!   `path:line:text` hits in an indexed project, name each hit's enclosing definition and its
 //!   handle. It only adds `additionalContext`; the tool output is never changed. Anything it
@@ -696,6 +698,801 @@ fn defs_in_file(c: &Connection, pid: i64, rel: &str) -> Vec<Def> {
 /// The innermost definition whose span holds `line`.
 fn enclosing(defs: &[Def], line: i64) -> Option<&Def> {
     defs.iter().filter(|d| d.line <= line && line <= d.end.max(d.line)).min_by_key(|d| (d.end.max(d.line) - d.line, -d.line))
+}
+
+// ---------------------------------------------------------------- pre-tool-use
+
+const FACT_CANDIDATES: usize = 4;
+const FACT_FILES: usize = 64;
+const FACT_BYTES: u64 = 256 * 1024;
+
+struct FactGate<'a> {
+    db: &'a Connection,
+    project: &'a Project,
+    root: PathBuf,
+    files: HashMap<PathBuf, Option<String>>,
+}
+
+impl FactGate<'_> {
+    fn source(&mut self, path: &Path) -> Option<&str> {
+        self.files
+            .entry(path.to_path_buf())
+            .or_insert_with(|| {
+                let rel = path.strip_prefix(&self.root).ok()?.to_str()?;
+                let (source, metadata) = fact_read(path)?;
+                let (hash, size, mtime): (String, i64, i64) = self
+                    .db
+                    .query_row(
+                        "SELECT hash, size, mtime FROM ts_file WHERE project_id = ?1 AND path = ?2",
+                        params![self.project.id, rel],
+                        |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+                    )
+                    .ok()?;
+                (size == metadata.len() as i64
+                    && mtime == crate::inventory::mtime_ms(&metadata)
+                    && hash == crate::tsindex::content_hash(source.as_bytes()))
+                .then_some(source)
+            })
+            .as_deref()
+    }
+
+    fn definitions(&self, paths: &[String]) -> Option<Vec<Def>> {
+        let paths = serde_json::to_string(paths).ok()?;
+        let mut query = self
+            .db
+            .prepare_cached(&format!(
+                "SELECT {DEF_COLS} FROM json_each(?2) p JOIN node n ON n.path = p.value
+             WHERE n.project_id = ?1 AND n.kind = 'symbol' AND n.source = 'treesitter'
+               AND json_extract(n.meta,'$.parent') IS NULL
+             ORDER BY n.path, n.line, n.name LIMIT 1001"
+            ))
+            .ok()?;
+        let defs = query.query_map(params![self.project.id, paths], map_def).ok()?.collect::<rusqlite::Result<Vec<_>>>().ok()?;
+        (defs.len() <= 1000).then_some(defs)
+    }
+}
+
+fn fact_read(path: &Path) -> Option<(String, std::fs::Metadata)> {
+    use std::io::Read;
+    use std::os::unix::fs::OpenOptionsExt;
+
+    let metadata = path.symlink_metadata().ok()?;
+    if !metadata.is_file() || metadata.len() > FACT_BYTES || std::fs::canonicalize(path).ok()? != path {
+        return None;
+    }
+    let file = std::fs::OpenOptions::new().read(true).custom_flags(libc::O_NONBLOCK | libc::O_NOFOLLOW).open(path).ok()?;
+    let metadata = file.metadata().ok()?;
+    if !metadata.is_file() || metadata.len() > FACT_BYTES {
+        return None;
+    }
+    let mut text = String::new();
+    (&file).take(FACT_BYTES + 1).read_to_string(&mut text).ok()?;
+    let after = file.metadata().ok()?;
+    (text.len() as u64 == metadata.len() && after.len() == metadata.len() && after.modified().ok()? == metadata.modified().ok()?)
+        .then_some((text, metadata))
+}
+
+fn fact_path(dir: &Path, path: &str) -> Option<PathBuf> {
+    if path.is_empty()
+        || path.contains(['$', '*', '?', '[', ']', '{', '}', '~', '\\', '\n', '\r'])
+        || Path::new(path).components().any(|c| c == Component::ParentDir)
+    {
+        return None;
+    }
+    Some(dir.join(path))
+}
+
+fn fact_tree(path: &str, source: &str) -> Option<tree_sitter::Tree> {
+    let language = crate::lang::for_path(path)?;
+    let mut parser = tree_sitter::Parser::new();
+    parser.set_language(&language.language()).ok()?;
+    let tree = parser.parse(source, None)?;
+    (!tree.root_node().has_error()).then_some(tree)
+}
+
+fn fact_walk(node: tree_sitter::Node<'_>, visit: &mut impl FnMut(tree_sitter::Node<'_>)) {
+    let mut cursor = node.walk();
+    loop {
+        visit(cursor.node());
+        if cursor.goto_first_child() {
+            continue;
+        }
+        while !cursor.goto_next_sibling() {
+            if !cursor.goto_parent() || cursor.node() == node {
+                return;
+            }
+        }
+    }
+}
+
+#[derive(PartialEq, Eq)]
+struct FactCitation {
+    qualifier: String,
+    name: String,
+}
+
+fn fact_citations(path: &str, source: &str, root: tree_sitter::Node<'_>) -> Vec<FactCitation> {
+    let mut found = Vec::new();
+    fact_walk(root, &mut |node| {
+        let mut add = |qualifier: &str, name: &str| {
+            if found.len() < 32 && qualifier.len() <= 100 && name.len() <= 64 && is_ident(name) {
+                let citation = FactCitation { qualifier: qualifier.into(), name: name.into() };
+                if !found.contains(&citation) {
+                    found.push(citation);
+                }
+            }
+        };
+        if path.ends_with(".rs") {
+            match node.kind() {
+                "scoped_identifier" | "scoped_type_identifier" => {
+                    if node.parent().is_some_and(|p| {
+                        matches!(p.kind(), "scoped_identifier" | "scoped_type_identifier" | "scoped_use_list" | "macro_invocation")
+                    }) {
+                        return;
+                    }
+                    if let Some((qualifier, name)) = source[node.byte_range()].rsplit_once("::") {
+                        add(qualifier, name);
+                    }
+                }
+                "scoped_use_list" => {
+                    let Some(qualifier) = node.child_by_field_name("path").map(|p| &source[p.byte_range()]) else { return };
+                    let Some(list) = node.child_by_field_name("list") else { return };
+                    for item in list.named_children(&mut list.walk()).take(32) {
+                        let node = match item.kind() {
+                            "identifier" => item,
+                            "use_as_clause" => {
+                                let Some(path) = item.child_by_field_name("path").filter(|n| n.kind() == "identifier") else { continue };
+                                path
+                            }
+                            _ => continue,
+                        };
+                        add(qualifier, &source[node.byte_range()]);
+                    }
+                }
+                _ => {}
+            }
+        } else if node.kind() == "import_from_statement" {
+            let Some(module) = node.child_by_field_name("module_name") else { return };
+            let qualifier = &source[module.byte_range()];
+            for item in node.children_by_field_name("name", &mut node.walk()).take(32) {
+                let name = match item.kind() {
+                    "dotted_name" => item,
+                    "aliased_import" => {
+                        let Some(name) = item.child_by_field_name("name") else { continue };
+                        name
+                    }
+                    _ => continue,
+                };
+                add(qualifier, &source[name.byte_range()]);
+            }
+        }
+    });
+    found
+}
+
+fn fact_name_rank(name: &str, candidate: &str) -> Option<usize> {
+    if name == candidate {
+        return Some(0);
+    }
+    if !name.is_ascii() || !candidate.is_ascii() || name.len().min(candidate.len()) < 2 || candidate.len() > 100 {
+        return None;
+    }
+    let mut previous = (0..=candidate.len()).collect::<Vec<_>>();
+    let mut before_previous = previous.clone();
+    let mut next = previous.clone();
+    let a = name.as_bytes();
+    let b = candidate.as_bytes();
+    for (i, &letter) in a.iter().enumerate() {
+        next[0] = i + 1;
+        for (j, &other) in b.iter().enumerate() {
+            next[j + 1] = (previous[j + 1] + 1).min(next[j] + 1).min(previous[j] + usize::from(letter != other));
+            if i > 0 && j > 0 && letter == b[j - 1] && other == a[i - 1] {
+                next[j + 1] = next[j + 1].min(before_previous[j - 1] + 1);
+            }
+        }
+        std::mem::swap(&mut before_previous, &mut previous);
+        std::mem::swap(&mut previous, &mut next);
+    }
+    let distance = previous[b.len()];
+    if distance <= (name.len() / 4).clamp(1, 2) {
+        return Some(distance);
+    }
+    let parts: Vec<_> = name.split('_').collect();
+    if parts.len() >= 3 && (1..parts.len() - 1).any(|i| [&parts[..i], &parts[i + 1..]].concat().join("_") == candidate) {
+        return Some(3);
+    }
+    None
+}
+
+fn fact_suggestion<'a>(name: &str, defs: &'a [Def], target: Option<&str>) -> Option<&'a Def> {
+    let mut best = None;
+    let mut tied = false;
+    for def in defs.iter().filter(|d| d.line > 0) {
+        let Some(distance) = fact_name_rank(name, &def.name) else { continue };
+        let rank = (distance, target.is_some_and(|p| p != def.path));
+        match best {
+            Some((current, _)) if rank > current => continue,
+            Some((current, _)) if rank == current => tied = true,
+            _ => {
+                best = Some((rank, def));
+                tied = false;
+            }
+        }
+    }
+    (!tied).then_some(best?.1)
+}
+
+fn fact_rust_sources(
+    gate: &mut FactGate<'_>,
+    prefix: &str,
+    module: &str,
+    edited: &str,
+    newer: &str,
+    pending: tree_sitter::Node<'_>,
+) -> Option<(String, Vec<String>)> {
+    let manifest: toml::Table = fact_read(&gate.root.join("Cargo.toml"))?.0.parse().ok()?;
+    let lib = manifest.get("lib").and_then(toml::Value::as_table);
+    if lib.is_some_and(|l| l.contains_key("path")) || manifest.contains_key("bin") {
+        return None;
+    }
+    let package_name = manifest.get("package")?.as_table()?.get("name")?.as_str()?;
+    let crate_name = lib.and_then(|l| l.get("name")).and_then(toml::Value::as_str).unwrap_or(package_name).replace('-', "_");
+    if prefix == "crate" {
+        if gate.root.join("src/main.rs").symlink_metadata().is_ok() {
+            return None;
+        }
+    } else {
+        if prefix != crate_name
+            || matches!(prefix, "std" | "core" | "alloc")
+            || !(edited.starts_with("tests/") || edited.starts_with("examples/"))
+        {
+            return None;
+        }
+        let mut shadowed = false;
+        fact_walk(pending, &mut |node| {
+            let text = &newer[node.byte_range()];
+            shadowed |= match node.kind() {
+                "extern_crate_declaration" | "macro_definition" | "use_wildcard" => true,
+                "use_as_clause" => node.child_by_field_name("alias").is_some_and(|n| &newer[n.byte_range()] == prefix),
+                "mod_item" => node.child_by_field_name("name").is_some_and(|n| &newer[n.byte_range()] == prefix),
+                "use_declaration" => text.trim_end_matches(';').trim_end().ends_with(prefix),
+                "use_list" => node.named_children(&mut node.walk()).any(|n| &newer[n.byte_range()] == prefix),
+                _ => false,
+            };
+        });
+        if shadowed {
+            return None;
+        }
+    }
+    let root_file = gate.root.join("src/lib.rs");
+    let root = gate.source(&root_file)?.to_owned();
+    let tree = fact_tree("src/lib.rs", &root)?;
+    let mut uncertain = false;
+    fact_walk(tree.root_node(), &mut |node| {
+        uncertain |=
+            matches!(node.kind(), "macro_invocation" | "macro_definition" | "attribute_item" | "inner_attribute_item" | "use_wildcard");
+    });
+    if uncertain {
+        return None;
+    }
+    let first = format!("src/{module}.rs");
+    let second = format!("src/{module}/mod.rs");
+    let target = match (gate.root.join(&first).symlink_metadata(), gate.root.join(&second).symlink_metadata()) {
+        (Ok(_), Err(e)) if e.kind() == std::io::ErrorKind::NotFound => first,
+        (Err(e), Ok(_)) if e.kind() == std::io::ErrorKind::NotFound => second,
+        _ => return None,
+    };
+    let mut paths = Vec::new();
+    let mut cursor = tree.root_node().walk();
+    for node in tree.root_node().named_children(&mut cursor) {
+        if node.kind() != "mod_item" || node.child_by_field_name("body").is_some() {
+            continue;
+        }
+        let Some(name) = node.child_by_field_name("name").map(|n| &root[n.byte_range()]).filter(|n| is_ident(n)) else { continue };
+        if prefix != "crate" && !fact_public(node, &root, true) {
+            continue;
+        }
+        let flat = format!("src/{name}.rs");
+        let directory = format!("src/{name}/mod.rs");
+        match (gate.root.join(&flat).symlink_metadata(), gate.root.join(&directory).symlink_metadata()) {
+            (Ok(md), Err(e)) if md.is_file() && e.kind() == std::io::ErrorKind::NotFound => paths.push(flat),
+            (Err(e), Ok(md)) if md.is_file() && e.kind() == std::io::ErrorKind::NotFound => paths.push(directory),
+            _ => {}
+        }
+        if paths.len() > FACT_FILES {
+            return None;
+        }
+    }
+    if paths.iter().filter(|path| *path == &target).count() != 1 || prefix == "crate" && !paths.iter().any(|path| path == edited) {
+        return None;
+    }
+    Some((target, paths))
+}
+
+fn fact_python_target(gate: &mut FactGate<'_>, qualifier: &str, edited: &str) -> Option<String> {
+    let path = if let Some(module) = qualifier.strip_prefix('.') {
+        let package = Path::new(edited).parent()?.to_str()?;
+        if package.is_empty() {
+            return None;
+        }
+        format!("{package}/{}", module.replace('.', "/"))
+    } else {
+        // Only resolve absolute imports from within the owning package.
+        let (package, _) = qualifier.split_once('.')?;
+        let (owning, _) = edited.split_once('/')?;
+        if package != owning || matches!(package, "sys" | "os" | "builtins" | "importlib") {
+            return None;
+        }
+        for dir in Path::new(edited).parent()?.ancestors().filter(|p| !p.as_os_str().is_empty()) {
+            if gate.root.join(dir).join(package).symlink_metadata().is_ok()
+                || gate.root.join(dir).join(format!("{package}.py")).symlink_metadata().is_ok()
+            {
+                return None;
+            }
+        }
+        qualifier.replace('.', "/")
+    };
+    if !path.split('/').all(is_ident) {
+        return None;
+    }
+    let module = format!("{path}.py");
+    if gate.root.join(&path).symlink_metadata().is_ok() {
+        return None;
+    }
+    let path = Path::new(&path);
+    fact_no_python_extension(&gate.root.join(path.parent()?), path.file_name()?.to_str()?)?;
+    let mut package = path.parent();
+    while let Some(dir) = package.filter(|d| !d.as_os_str().is_empty()) {
+        let absolute = gate.root.join(dir);
+        fact_no_python_extension(&absolute, "__init__")?;
+        // An initializer can redirect imports or populate the module dynamically.
+        if gate.source(&absolute.join("__init__.py"))?.lines().any(|l| !l.trim().is_empty() && !l.trim_start().starts_with('#')) {
+            return None;
+        }
+        package = dir.parent();
+    }
+    Some(module)
+}
+
+fn fact_no_python_extension(dir: &Path, stem: &str) -> Option<()> {
+    for (index, entry) in std::fs::read_dir(dir).ok()?.enumerate() {
+        if index >= FACT_FILES {
+            return None;
+        }
+        let name = entry.ok()?.file_name();
+        let name = name.to_str()?;
+        if name
+            .strip_prefix(stem)
+            .is_some_and(|suffix| suffix.starts_with('.') && [".so", ".pyd", ".pyi"].iter().any(|ext| suffix.ends_with(ext)))
+        {
+            return None;
+        }
+    }
+    Some(())
+}
+
+fn fact_public(node: tree_sitter::Node<'_>, source: &str, external: bool) -> bool {
+    node.named_children(&mut node.walk()).find(|child| child.kind() == "visibility_modifier").is_some_and(|visibility| {
+        match &source[visibility.byte_range()] {
+            "pub" => true,
+            "pub(crate)" | "pub(super)" => !external,
+            _ => false,
+        }
+    })
+}
+
+fn fact_available(suggestion: &Def, source: &str, root: tree_sitter::Node<'_>, rust: bool, external: bool) -> bool {
+    root.named_children(&mut root.walk()).any(|node| {
+        let kind = node.kind();
+        let supported = if rust {
+            matches!(kind, "function_item" | "struct_item" | "enum_item" | "type_item" | "const_item" | "static_item" | "trait_item")
+                && fact_public(node, source, external)
+        } else {
+            matches!(kind, "function_definition" | "class_definition")
+        };
+        supported && node.child_by_field_name("name").is_some_and(|n| source[n.byte_range()] == suggestion.name)
+    })
+}
+
+fn fact_static_module(path: &str, source: &str, root: tree_sitter::Node<'_>) -> Option<()> {
+    if !source.is_ascii() {
+        return None;
+    }
+    let mut uncertain = false;
+    let mut cursor = root.walk();
+    if path.ends_with(".rs") {
+        fact_walk(root, &mut |node| {
+            uncertain |=
+                matches!(node.kind(), "use_wildcard" | "macro_invocation" | "macro_definition" | "attribute_item" | "inner_attribute_item");
+        });
+    } else {
+        uncertain = root.named_children(&mut cursor).any(|n| !matches!(n.kind(), "function_definition" | "class_definition" | "comment"));
+        uncertain |= ["__getattr__", "__getattribute__", "globals", "exec", "setattr", "__dict__", "sys", "__import__", "*"]
+            .iter()
+            .any(|word| source.contains(word));
+    }
+    (!uncertain).then_some(())
+}
+
+fn fact_edit(gate: &mut FactGate<'_>, dir: &Path, tool: &str, input: &Value) -> Option<String> {
+    let path = fact_path(dir, input["file_path"].as_str()?)?;
+    let rel = path.strip_prefix(&gate.root).ok()?.to_str()?;
+    if !matches!(crate::lang::for_path(rel)?.family, "rust" | "python") {
+        return None;
+    }
+    let located = project::locate(path.parent()?);
+    if located.git_dir != located.common_dir || located.common_dir.is_some() && located.root != gate.root {
+        return None;
+    }
+    let old = gate.source(&path)?.to_owned();
+    let newer = if tool == "Write" {
+        let content = input["content"].as_str()?;
+        if content.len() as u64 > FACT_BYTES {
+            return None;
+        }
+        content.to_owned()
+    } else {
+        let from = input["old_string"].as_str()?;
+        let to = input["new_string"].as_str()?;
+        if from.is_empty() {
+            return None;
+        }
+        let matches = old.matches(from).count();
+        if matches == 0 || (matches > 1 && input["replace_all"] != true) {
+            return None;
+        }
+        let retained = old.len() - matches * from.len();
+        let size = retained.checked_add(matches.checked_mul(to.len())?)?;
+        if size as u64 > FACT_BYTES {
+            return None;
+        }
+        old.replace(from, to)
+    };
+    let old_tree = fact_tree(rel, &old)?;
+    let existing = fact_citations(rel, &old, old_tree.root_node());
+    let tree = fact_tree(rel, &newer)?;
+    let pending = tree.root_node();
+    let citations = fact_citations(rel, &newer, pending);
+    let mut checked = std::collections::HashSet::new();
+    for citation in citations.iter().filter(|f| !existing.contains(f) && checked.insert(&f.name)).take(FACT_CANDIDATES) {
+        if fact_new_binding((&old, old_tree.root_node()), (&newer, pending), &citation.name) {
+            continue;
+        }
+        if let Some(line) = fact_check_citation(gate, rel, &newer, pending, citation) {
+            return Some(line);
+        }
+    }
+    None
+}
+
+fn fact_binding<'a>(source: &'a str, node: tree_sitter::Node<'_>, name: &str) -> Option<&'a str> {
+    use crate::memcheck::mentions;
+    let field = match node.kind() {
+        "function_item"
+        | "function_definition"
+        | "struct_item"
+        | "enum_item"
+        | "type_item"
+        | "const_item"
+        | "static_item"
+        | "mod_item"
+        | "trait_item"
+        | "class_definition"
+        | "macro_definition" => "name",
+        "assignment" => "left",
+        "let_declaration" => "pattern",
+        "use_as_clause" | "aliased_import" => "alias",
+        _ => return None,
+    };
+    let binding = node.child_by_field_name(field)?;
+    mentions(&source[binding.byte_range()], name).then(|| &source[node.byte_range()])
+}
+
+fn fact_new_binding((old, before): (&str, tree_sitter::Node<'_>), (newer, pending): (&str, tree_sitter::Node<'_>), name: &str) -> bool {
+    let mut declarations = HashMap::new();
+    fact_walk(before, &mut |node| {
+        if let Some(declaration) = fact_binding(old, node, name) {
+            *declarations.entry(declaration).or_insert(0usize) += 1;
+        }
+    });
+    let mut uncertain = false;
+    fact_walk(pending, &mut |node| {
+        uncertain |= matches!(node.kind(), "use_wildcard" | "macro_invocation");
+        if let Some(declaration) = fact_binding(newer, node, name) {
+            match declarations.get_mut(declaration) {
+                Some(count) if *count > 0 => *count -= 1,
+                _ => uncertain = true,
+            }
+        }
+    });
+    uncertain
+}
+
+fn fact_check_citation(
+    gate: &mut FactGate<'_>,
+    edited: &str,
+    newer: &str,
+    pending: tree_sitter::Node<'_>,
+    citation: &FactCitation,
+) -> Option<String> {
+    use crate::memcheck::mentions;
+    let FactCitation { qualifier, name } = citation;
+    let rust = edited.ends_with(".rs");
+    let (target, paths) = if rust {
+        let (prefix, module) = qualifier.split_once("::")?;
+        if !is_ident(prefix) || !is_ident(module) {
+            return None;
+        }
+        fact_rust_sources(gate, prefix, module, edited, newer, pending)?
+    } else {
+        if ["sys.path", "sys.meta_path", "sys.modules", "__import__", "importlib"].iter().any(|word| newer.contains(word)) {
+            return None;
+        }
+        if qualifier.starts_with('.') && ["__package__", "__spec__", "__name__"].iter().any(|name| newer.contains(name)) {
+            return None;
+        }
+        let module = fact_python_target(gate, qualifier, edited)?;
+        (module.clone(), vec![module])
+    };
+    let source = gate.source(&gate.root.join(&target))?;
+    if mentions(source, name) {
+        return None;
+    }
+    if edited == target {
+        fact_static_module(edited, newer, pending)?;
+    } else {
+        fact_static_module(&target, source, fact_tree(&target, source)?.root_node())?;
+    }
+    let defs = gate.definitions(&paths)?;
+    let suggestion = fact_suggestion(name, &defs, Some(&target))?;
+    let external = rust && !qualifier.starts_with("crate::");
+    let available = if suggestion.path == edited {
+        fact_available(suggestion, newer, pending, rust, external)
+    } else {
+        let source = gate.source(&gate.root.join(&suggestion.path))?;
+        let tree = fact_tree(&suggestion.path, source)?;
+        fact_static_module(&suggestion.path, source, tree.root_node())?;
+        fact_available(suggestion, source, tree.root_node(), rust, external)
+    };
+    if !available {
+        return None;
+    }
+    let (label, replacement) = if rust {
+        let (prefix, _) = qualifier.split_once("::")?;
+        let suggested_module = suggestion
+            .path
+            .strip_prefix("src/")?
+            .strip_suffix("/mod.rs")
+            .or_else(|| suggestion.path.strip_prefix("src/")?.strip_suffix(".rs"))?;
+        (format!("{qualifier}::{name}"), format!("{prefix}::{suggested_module}::{}", suggestion.name))
+    } else {
+        (name.to_owned(), suggestion.name.clone())
+    };
+    Some(format!("foxdb: `{label}` does not exist in {target}; did you mean `{replacement}` ({}:{})?", suggestion.path, suggestion.line))
+}
+
+/// Advisory context for a narrow set of references with a verifiable local target.
+pub fn fact_gate(input: &Value) -> Result<String> {
+    let tool = input["tool_name"].as_str().unwrap_or("");
+    if !matches!(tool, "Edit" | "Write" | "Bash") {
+        return Ok(String::new());
+    }
+    let Some(dir) = input["cwd"].as_str().map(PathBuf::from).map(|p| canon(&p)) else { return Ok(String::new()) };
+    let Some(db) = crate::db::open_ro_ready() else { return Ok(String::new()) };
+    let located = project::locate(&dir);
+    if located.git_dir != located.common_dir {
+        return Ok(String::new());
+    }
+    let project = if located.common_dir.is_some() { project::find(&db, &located)? } else { project_of(&db, &dir)? };
+    let Some(project) = project else { return Ok(String::new()) };
+    let root = canon(&project.root);
+    if !dir.starts_with(&root) {
+        return Ok(String::new());
+    }
+    let mut gate = FactGate { db: &db, project: &project, root, files: HashMap::new() };
+    let input = &input["tool_input"];
+    Ok(if tool == "Bash" {
+        input["command"].as_str().and_then(|cmd| fact_bash(&mut gate, &dir, cmd))
+    } else {
+        fact_edit(&mut gate, &dir, tool, input)
+    }
+    .filter(|line| !line.chars().any(char::is_control))
+    .unwrap_or_default())
+}
+
+fn fact_bash(gate: &mut FactGate<'_>, cwd: &Path, command: &str) -> Option<String> {
+    if command.len() > 2048 || command.contains(['#', '$', '\n', '\r']) {
+        return None;
+    }
+    let tokens = shell_words(command)?;
+    let (dir, tokens) = match tokens.as_slice() {
+        [Tok::Word(cd), Tok::Word(dir), Tok::Op(and), rest @ ..] if cd == "cd" && and == "&&" => {
+            if !dir.starts_with("./") && !Path::new(dir).is_absolute() {
+                return None;
+            }
+            let dir = fact_path(cwd, dir)?;
+            if !dir.is_dir() || canon(&dir) != dir || !dir.starts_with(&gate.root) {
+                return None;
+            }
+            let located = project::locate(&dir);
+            if located.git_dir != located.common_dir || located.common_dir.is_some() && located.root != gate.root {
+                return None;
+            }
+            (dir, rest)
+        }
+        rest => (cwd.to_path_buf(), rest),
+    };
+    let (first, tail) = tokens.iter().position(|t| matches!(t, Tok::Op(_))).map_or((tokens, &[][..]), |i| tokens.split_at(i));
+    if !tail.is_empty() {
+        let [Tok::Op(pipe), Tok::Word(tail), Tok::Word(count)] = tail else { return None };
+        if pipe != "|" || tail != "tail" || !count.strip_prefix('-').is_some_and(fact_number) {
+            return None;
+        }
+    }
+    let words: Vec<_> = first
+        .iter()
+        .filter_map(|t| match t {
+            Tok::Word(w) => Some(w.as_str()),
+            Tok::Op(_) => None,
+        })
+        .collect();
+    let [program, args @ ..] = words.as_slice() else { return None };
+    let paths = match (*program, args) {
+        ("grep" | "rg", _) if tail.is_empty() => return fact_grep(gate, &dir, program, args),
+        ("cat", _) => args,
+        ("head" | "tail", ["-n", n, files @ ..]) if fact_number(n) => files,
+        ("head" | "tail", [n, files @ ..]) if n.strip_prefix('-').is_some_and(fact_number) => files,
+        ("head" | "tail", _) => args,
+        ("sed", ["-n", expression, files @ ..])
+            if expression
+                .strip_suffix('p')
+                .is_some_and(|e| e.split_once(',').map_or_else(|| fact_number(e), |(a, b)| fact_number(a) && fact_number(b))) =>
+        {
+            files
+        }
+        _ => return None,
+    };
+    if paths.is_empty() || paths.len() > FACT_CANDIDATES || paths.iter().any(|p| p.starts_with('-') || fact_path(&dir, p).is_none()) {
+        return None;
+    }
+    paths.iter().find_map(|p| fact_missing_file(gate, &dir, p))
+}
+
+fn fact_number(s: &str) -> bool {
+    !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit())
+}
+
+fn fact_missing_file(gate: &mut FactGate<'_>, dir: &Path, given: &str) -> Option<String> {
+    let path = fact_path(dir, given)?;
+    let rel = path.strip_prefix(&gate.root).ok()?.to_str()?;
+    let parent = path.parent()?;
+    if !matches!(path.symlink_metadata(), Err(e) if e.kind() == std::io::ErrorKind::NotFound)
+        || std::fs::canonicalize(parent).ok()? != parent
+    {
+        return None;
+    }
+    let base = path.file_stem()?.to_str()?;
+    if !is_ident(base) {
+        return None;
+    }
+    let ext = path.extension()?;
+    let mut matches = Vec::new();
+    for (i, entry) in std::fs::read_dir(parent).ok()?.enumerate() {
+        if i >= FACT_FILES {
+            return None;
+        }
+        let entry = entry.ok()?;
+        let candidate = entry.path();
+        if candidate.extension() != Some(ext) || !entry.file_type().ok()?.is_file() {
+            continue;
+        }
+        if let Some(rank) = fact_name_rank(base, candidate.file_stem()?.to_str()?) {
+            matches.push((rank, candidate));
+        }
+    }
+    matches.sort_unstable();
+    let (rank, candidate) = matches.first()?;
+    if matches.get(1).is_some_and(|(other, _)| rank == other) {
+        return None;
+    }
+    gate.source(candidate)?;
+    let candidate = candidate.strip_prefix(&gate.root).ok()?.to_str()?;
+    Some(format!("foxdb: `{rel}` does not exist; did you mean `{candidate}`?"))
+}
+
+fn fact_grep(gate: &mut FactGate<'_>, dir: &Path, program: &str, args: &[&str]) -> Option<String> {
+    let mut recursive = program == "rg";
+    let mut positional = args;
+    while let Some((arg, rest)) = positional.split_first() {
+        match *arg {
+            "--" => {
+                positional = rest;
+                break;
+            }
+            "--recursive" if program == "grep" => recursive = true,
+            "--line-number" | "--with-filename" => {}
+            flags if flags.starts_with('-') && flags.len() > 1 => {
+                for flag in flags[1..].chars() {
+                    match flag {
+                        'r' if program == "grep" => recursive = true,
+                        'n' | 'H' => {}
+                        _ => return None,
+                    }
+                }
+            }
+            _ => break,
+        }
+        positional = rest;
+    }
+    let [pattern, scope] = positional else { return None };
+    if scope.starts_with('-') {
+        return None;
+    }
+    let literal = if program == "rg" { pattern.strip_suffix("\\(").unwrap_or(pattern) } else { pattern };
+    if !is_ident(literal) || literal.len() > 64 || !crate::memcheck::code_shaped(literal, "") {
+        return None;
+    }
+    let scope = fact_path(dir, scope)?;
+    let scope_rel = scope.strip_prefix(&gate.root).ok()?.to_str()?;
+    if scope_rel.is_empty() {
+        return None;
+    }
+    let mut todo = vec![scope.clone()];
+    let mut paths = Vec::new();
+    let mut visited = 0;
+    while let Some(path) = todo.pop() {
+        visited += 1;
+        if visited > FACT_FILES || todo.len() > FACT_FILES {
+            return None;
+        }
+        let ty = path.symlink_metadata().ok()?.file_type();
+        if ty.is_dir() && recursive {
+            if canon(&path) != path {
+                return None;
+            }
+            for entry in std::fs::read_dir(&path).ok()?.take(FACT_FILES + 1) {
+                todo.push(entry.ok()?.path());
+            }
+        } else if ty.is_file() {
+            let source = gate.source(&path)?;
+            if source.contains(literal) {
+                return None;
+            }
+            paths.push(path.strip_prefix(&gate.root).ok()?.to_str()?.to_owned());
+        } else {
+            return None;
+        }
+    }
+    let defs = gate.definitions(&paths)?;
+    let def = fact_suggestion(literal, &defs, None)?;
+    if program == "rg" {
+        let candidate = gate.root.join(&def.path);
+        let source = gate.source(&candidate)?;
+        let replacement = if *pattern == literal { def.name.clone() } else { format!("{}(", def.name) };
+        if std::env::var_os("RIPGREP_CONFIG_PATH").is_some()
+            || source.contains('\0')
+            || !source.contains(&replacement)
+            || !fact_rg_searches(&scope, &candidate)?
+        {
+            return None;
+        }
+    }
+    Some(format!("foxdb: `{literal}` does not exist in {scope_rel}; did you mean `{}` ({}:{})?", def.name, def.path, def.line))
+}
+
+fn fact_rg_searches(scope: &Path, candidate: &Path) -> Option<bool> {
+    let mut walk = ignore::WalkBuilder::new(scope);
+    walk.add_custom_ignore_filename(".rgignore");
+    for (index, entry) in walk.build().enumerate() {
+        let entry = entry.ok()?;
+        if index >= FACT_FILES || entry.error().is_some() {
+            return None;
+        }
+        if entry.path() == candidate {
+            return Some(true);
+        }
+    }
+    Some(false)
 }
 
 // ---------------------------------------------------------------- post-tool-use

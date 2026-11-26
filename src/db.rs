@@ -831,6 +831,14 @@ pub fn minority(c: &Connection, ranges: &[(i64, i64)]) -> bool {
 /// The schema version this build writes.
 pub const LATEST: i64 = 30;
 
+/// Open a ready store for an advisory hook without waiting on SQLite or running migrations.
+pub(crate) fn open_ro_ready() -> Option<Connection> {
+    let c = Connection::open_with_flags(db_path(), OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX).ok()?;
+    c.busy_timeout(std::time::Duration::ZERO).ok()?;
+    let version: i64 = c.pragma_query_value(None, "user_version", |row| row.get(0)).ok()?;
+    (version == LATEST).then_some(c)
+}
+
 /// Read-only connection for the hot paths. None if the store does not exist yet.
 pub fn open_ro() -> Option<Connection> {
     let p = db_path();

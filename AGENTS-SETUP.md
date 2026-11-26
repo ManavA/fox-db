@@ -85,7 +85,8 @@ mkdir -p ~/.foxdb
 # Agents whose name or type matches get no SubagentStart brief (zero-context reviewers).
 [hooks]
 skip_agents = ["egm-*", "*goldfish*", "*reviewer*"]
-# Opt-in tool hooks (step 6, "Search hooks"); each also needs its Claude Code hook entry.
+# Opt-in tool hooks (step 6, "Tool hooks"); each also needs its Claude Code hook entry.
+fact_gate = false
 grep_context = false
 prompt_context = false
 # Restate the swarm board protocol in SubagentStart briefs (docs/multi-agent.md).
@@ -206,7 +207,7 @@ Each is a command hook that prints nothing and exits 0 on any error or after 1.5
 | `PreCompact` | Saves a handoff packet before compaction; for Claude Code, prints four lines asking the compaction summary to keep the working set's `path:line` anchors, the symbols being edited, ruled-out leads and the packet handle | Injects no context: Claude Code hands the lines to the summariser as instructions; the following session start adds one line |
 
 By default fox-db never injects from `PreToolUse`, `PostToolUse` or `UserPromptSubmit`, which
-would rewrite the cached history or grow every turn; a test enforces this. The two search hooks
+would rewrite the cached history or grow every turn; a test enforces this. The opt-in tool hooks
 below are the only exceptions, and they are off unless the user turns them on.
 
 ### Claude Code hooks
@@ -232,16 +233,14 @@ jq -r '.hooks | keys[]' "$f"
 Expected output: `PreCompact`, `SessionStart`, `SubagentStart`, `SubagentStop` (plus any events
 the user already had).
 
-### Search hooks (opt-in)
+### Tool hooks (opt-in)
 
-Two hooks meet the model where it already searches. Both are off unless set to `true` under
-`[hooks]` in `~/.foxdb/config.toml`, both print nothing when they cannot be sure, and neither
-changes a tool's output. Each one adds context to the turn (a PostToolUse hook's context sits
-next to the tool result; a UserPromptSubmit hook's next to the prompt), so it costs prompt-cache
-reuse on that turn. Offer them only when the user wants them.
+These hooks are off unless set to `true` under `[hooks]` in `~/.foxdb/config.toml`.
+Each hook can add context to the turn, which costs prompt-cache reuse on that turn.
 
 | Hook | Setting | What it adds |
 |---|---|---|
+| `PreToolUse` on `Edit\|Write\|Bash` | `fact_gate = true` | One line with a suggestion when an indexed project name or path is provably absent. The tool call runs normally. |
 | `PostToolUse` on `Bash` | `grep_context = true` | After a `grep -n`, `rg -n` or `git grep -n` in an indexed project, the enclosing definition and its handle for each hit: at most 12 rows and 1,200 characters. Silent on compound commands, pipes into anything but `head`/`tail`/`sort`/`uniq`/`grep`, counts and file lists, files changed since indexing, and projects fox-db has not indexed |
 | `UserPromptSubmit` | `prompt_context = true` | When the prompt names a code-shaped identifier (`snake_case`, `camelCase`, `Type.member`, a backticked name) or a source path that resolves to exactly one indexed definition or file: its location, caller count and handle, at most 5 rows. Silent otherwise |
 
@@ -250,6 +249,8 @@ fields keep the PostToolUse hook from starting for any other Bash command):
 
 ```json
 {"hooks": {
+  "PreToolUse": [{"matcher": "Edit|Write|Bash", "hooks": [
+    {"type": "command", "timeout": 2, "command": "H=\"$HOME/.foxdb/bin/fox\"; [ -x \"$H\" ] && \"$H\" hook pre-tool-use --harness claude; exit 0"}]}],
   "PostToolUse": [{"matcher": "Bash", "hooks": [
     {"type": "command", "timeout": 2, "if": "Bash(grep *)", "command": "H=\"$HOME/.foxdb/bin/fox\"; [ -x \"$H\" ] && \"$H\" hook post-tool-use --harness claude; exit 0"},
     {"type": "command", "timeout": 2, "if": "Bash(rg *)", "command": "H=\"$HOME/.foxdb/bin/fox\"; [ -x \"$H\" ] && \"$H\" hook post-tool-use --harness claude; exit 0"},
