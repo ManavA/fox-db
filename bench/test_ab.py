@@ -395,6 +395,19 @@ class DryRun(unittest.TestCase):
         self.assertNotIn("Context", ab.delegate_prompt("q", "lean", ""))
         self.assertIn("PKT", ab.delegate_prompt("q", "lean", "PKT"))
 
+    def test_claude_packet_dry_run_selects_one_arm_and_budget(self):
+        with tempfile.TemporaryDirectory() as d:
+            tasks = Path(d) / "t.toml"
+            tasks.write_text('repo = "/r"\n[[task]]\nid = "a"\nprompt = "q"\n')
+            buf = io.StringIO()
+            with contextlib.redirect_stdout(buf):
+                ab.main([str(tasks), "--harness", "claude", "--arm", "packet", "--packet-budget", "3200",
+                         "--repeat", "1", "--work", str(Path(d) / "w"), "--fox", "/nonexistent/fox"])
+        text = buf.getvalue()
+        self.assertEqual(text.count("# slot "), 1)
+        self.assertIn("a-claude-packet-0", text)
+        self.assertIn("/nonexistent/fox packet q --budget 3200", text)
+
     def test_local_dry_run_indexes_only_fox_arms(self):
         with tempfile.TemporaryDirectory() as d:
             tasks = Path(d) / "t.toml"

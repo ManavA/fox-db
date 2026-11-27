@@ -298,13 +298,13 @@ def grader_selftest(spec: dict, universe=frozenset()) -> tuple:
 
 # ---- order and store
 
-def schedule(task_ids: list, harnesses: list, repeat: int, seed: int) -> list:
+def schedule(task_ids: list, harnesses: list, repeat: int, seed: int, arms_by_harness=ARMS) -> list:
     rng = random.Random(seed)
     runs = []
     for rep in range(repeat):
         for tid in rng.sample(task_ids, len(task_ids)):
             for h in harnesses:
-                arms = list(ARMS[h])
+                arms = list(arms_by_harness[h])
                 rng.shuffle(arms)
                 runs += [{"rep": rep, "task": tid, "harness": h, "arm": arm} for arm in arms]
     return runs
@@ -389,7 +389,7 @@ def local_cmd(prompt: str, arm: str, cwd: Path, fox: str, scratch: Path, transcr
            "--cwd", str(cwd), "--scratch", str(scratch), "--fox", fox, "--url", a.local_url,
            "--steps", str(a.local_steps), "--token-cap", str(a.local_token_cap),
            "--reasoning-effort", a.local_effort, "--packet-builder", a.local_packet_builder,
-           "--transcript", str(transcript)]
+           "--packet-budget", str(a.packet_budget), "--transcript", str(transcript)]
     return cmd + (["--model", a.model] if a.model else [])
 
 
@@ -655,8 +655,11 @@ def run_parser() -> argparse.ArgumentParser:
     ap.add_argument("--local-steps", type=int, default=20, help="turn cap for local (one last answer turn after)")
     ap.add_argument("--local-token-cap", type=int, default=200_000, help="prompt plus completion tokens, all turns")
     ap.add_argument("--local-effort", default="low", help="reasoning_effort chat template kwarg; '' for default")
-    ap.add_argument("--subagent", choices=sorted(SUBAGENT_TYPES), default=None,
+    selection = ap.add_mutually_exclusive_group()
+    selection.add_argument("--subagent", choices=sorted(SUBAGENT_TYPES), default=None,
                     help="claude: one arm, fox MCP on, task delegated to this subagent setup")
+    selection.add_argument("--arm", choices=["packet"], help="claude: run only the fox packet arm")
+    ap.add_argument("--packet-budget", type=int, default=800, help="packet budget in tokens")
     ap.add_argument("--local-packet-builder", choices=["fox", "python"], default="fox",
                     help="packet arm: `fox packet`, or local_agent.py's older Python builder")
     ap.add_argument("--out", type=Path, default=Path("ab-results.jsonl"))
@@ -680,7 +683,7 @@ def report_main(argv: list) -> int:
     return 0
 
 
-def done_cells(out: Path) -> set:
+def done_cells(out: Path, packet_budget: int | None = None) -> set:
     cells = set()
     if out.exists():
         for line in out.read_text().splitlines():
@@ -688,6 +691,9 @@ def done_cells(out: Path) -> set:
                 r = json.loads(line)
             except json.JSONDecodeError:
                 continue
+            if packet_budget is not None and r["foxdb"] in {"packet", "lean-packet"}:
+                if r.get("packet_budget", 800) != packet_budget:
+                    raise ValueError("use a separate --out file for each packet budget")
             cells.add((r["task"], r["harness"], r["foxdb"], r["rep"]))
     return cells
 
@@ -696,7 +702,12 @@ def main(argv: list | None = None) -> int:
     argv = sys.argv[1:] if argv is None else argv
     if argv[:1] == ["report"]:
         return report_main(argv[1:])
-    a = run_parser().parse_args(argv)
+    parser = run_parser()
+    a = parser.parse_args(argv)
+    if a.arm and (a.harness != "claude" or a.store != "scratch"):
+        parser.error("--arm packet requires --harness claude and --store scratch")
+    if a.packet_budget <= 0:
+        parser.error("--packet-budget must be positive")
     spec = tomllib.loads(a.tasks.read_text())
     if a.grader_selftest:
         ok, lines = grader_selftest(spec)
@@ -713,9 +724,18 @@ def main(argv: list | None = None) -> int:
     work.mkdir(parents=True, exist_ok=True)
     mode = f"headroom-{a.headroom}"
     fox_sha = sha256_file(a.fox)
-    if a.subagent:
-        ARMS["claude"] = [a.subagent]
-    arms = sorted({arm for h in harnesses for arm in ARMS[h]})
+    arms_by_harness = ARMS.copy()
+    if selected := a.arm or a.subagent:
+        arms_by_harness["claude"] = [selected]
+    arms = sorted({arm for h in harnesses for arm in arms_by_harness[h]})
+    done = set()
+    if a.run and (a.resume or {"packet", "lean-packet"}.intersection(arms)):
+        try:
+            seen = done_cells(a.out, a.packet_budget)
+        except ValueError as e:
+            parser.error(str(e))
+        if a.resume:
+            done = seen
     print(f"# {len(tasks)} tasks x {harnesses} x {arms} x {a.repeat} · {mode} · store {a.store} · seed {seed}"
           f" · fox {fox_sha or 'missing'} · work {work}" + ("" if a.run else " · DRY RUN"))
 
@@ -737,8 +757,7 @@ def main(argv: list | None = None) -> int:
         prov["bench_commit"] = _out(["git", "-C", str(Path(__file__).resolve().parent), "rev-parse", "HEAD"])
         versions = {h: local_version(a.local_url) if h == "local" else _out([h, "--version"]) for h in harnesses}
     out = a.out.open("a") if a.run else None
-    done = done_cells(a.out) if a.resume else set()
-    for slot, s in enumerate(schedule(list(tasks), harnesses, a.repeat, seed)):
+    for slot, s in enumerate(schedule(list(tasks), harnesses, a.repeat, seed, arms_by_harness)):
         t, h, arm, rep = tasks[s["task"]], s["harness"], s["arm"], s["rep"]
         if (t["id"], h, arm, rep) in done:
             continue
@@ -757,12 +776,16 @@ def main(argv: list | None = None) -> int:
         else:
             cmd = local_cmd(t["prompt"], arm, cwd, a.fox, work / f"{name}.agent", work / f"{name}.transcript.jsonl", a)
         index = plan["index"] if arm in INDEXED_ARMS else None
+        claude_packet = h == "claude" and arm == "packet"
         if not a.run:
             print(f"# slot {slot}: {name}")
             print(shlex.join(clone))
             if index:
                 envs = " ".join(f"{k}={shlex.quote(v)}" for k, v in plan["env"].items())
                 print(f"{envs} {shlex.join(index)}")
+            if claude_packet:
+                packet_cmd = [a.fox, "packet", t["prompt"], "--budget", str(a.packet_budget)]
+                print(f"(cd {shlex.quote(str(cwd))} && {envs} {shlex.join(packet_cmd)})")
             print(f"(cd {shlex.quote(str(cwd))} && {shlex.join(cmd)})")
             continue
         if h != "local":
@@ -775,8 +798,15 @@ def main(argv: list | None = None) -> int:
         if arm in SUBAGENT_TYPES:
             (cwd / ".claude" / "agents").mkdir(parents=True, exist_ok=True)
             (cwd / ".claude" / "agents" / "lean.md").write_text(LEAN_AGENT)
-            packet = local_agent.build_packet(t["prompt"], a.fox, cwd, env) if arm == "lean-packet" else ""
+            packet = ""
+            if arm == "lean-packet":
+                packet = local_agent.build_packet(t["prompt"], a.fox, cwd, env, a.packet_budget)
             cmd[2] = delegate_prompt(t["prompt"], arm, packet)
+        if claude_packet:
+            packet = local_agent.fox_packet(t["prompt"], a.fox, cwd, env, a.packet_budget)
+            if not packet:
+                raise RuntimeError(f"fox packet returned no context for {t['id']}")
+            cmd[2] = f"{t['prompt']}\n\nContext index:\n{packet}"
         t0 = time.monotonic()
         p = subprocess.run(cmd, cwd=cwd, env=env, capture_output=True, text=True,
                            timeout=7200 if h == "local" else 1800)
@@ -792,6 +822,8 @@ def main(argv: list | None = None) -> int:
         row = {"task": t["id"], "depth": t.get("depth"), "harness": h, "foxdb": arm, "rep": rep, "slot": slot, "headroom": mode,
                "exit": p.returncode, "secs": round(secs, 1), **u, **grade(ans, t, universe), "model": model,
                "harness_version": versions.get(h), "answer": ans, **prov}
+        if arm in {"packet", "lean-packet"}:
+            row["packet_budget"] = a.packet_budget
         out.write(json.dumps(row) + "\n")
         out.flush()
         print(json.dumps(row))
