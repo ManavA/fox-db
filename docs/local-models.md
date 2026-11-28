@@ -7,6 +7,11 @@ three arms across 6 C caller tasks. Haiku showed no meaningful accuracy gain
 
 Use a model that can already make tool calls reliably.
 
+For local models, pass a larger packet: `fox packet "<question>" --budget 3200`. On the
+oracle caller tasks a local model passed 59 of 224 runs at 3200 tokens against 37 at the
+800-token default, for 9% more tokens. Haiku showed no difference (27 and 26 of 66), so
+the default stays at 800.
+
 Every config below starts the same stdio MCP server: `<home>/.foxdb/bin/fox mcp`. Use the
 absolute path to `fox`; write your own home in place of `/path/to/home`. Index each project first
 with `fox index .`.
