@@ -9,6 +9,7 @@
 # doc runs point FOXDB_RELEASE_URL at a missing file:// directory, so they build from source.
 #
 # Usage: scripts/docs-test.sh [--keep]        (--keep leaves the scratch dir for inspection)
+# Requires Python 3 to check server.json against the Cargo package version.
 # The real home is never written: HOME points into the scratch dir, and the script fails if the
 # user's Claude Code or Codex settings files change while it runs.
 set -euo pipefail
@@ -16,8 +17,20 @@ set -euo pipefail
 repo=$(cd "$(dirname "$0")/.." && pwd)
 keep=${1:-}
 real_home=$HOME
-scratch=$(mktemp -d "${TMPDIR:-/tmp}/foxdb-docs-test.XXXXXX")
 version=$(sed -n 's/^version = "\(.*\)"/\1/p' "$repo/Cargo.toml" | head -n1)
+
+python3 - "$repo/server.json" "$version" <<'PY'
+import json
+import sys
+
+manifest_path, cargo_version = sys.argv[1:]
+with open(manifest_path, encoding="utf-8") as manifest:
+    server_version = json.load(manifest)["version"]
+if server_version != cargo_version:
+    sys.exit(f"server.json version {server_version!r} must match Cargo.toml version {cargo_version!r}")
+PY
+
+scratch=$(mktemp -d "${TMPDIR:-/tmp}/foxdb-docs-test.XXXXXX")
 
 # Tool PATH for the blocks: the caller's PATH without any foxdb bin dir, so `fox` resolves only
 # once a block has installed it and put ~/.foxdb/bin first.

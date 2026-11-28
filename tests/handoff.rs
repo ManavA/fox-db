@@ -406,7 +406,7 @@ fn parent_transcript(dir: &Path, repo: &Path) -> std::path::PathBuf {
 #[test]
 fn subagent_brief_has_the_parents_files_as_handles_and_the_board_protocol_only_when_asked() {
     let _g = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
-    let (_h, repo, c, _p) = setup_ts();
+    let (home, repo, c, _p) = setup_ts();
     let tx = tempfile::tempdir().unwrap();
     let t = parent_transcript(tx.path(), repo.path());
     let input = |id: &str| {
@@ -414,25 +414,43 @@ fn subagent_brief_has_the_parents_files_as_handles_and_the_board_protocol_only_w
             "agent_type": "worker", "transcript_path": t})
         .to_string()
     };
+    let run = |input: &str| {
+        use std::io::Write;
+        use std::process::{Command, Stdio};
+
+        let mut child = Command::new(env!("CARGO_BIN_EXE_fox"))
+            .args(["hook", "subagent-start", "--harness", "claude"])
+            .env("HOME", home.path())
+            .env("FOXDB_HOME", home.path())
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .spawn()
+            .unwrap();
+        child.stdin.take().unwrap().write_all(input.as_bytes()).unwrap();
+        let out = child.wait_with_output().unwrap();
+        assert!(out.status.success(), "{out:?}");
+        String::from_utf8(out.stdout).unwrap()
+    };
     let ctx_of = |out: &str| {
         let v: serde_json::Value = serde_json::from_str(out).unwrap();
         v["hookSpecificOutput"]["additionalContext"].as_str().unwrap().to_string()
     };
     // Off by default: the parent packet and parent read lines, no board line.
-    let off = foxdb::config::Config::default();
-    let a = hook::run_with(&off, "subagent-start", &input("a1"), hook::Harness::Claude);
-    let b = hook::run_with(&off, "subagent-start", &input("b2"), hook::Harness::Claude);
+    let a = run(&input("a1"));
+    let b = run(&input("b2"));
     assert_eq!(a, b, "sibling briefs must be byte-identical");
     let plain = ctx_of(&a);
     assert!(plain.contains("parent packet h:") && plain.contains("parent read"), "{plain}");
     assert!(!plain.lines().any(|l| l.starts_with("board:")) && !plain.contains("since=h:"), "the board line is opt-in: {plain}");
     // On: the board protocol, from the snapshot.
-    let on = foxdb::config::parse("[hooks]\nswarm_board = true\n");
-    let a = hook::run_with(&on, "subagent-start", &input("a1"), hook::Harness::Claude);
-    let b = hook::run_with(&on, "subagent-start", &input("b2"), hook::Harness::Claude);
+    write(home.path(), "config.toml", "[hooks]\nswarm_board = true\n");
+    let a = run(&input("a1"));
+    let b = run(&input("b2"));
     assert_eq!(a, b, "sibling briefs must be byte-identical");
     let ctx = ctx_of(&a);
     let ctx = ctx.as_str();
+    let board = ctx.lines().find(|line| line.starts_with("board:")).unwrap();
+    assert_eq!(plain, ctx.replacen(&format!("{board}\n"), "", 1));
     let snap = ctx.split_whitespace().find(|w| w.starts_with("h:")).unwrap();
     assert!(ctx.contains(&format!("since={snap}")), "board cursor from the snapshot: {ctx}");
     for want in ["fact", "failed", "question", "agent="] {
@@ -445,7 +463,7 @@ fn subagent_brief_has_the_parents_files_as_handles_and_the_board_protocol_only_w
     // Without a transcript the brief just leaves the line out.
     let bare =
         json!({"hook_event_name": "SubagentStart", "session_id": "s1", "cwd": repo.path(), "agent_id": "c3", "agent_type": "worker"});
-    let out = hook::run_with(&on, "subagent-start", &bare.to_string(), hook::Harness::Claude);
+    let out = run(&bare.to_string());
     assert!(!out.contains("src/lib.rs") && out.contains("since=h:"), "{out}");
 }
 

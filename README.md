@@ -1,7 +1,6 @@
 # fox-db
 
-A local code graph that makes small models find the right code, and tells any agent when an
-answer is proven or a guess.
+A local code graph for agents that marks resolved and guessed links.
 
 - **Four tools, one binary.** `fox` is the CLI and an MCP server with four tools; `foxd` is an
   optional daemon.
@@ -12,13 +11,17 @@ answer is proven or a guess.
   (`guess 1 of N`), so an agent knows when to check.
 - **Short answers.** Budgeted rows that end in `path:line`, not whole files.
 
-What it buys you depends on the model. A small local model gains the most: on 6 compiler-checked
-C caller tasks (2 reps each, a small sample), Inkling-2-Mini passed 0.42 with grep alone, 0.75
-with the `fox` CLI and 0.83 with a pre-built fox packet (F1 up 0.33). Strong models that already
-grep well gain little: kernel impact questions cost about 5-10% less, and Haiku and Sonnet showed
-no accuracy gain. Details and the reproduce commands are in
-[docs/benchmarks.md](docs/benchmarks.md); setup for OpenCode, Goose, Cline and Continue with
-Ollama or llama.cpp is in [docs/local-models.md](docs/local-models.md).
+On 6 compiler-checked C caller tasks (2 reps each, a small sample), the local model
+Inkling-2-Mini had a pass rate of 0.42 with grep alone, 0.75 with the `fox` CLI
+and 0.83 with a pre-built fox packet (F1 up 0.33). Qwen3-8B Q4 scored 0 with
+grep, the `fox` CLI and a fox packet across 6 C caller tasks. Haiku showed no
+meaningful accuracy gain (F1 +0.02).
+
+Use a model that can already make tool calls reliably.
+
+See [docs/benchmarks.md](docs/benchmarks.md) for results and reproduction commands,
+and [docs/local-models.md](docs/local-models.md) for setup with OpenCode, Goose,
+Cline and Continue using Ollama or llama.cpp.
 
 It also keeps a handoff board for several agents; see
 [Multi-agent work](#multi-agent-work) below.

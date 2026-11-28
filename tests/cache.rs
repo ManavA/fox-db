@@ -217,10 +217,22 @@ fn pre_compact_asks_the_summary_to_keep_the_working_set() {
 fn context_budget_file_matches() {
     let budget: serde_json::Value = serde_json::from_str(include_str!("../context-budget.json")).unwrap();
     let init = mcp::handle(&serde_json::json!({"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {}})).unwrap();
+    let _g = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    let (_home, repo) = setup();
+    let (_c, _p) = indexed(repo.path());
+    let input = serde_json::json!({"hook_event_name": "SubagentStart", "cwd": repo.path(), "session_id": "s1",
+        "agent_id": "a1", "agent_type": "helper"})
+    .to_string();
+    let output = hook::run_with(&foxdb::config::Config::default(), "subagent-start", &input, hook::Harness::Claude);
+    let output: serde_json::Value = serde_json::from_str(&output).unwrap();
+    let brief = output["hookSpecificOutput"]["additionalContext"].as_str().unwrap();
+    assert!(brief.contains("parent packet h:"));
+    let board_bytes = brief.lines().filter(|line| line.starts_with("board:")).map(|line| line.len() + 1).sum();
     let actual = [
         ("session_brief_cap_claude_chars", hook::Harness::Claude.cap_chars()),
         ("session_brief_cap_codex_chars", hook::Harness::Codex.cap_chars()),
         ("subagent_brief_cap_chars", hook::SUBAGENT_BRIEF_CHARS),
+        ("subagent_default_board_bytes", board_bytes),
         ("session_brief_budget_tokens", hook::SESSION_BRIEF_TOKENS),
         ("subagent_brief_budget_tokens", hook::SUBAGENT_BRIEF_TOKENS),
         ("tools_list_bytes", mcp::tools().to_string().len()),
